@@ -1,0 +1,26 @@
+[
+  {
+    "source": "https://raw.githubusercontent.com/rcampagnale/sidca-chatbot-docs/main/regimen_licencias_docentes.json",
+    "filename": "regimen_licencias_docentes.json",
+    "attributes": {
+      "ambito": "provincial",
+      "dominio": "licencias"
+    }
+  },
+  {
+    "source": "https://raw.githubusercontent.com/rcampagnale/sidca-chatbot-docs/main/consultas_generales.json",
+    "filename": "consultas_generales.json",
+    "attributes": {
+      "ambito": "provincial",
+      "dominio": "general"
+    }
+  },
+  {
+    "source": "https://raw.githubusercontent.com/rcampagnale/sidca-chatbot-docs/main/texto_provincial_para_firestore.json",
+    "filename": "texto_provincial_para_firestore.json",
+    "attributes": {
+      "ambito": "provincial",
+      "dominio": "estatuto"
+    }
+  }
+]
