@@ -1,0 +1,111 @@
+[
+  {
+    "articulo": 1,
+    "contenido": "[ARTÍCULO 1°]\nARTÍCULO 1°.- Fijase el presente Régimen de Licencias, Justificaciones y Franquicias para el Personal que desempeñe cargos docentes cualquiera sea su función (docente, auxiliar docente, técnico docente, administrativa docente, administrativa superior, directiva docente, supervisión docente, escalafonaria docente) dependiente del Ministerio de Educación Ciencia y Tecnología de la Provincia de Catamarca en todas sus dependencias, de acuerdo a lo estipulado por la Ley Nacional de Educación N° 26.206, Ley Provincial de Educación N° 5381, Ley N° 3122 «Estatuto del Docente Provincial» y demás normativa que regule el régimen jurídico educativo de la Provincia, sea que presten sus servicios en entidades educativas de gestión estatal, gestión privada, gestión cooperativa y gestión social, que abarcan los distintos niveles y modalidades de la educación.\nALCANCES"
+  },
+  {
+    "id": 1,
+    "pregunta": "docentes﻿",
+    "respuesta": "docente prueba"
+  },
+  {
+    "id": 2,
+    "pregunta": "﻿Becas",
+    "respuesta": ""
+  },
+  {
+    "id": 3,
+    "pregunta": "¿Cuántas horas semanales tiene que trabajar un docente en Catamarca?",
+    "respuesta": "Depende del cargo y nivel educativo, pero el Estatuto establece la carga horaria según categoría y función del docente."
+  },
+  {
+    "id": 4,
+    "pregunta": "¿Qué pasa si un docente es titular y quiere pasar a otro cargo?",
+    "respuesta": "Tiene que seguir un proceso de traslado o ascenso, y respetar el orden de mérito y normativa de Junta de Clasificación."
+  },
+  {
+    "id": 5,
+    "pregunta": "¿Se puede tener más de un cargo docente al mismo tiempo?",
+    "respuesta": "Sí, siempre que no se exceda el límite de incompatibilidad horaria establecido por el Estatuto."
+  },
+  {
+    "id": 6,
+    "pregunta": "¿Cómo se hace para acceder a la titularidad en un cargo?",
+    "respuesta": "A través de concursos, inscripciones en Junta y cumpliendo con los requisitos exigidos por normativa."
+  },
+  {
+    "id": 7,
+    "pregunta": "¿Cuánto tiempo dura un interinato?",
+    "respuesta": "Hasta que se cubra el cargo por concurso, reincorporación del titular o finalice el ciclo lectivo."
+  },
+  {
+    "id": 8,
+    "pregunta": "¿Qué derechos tiene un docente cuando se jubila?",
+    "respuesta": "Accede a beneficios previsionales, y si tiene más de 25 años de servicio, puede obtener reconocimiento y bonificaciones."
+  },
+  {
+    "id": 9,
+    "pregunta": "¿Qué pasa si un docente quiere renunciar a su cargo?",
+    "respuesta": "Debe presentar su renuncia por escrito, y esta tiene que ser aceptada por la autoridad correspondiente."
+  },
+  {
+    "id": 10,
+    "pregunta": "¿Cuántos días de licencia anual le corresponden a un docente?",
+    "respuesta": "El Estatuto establece licencias por vacaciones, enfermedad, maternidad, entre otras, según antigüedad y situación."
+  },
+  {
+    "id": 11,
+    "pregunta": "¿El Estatuto protege a los docentes frente a sanciones injustas?",
+    "respuesta": "Sí, establece un régimen disciplinario con garantías para la defensa del docente."
+  },
+  {
+    "id": 12,
+    "pregunta": "¿Qué tareas están obligados a cumplir los docentes además de dar clases?",
+    "respuesta": "Participar en reuniones, planificar, evaluar, asistir a actos escolares y otras funciones pedagógicas."
+  },
+  {
+    "id": 13,
+    "pregunta": "¿Qué hago si me enfermo y no puedo ir a trabajar?",
+    "respuesta": "Podés pedir licencia por enfermedad común presentando el certificado médico correspondiente."
+  },
+  {
+    "id": 14,
+    "pregunta": "¿Cuánto tiempo me cubre la licencia por enfermedad?",
+    "respuesta": "El régimen prevé hasta 12 meses, con distintas modalidades de goce de haberes según el caso.\n\nEstoy embarazada, ¿qué licencia me corresponde?\nLa licencia por maternidad te cubre 45 días antes del parto y 45 días después, con goce de haberes."
+  },
+  {
+    "id": 15,
+    "pregunta": "¿Qué es una licencia por largo tratamiento?",
+    "respuesta": "Es para enfermedades graves que requieren más tiempo de recuperación. Podés tener hasta 24 meses (con distintos porcentajes de sueldo)."
+  },
+  {
+    "id": 16,
+    "pregunta": "¿Puedo tomarme licencia por un familiar enfermo?",
+    "respuesta": "Sí, existe la licencia por enfermedad de familiar directo, con requisitos y plazos determinados."
+  },
+  {
+    "id": 17,
+    "pregunta": "¿Qué pasa si necesito operarme y estar en reposo?",
+    "respuesta": "Se puede solicitar una licencia por cirugía, con respaldo médico y evaluación por junta médica si es necesario."
+  },
+  {
+    "id": 18,
+    "pregunta": "¿Me pueden descontar los días si estoy con licencia médica?",
+    "respuesta": "No, si la licencia es justificada y dentro del régimen, se mantienen los haberes según lo que indica la normativa."
+  },
+  {
+    "id": 19,
+    "pregunta": "¿Cuántas licencias puedo pedir en el año?",
+    "respuesta": "No hay un número fijo, pero se deben respetar los límites según el tipo de licencia y lo que apruebe la junta médica."
+  },
+  {
+    "id": 20,
+    "pregunta": "¿Puedo pedir licencia para estudiar?",
+    "respuesta": "Sí, existe una licencia por estudio, tanto para rendir exámenes como para cursar carreras."
+  },
+  {
+    "id": 21,
+    "pregunta": "¿Qué hago si me agoto el tiempo de licencia médica y no estoy recuperado?",
+    "respuesta": "Podés solicitar extensión, cambio de funciones o iniciar el trámite para jubilación por invalidez, según dictamen médico."
+  }
+]
