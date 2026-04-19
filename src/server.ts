@@ -1,11 +1,24 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
+import multer from "multer";
+import OpenAI, { toFile } from "openai";
 import { z } from "zod";
 import { runChatbotWorkflow } from "./openaiWorkflow.js";
 
 const app = express();
 const PORT = Number(process.env.PORT || 8080);
+
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 25 * 1024 * 1024,
+  },
+});
 
 const bodySchema = z.object({
   pregunta: z.string().trim().min(2, "La pregunta es obligatoria"),
@@ -67,6 +80,48 @@ app.post("/api/chatbot/query", async (req, res) => {
     });
   }
 });
+
+app.post(
+  "/api/chatbot/transcribe",
+  upload.single("audio"),
+  async (req, res) => {
+    try {
+      if (!req.file) {
+        res.status(400).json({
+          ok: false,
+          error: "No se recibió ningún archivo de audio.",
+        });
+        return;
+      }
+
+      const audioFile = await toFile(
+        req.file.buffer,
+        req.file.originalname || "audio.m4a",
+        {
+          type: req.file.mimetype || "audio/m4a",
+        }
+      );
+
+      const transcription = await openai.audio.transcriptions.create({
+        file: audioFile,
+        model: "gpt-4o-mini-transcribe",
+        language: "es",
+      });
+
+      res.status(200).json({
+        ok: true,
+        texto: transcription.text?.trim() || "",
+      });
+    } catch (error: any) {
+      console.error("[sidca-chatbot-backend] Error STT:", error);
+
+      res.status(500).json({
+        ok: false,
+        error: error?.message || "No se pudo transcribir el audio.",
+      });
+    }
+  }
+);
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`[sidca-chatbot-backend] running on http://0.0.0.0:${PORT}`);
