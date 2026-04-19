@@ -1,111 +1,102 @@
 [
   {
-    "articulo": 1,
-    "contenido": "[ARTÍCULO 1°]\nARTÍCULO 1°.- Fijase el presente Régimen de Licencias, Justificaciones y Franquicias para el Personal que desempeñe cargos docentes cualquiera sea su función (docente, auxiliar docente, técnico docente, administrativa docente, administrativa superior, directiva docente, supervisión docente, escalafonaria docente) dependiente del Ministerio de Educación Ciencia y Tecnología de la Provincia de Catamarca en todas sus dependencias, de acuerdo a lo estipulado por la Ley Nacional de Educación N° 26.206, Ley Provincial de Educación N° 5381, Ley N° 3122 «Estatuto del Docente Provincial» y demás normativa que regule el régimen jurídico educativo de la Provincia, sea que presten sus servicios en entidades educativas de gestión estatal, gestión privada, gestión cooperativa y gestión social, que abarcan los distintos niveles y modalidades de la educación.\nALCANCES"
-  },
-  {
     "id": 1,
-    "pregunta": "docentes﻿",
-    "respuesta": "docente prueba"
+    "pregunta": "¿Cómo me afilio al sindicato?",
+    "respuesta": "La afiliación se realiza presentando la documentación requerida en la sede correspondiente o por los canales habilitados por el sindicato."
   },
   {
     "id": 2,
-    "pregunta": "﻿Becas",
-    "respuesta": ""
+    "pregunta": "¿Qué documentación necesito para afiliarme?",
+    "respuesta": "Generalmente se solicita DNI, constancia laboral o recibo de haberes y la ficha de afiliación. Te sugerimos consultar en la sede o con la secretaría correspondiente para confirmar los requisitos actualizados."
   },
   {
     "id": 3,
-    "pregunta": "¿Cuántas horas semanales tiene que trabajar un docente en Catamarca?",
-    "respuesta": "Depende del cargo y nivel educativo, pero el Estatuto establece la carga horaria según categoría y función del docente."
+    "pregunta": "¿Dónde están las oficinas del sindicato?",
+    "respuesta": "Podés consultar la dirección, horarios de atención y medios de contacto en los canales oficiales del sindicato."
   },
   {
     "id": 4,
-    "pregunta": "¿Qué pasa si un docente es titular y quiere pasar a otro cargo?",
-    "respuesta": "Tiene que seguir un proceso de traslado o ascenso, y respetar el orden de mérito y normativa de Junta de Clasificación."
+    "pregunta": "¿Cuál es el horario de atención del sindicato?",
+    "respuesta": "El horario de atención puede variar según la sede o el área. Te recomendamos verificarlo por los medios oficiales antes de asistir."
   },
   {
     "id": 5,
-    "pregunta": "¿Se puede tener más de un cargo docente al mismo tiempo?",
-    "respuesta": "Sí, siempre que no se exceda el límite de incompatibilidad horaria establecido por el Estatuto."
+    "pregunta": "¿Qué beneficios tienen los afiliados?",
+    "respuesta": "Los afiliados pueden acceder a asesoramiento, acompañamiento gremial, capacitaciones, servicios y otros beneficios que brinda la institución."
   },
   {
     "id": 6,
-    "pregunta": "¿Cómo se hace para acceder a la titularidad en un cargo?",
-    "respuesta": "A través de concursos, inscripciones en Junta y cumpliendo con los requisitos exigidos por normativa."
+    "pregunta": "¿Cómo me comunico con el sindicato?",
+    "respuesta": "Podés comunicarte por teléfono, WhatsApp, redes sociales o de manera presencial en las oficinas del sindicato, según los canales habilitados."
   },
   {
     "id": 7,
-    "pregunta": "¿Cuánto tiempo dura un interinato?",
-    "respuesta": "Hasta que se cubra el cargo por concurso, reincorporación del titular o finalice el ciclo lectivo."
+    "pregunta": "¿Cómo hago una consulta gremial?",
+    "respuesta": "Podés realizar tu consulta acercándote a la sede, comunicándote por WhatsApp o utilizando los formularios y medios oficiales del sindicato."
   },
   {
     "id": 8,
-    "pregunta": "¿Qué derechos tiene un docente cuando se jubila?",
-    "respuesta": "Accede a beneficios previsionales, y si tiene más de 25 años de servicio, puede obtener reconocimiento y bonificaciones."
+    "pregunta": "¿Cómo presento una nota o un pedido en el sindicato?",
+    "respuesta": "Los pedidos o notas se presentan por mesa de entrada o por el canal administrativo que indique el sindicato. Conviene acompañarlos con tus datos personales y una descripción clara del trámite."
   },
   {
     "id": 9,
-    "pregunta": "¿Qué pasa si un docente quiere renunciar a su cargo?",
-    "respuesta": "Debe presentar su renuncia por escrito, y esta tiene que ser aceptada por la autoridad correspondiente."
+    "pregunta": "¿Dónde puedo pedir asesoramiento?",
+    "respuesta": "Podés solicitar asesoramiento en las áreas correspondientes del sindicato, según se trate de afiliación, gestiones administrativas, capacitaciones u otros servicios."
   },
   {
     "id": 10,
-    "pregunta": "¿Cuántos días de licencia anual le corresponden a un docente?",
-    "respuesta": "El Estatuto establece licencias por vacaciones, enfermedad, maternidad, entre otras, según antigüedad y situación."
+    "pregunta": "¿Cómo me inscribo en una capacitación?",
+    "respuesta": "La inscripción a las capacitaciones se realiza por los formularios, enlaces o canales de difusión que publique el sindicato."
   },
   {
     "id": 11,
-    "pregunta": "¿El Estatuto protege a los docentes frente a sanciones injustas?",
-    "respuesta": "Sí, establece un régimen disciplinario con garantías para la defensa del docente."
+    "pregunta": "¿Dónde veo las capacitaciones disponibles?",
+    "respuesta": "Las capacitaciones disponibles suelen difundirse por los canales oficiales del sindicato, redes sociales, formularios o medios institucionales."
   },
   {
     "id": 12,
-    "pregunta": "¿Qué tareas están obligados a cumplir los docentes además de dar clases?",
-    "respuesta": "Participar en reuniones, planificar, evaluar, asistir a actos escolares y otras funciones pedagógicas."
+    "pregunta": "¿Cómo obtengo mi certificado de una capacitación?",
+    "respuesta": "Los certificados se entregan o publican según el procedimiento establecido para cada capacitación. Si ya finalizaste una propuesta, consultá por el canal correspondiente."
   },
   {
     "id": 13,
-    "pregunta": "¿Qué hago si me enfermo y no puedo ir a trabajar?",
-    "respuesta": "Podés pedir licencia por enfermedad común presentando el certificado médico correspondiente."
+    "pregunta": "¿Cómo recupero mi certificado?",
+    "respuesta": "Si ya realizaste una capacitación y no encontrás tu certificado, podés comunicarte con el área responsable para solicitar orientación sobre su recuperación."
   },
   {
     "id": 14,
-    "pregunta": "¿Cuánto tiempo me cubre la licencia por enfermedad?",
-    "respuesta": "El régimen prevé hasta 12 meses, con distintas modalidades de goce de haberes según el caso.\n\nEstoy embarazada, ¿qué licencia me corresponde?\nLa licencia por maternidad te cubre 45 días antes del parto y 45 días después, con goce de haberes."
+    "pregunta": "¿Cómo actualizo mis datos personales en el sindicato?",
+    "respuesta": "La actualización de datos personales se realiza por los canales administrativos habilitados por el sindicato. Es importante mantener tus datos actualizados para recibir información y beneficios."
   },
   {
     "id": 15,
-    "pregunta": "¿Qué es una licencia por largo tratamiento?",
-    "respuesta": "Es para enfermedades graves que requieren más tiempo de recuperación. Podés tener hasta 24 meses (con distintos porcentajes de sueldo)."
+    "pregunta": "¿Cómo sé si estoy afiliado?",
+    "respuesta": "Podés confirmar tu situación de afiliación consultando en la sede del sindicato o por los canales administrativos correspondientes."
   },
   {
     "id": 16,
-    "pregunta": "¿Puedo tomarme licencia por un familiar enfermo?",
-    "respuesta": "Sí, existe la licencia por enfermedad de familiar directo, con requisitos y plazos determinados."
+    "pregunta": "¿Cómo hago un trámite en el sindicato?",
+    "respuesta": "Para realizar un trámite, te recomendamos comunicarte primero con el sindicato para que te indiquen el área correspondiente, la documentación necesaria y la modalidad de presentación."
   },
   {
     "id": 17,
-    "pregunta": "¿Qué pasa si necesito operarme y estar en reposo?",
-    "respuesta": "Se puede solicitar una licencia por cirugía, con respaldo médico y evaluación por junta médica si es necesario."
+    "pregunta": "¿Dónde consulto novedades del sindicato?",
+    "respuesta": "Las novedades institucionales suelen informarse por los canales oficiales del sindicato, redes sociales, comunicados y medios de contacto habilitados."
   },
   {
     "id": 18,
-    "pregunta": "¿Me pueden descontar los días si estoy con licencia médica?",
-    "respuesta": "No, si la licencia es justificada y dentro del régimen, se mantienen los haberes según lo que indica la normativa."
+    "pregunta": "¿Cómo accedo a los formularios del sindicato?",
+    "respuesta": "Los formularios se comparten por los canales oficiales del sindicato, según el trámite o la convocatoria correspondiente."
   },
   {
     "id": 19,
-    "pregunta": "¿Cuántas licencias puedo pedir en el año?",
-    "respuesta": "No hay un número fijo, pero se deben respetar los límites según el tipo de licencia y lo que apruebe la junta médica."
+    "pregunta": "¿Qué servicios brinda el sindicato?",
+    "respuesta": "El sindicato brinda acompañamiento gremial, asesoramiento, gestión de consultas, capacitaciones y otros servicios institucionales para sus afiliados."
   },
   {
     "id": 20,
-    "pregunta": "¿Puedo pedir licencia para estudiar?",
-    "respuesta": "Sí, existe una licencia por estudio, tanto para rendir exámenes como para cursar carreras."
-  },
-  {
-    "id": 21,
-    "pregunta": "¿Qué hago si me agoto el tiempo de licencia médica y no estoy recuperado?",
-    "respuesta": "Podés solicitar extensión, cambio de funciones o iniciar el trámite para jubilación por invalidez, según dictamen médico."
+    "pregunta": "¿Cómo hago una consulta sobre una gestión en curso?",
+    "respuesta": "Si ya iniciaste una gestión, podés consultar su estado por el canal donde fue presentada o comunicándote con el área correspondiente del sindicato."
   }
 ]

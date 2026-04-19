@@ -437,6 +437,145 @@
       "otorgante": "Dir. Prov. RR HH - Min. de Educ. C.yT.",
       "interviniente": "Director Unidad Escolar Director de Nivel"
     }
+    ,
+{
+  "articulo": "35 y 36",
+  "descripcion": "Para Estudios, Exámenes y Prácticas",
+  "otorgante": "Director Unidad Escolar/Organismo",
+  "interviniente": "Secretario de Unidad Escolar"
+},
+{
+  "articulo": "37",
+  "descripcion": "Para Realizar Estudios e Investigaciones",
+  "otorgante": "Poder Ejecutivo",
+  "interviniente": "Dir. Prov. de RRHH - Min. de Educ. C. y T."
+},
+{
+  "articulo": "38",
+  "descripcion": "Para Actividades de interés educativo, científico, cultural y tecnológico",
+  "otorgante": "Director de Nivel",
+  "interviniente": "Director Unidad Escolar"
+},
+{
+  "articulo": "39",
+  "descripcion": "Para Actividades Deportivas no Rentadas",
+  "otorgante": "Min. de Educ. C. y T.",
+  "interviniente": "Director Unidad Escolar Director de Nivel"
+},
+{
+  "articulo": "40",
+  "descripcion": "Representación Gremial",
+  "otorgante": "Min. de Educ. C. y T.",
+  "interviniente": "Min. de Educ. C. y T."
+},
+{
+  "articulo": "41",
+  "descripcion": "Capacitación y Perfeccionamiento Docente",
+  "otorgante": "Dir. Prov. RR HH - Min. de Educ. C.yT.",
+  "interviniente": "Director Unidad Escolar"
+},
+{
+  "articulo": "42",
+  "descripcion": "Candidatura a Cargos Electivos",
+  "otorgante": "Director Unidad Escolar",
+  "interviniente": "Secretario de Unidad Escolar"
+},
+{
+  "articulo": "43",
+  "descripcion": "Ejercicio de Cargos Electivos o funciones superiores de gobierno",
+  "otorgante": "Dir. Prov. RR HH - Min. de Educ. C.yT.",
+  "interviniente": "Director Unidad Escolar Director de Nivel"
+},
+{
+  "articulo": "44",
+  "descripcion": "Ejercicio de Cargos de Mayor Jerarquía",
+  "otorgante": "Dir. Prov. RR HH - Min. de Educ. C.yT.",
+  "interviniente": "Director Unidad Escolar Director de Nivel"
+},
+{
+  "articulo": "45",
+  "descripcion": "Asuntos Particulares",
+  "otorgante": "Dir. Prov. RR HH - Min. de Educ. C.yT.",
+  "interviniente": "Director Unidad Escolar"
+},
+{
+  "articulo": "46",
+  "descripcion": "Para Acompañar al Cónyuge",
+  "otorgante": "Dir. Prov. RR HH - Min. de Educ. C.yT.",
+  "interviniente": "Director Unidad Escolar"
+},
+{
+  "articulo": "48",
+  "descripcion": "Por Fallecimiento",
+  "otorgante": "Director Unidad Escolar",
+  "interviniente": "Secretario de Unidad Escolar"
+},
+{
+  "articulo": "49",
+  "descripcion": "Por Razones Extraordinarias",
+  "otorgante": "Director Unidad Escolar",
+  "interviniente": "Secretario de Unidad Escolar"
+},
+{
+  "articulo": "50",
+  "descripcion": "Por Donación de Sangre",
+  "otorgante": "Director Unidad Escolar",
+  "interviniente": "Secretario de Unidad Escolar"
+},
+{
+  "articulo": "51",
+  "descripcion": "Por donación de órganos",
+  "otorgante": "Dir. Prov. RR HH - Min. de Educ. C.yT.",
+  "interviniente": "Secretario de Unidad Escolar"
+},
+{
+  "articulo": "52",
+  "descripcion": "Por Razones Especiales Particulares",
+  "otorgante": "Director Unidad Escolar",
+  "interviniente": "Secretario de Unidad Escolar"
+},
+{
+  "articulo": "53 y 54",
+  "descripcion": "Por Superposición de Horarios",
+  "otorgante": "Director Unidad Escolar",
+  "interviniente": "Secretario de Unidad Escolar"
+},
+{
+  "articulo": "55",
+  "descripcion": "Por Festividades Religiosas",
+  "otorgante": "Director Unidad Escolar",
+  "interviniente": "Secretario de Unidad Escolar"
+},
+{
+  "articulo": "56",
+  "descripcion": "Comisión de Servicios",
+  "otorgante": "Director Unidad Escolar",
+  "interviniente": "Secretario de Unidad Escolar"
+},
+{
+  "articulo": "58",
+  "descripcion": "Horario para Estudiantes",
+  "otorgante": "Dir. Prov. RR HH - Min. de Educ. C.yT.",
+  "interviniente": "Director Unidad Escolar"
+},
+{
+  "articulo": "59",
+  "descripcion": "Reducción Horaria para docentes madres de lactantes",
+  "otorgante": "Director Unidad Escolar",
+  "interviniente": "Secretario de Unidad Escolar"
+},
+{
+  "articulo": "60",
+  "descripcion": "Por Citaciones y Trámites Personales",
+  "otorgante": "Director Unidad Escolar",
+  "interviniente": "Secretario de Unidad Escolar"
+},
+{
+  "articulo": "61",
+  "descripcion": "Para Delegados Gremiales",
+  "otorgante": "Dir. Prov. RR HH - Min. de Educ. C.yT.",
+  "interviniente": "Director Unidad Escolar"
+}
   ]
 }
   

@@ -1,14 +1,17 @@
+import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import { z } from "zod";
-import { runChatbotFileSearch } from "./openaiFileSearch.js";
+import { runChatbotWorkflow } from "./openaiWorkflow.js";
 
 const app = express();
 const PORT = Number(process.env.PORT || 8080);
 
 const bodySchema = z.object({
   pregunta: z.string().trim().min(2, "La pregunta es obligatoria"),
-  dominio: z.enum(["licencias", "estatuto", "general"]).optional(),
+  dominio: z
+    .enum(["licencias", "estatuto", "general", "coberturas"])
+    .optional(),
   maxResults: z.number().int().min(1).max(8).optional(),
 });
 
@@ -25,16 +28,23 @@ app.get("/health", (_req, res) => {
 app.post("/api/chatbot/query", async (req, res) => {
   try {
     const input = bodySchema.parse(req.body);
-    const result = await runChatbotFileSearch(input);
+    const result = await runChatbotWorkflow(input);
     res.status(200).json(result);
   } catch (error: any) {
     if (error instanceof z.ZodError) {
       res.status(400).json({
         ok: false,
+        tipo: "error",
+        dominio: req.body?.dominio || "general",
+        origen: "backend",
+        consulta: req.body?.pregunta || "",
+        consultaNormalizada: req.body?.pregunta || "",
         respuesta: "Solicitud inválida.",
+        articulos: [],
         referencias: [],
         busqueda: [],
-        error: error.issues.map((i) => i.message).join(" | "),
+        conversationId: null,
+        error: error.issues.map((i: any) => i.message).join(" | "),
       });
       return;
     }
@@ -43,9 +53,16 @@ app.post("/api/chatbot/query", async (req, res) => {
 
     res.status(500).json({
       ok: false,
+      tipo: "error",
+      dominio: req.body?.dominio || "general",
+      origen: "backend",
+      consulta: req.body?.pregunta || "",
+      consultaNormalizada: req.body?.pregunta || "",
       respuesta: "Hubo un problema al consultar la IA.",
+      articulos: [],
       referencias: [],
       busqueda: [],
+      conversationId: null,
       error: error?.message || "Error interno",
     });
   }

@@ -13,11 +13,12 @@
     "index:docs": "tsx scripts/indexDocuments.ts"
   },
   "dependencies": {
+    "@openai/agents": "^0.8.3",
     "cors": "^2.8.5",
     "dotenv": "^17.3.1",
     "express": "^5.1.0",
     "openai": "^6.0.0",
-    "zod": "^3.25.76"
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "@types/cors": "^2.8.19",
