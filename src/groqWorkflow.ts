@@ -29,6 +29,9 @@ export type BackendArticulo = {
   fuente?: string;
   otorgante?: string;
   interviniente?: string;
+  seccion?: string;
+  nivel?: string;
+  tipo?: string;
   [key: string]: unknown;
 };
 
@@ -69,6 +72,9 @@ type LocalChunk = {
   descripcion?: string;
   otorgante?: string;
   interviniente?: string;
+  seccion?: string;
+  nivel?: string;
+  tipo?: string;
   text: string;
   raw?: unknown;
 };
@@ -704,6 +710,106 @@ const QUERY_EXPANSIONS: QueryExpansion[] = [
     ],
     preferredArticles: ["72", "73", "74", "75", "76"],
   },
+
+  {
+    dominio: "coberturas",
+    triggers: [
+      "cabecera cero",
+      "cabecera 0",
+      "que es cabecera cero",
+      "qué es cabecera cero",
+      "cargo desierto",
+      "cargos desiertos",
+      "asamblea desierta",
+      "asambleas desiertas",
+    ],
+    terms: [
+      "cabecera cero cargos quedaron desiertos despues de dos asambleas ordinarias orden titulo docente titulo habilitante titulo supletorio estudiantes avanzados",
+    ],
+    preferredArticles: ["ANEXO I Punto 12", "ANEXO II Punto 10"],
+  },
+  {
+    dominio: "coberturas",
+    triggers: [
+      "cabecera cero secundaria",
+      "cabecera 0 secundaria",
+      "cabecera cero nivel secundario",
+      "cabecera cero en secundaria",
+      "horas catedra cabecera cero",
+      "horas cátedra cabecera cero",
+    ],
+    terms: [
+      "anexo ii punto 10 cabecera cero secundaria cargos horas catedra desiertos dos asambleas ordinarias",
+    ],
+    preferredArticles: ["ANEXO II Punto 10"],
+  },
+  {
+    dominio: "coberturas",
+    triggers: [
+      "cabecera cero primaria",
+      "cabecera cero inicial",
+      "cabecera cero nivel primario",
+      "cabecera cero nivel inicial",
+    ],
+    terms: [
+      "anexo i punto 12 cabecera cero inicial primaria cargos desiertos dos asambleas ordinarias",
+    ],
+    preferredArticles: ["ANEXO I Punto 12"],
+  },
+  {
+    dominio: "coberturas",
+    triggers: [
+      "documentacion para tomar cargo",
+      "documentación para tomar cargo",
+      "documentacion necesito",
+      "documentación necesito",
+      "que documentacion necesito",
+      "qué documentación necesito",
+      "fua",
+      "formulario unico de alta",
+      "formulario único de alta",
+      "declaracion jurada de cargos",
+      "declaración jurada de cargos",
+    ],
+    terms: [
+      "documentacion alta formulario unico alta fua declaracion jurada cargos documento identidad legajo electronico cese licencia",
+    ],
+    preferredArticles: ["ANEXO I Punto 20", "ANEXO II Punto 15"],
+  },
+  {
+    dominio: "coberturas",
+    triggers: [
+      "no me presento a destino",
+      "no presentarse a destino",
+      "no se presento",
+      "no se presentó",
+      "despues de tomar un cargo",
+      "después de tomar un cargo",
+      "inhabilitacion",
+      "inhabilitación",
+      "perder derecho a optar",
+    ],
+    terms: [
+      "no presentarse destino pierde derecho optar resto ciclo lectivo inhabilitacion sancion",
+    ],
+    preferredArticles: ["ANEXO I Punto 15", "ANEXO II Punto 13"],
+  },
+  {
+    dominio: "coberturas",
+    triggers: [
+      "como se cubren horas catedra",
+      "cómo se cubren horas cátedra",
+      "horas catedra secundaria",
+      "horas cátedra secundaria",
+      "cobertura horas catedra",
+      "cobertura horas cátedra",
+    ],
+    terms: [
+      "anexo ii secundaria cobertura cargos horas catedras interino suplente lom titulo docente habilitante",
+    ],
+    preferredArticles: ["ANEXO II Punto 1", "ANEXO II Punto 8", "ANEXO II Punto 9"],
+  },
+
   {
     dominio: "estatuto",
     triggers: ["estabilidad", "estable", "titularidad"],
@@ -956,11 +1062,16 @@ function classifyDomain(
 
   if (
     text.includes("cobertura") ||
+    text.includes("coberturas") ||
     text.includes("asamblea") ||
     text.includes("cabecera") ||
     text.includes("vacante") ||
+    text.includes("vacantes") ||
     text.includes("lom") ||
-    text.includes("fua")
+    text.includes("fua") ||
+    text.includes("cargo desierto") ||
+    text.includes("horas catedra") ||
+    text.includes("horas cátedra")
   ) {
     return "coberturas";
   }
@@ -1057,6 +1168,8 @@ function classifyDomain(
       "suplente",
       "suplencia",
       "cabecera",
+      "cabecera cero",
+      "cabecera 0",
       "lom",
       "listado",
       "vacante",
@@ -1065,6 +1178,9 @@ function classifyDomain(
       "opcion",
       "destino",
       "renuncia",
+      "secundaria",
+      "primaria",
+      "inicial",
     ],
     general: [
       "afiliacion",
@@ -1233,6 +1349,9 @@ function objectToText(value: unknown, depth = 0): string {
             "keywords",
             "otorgante",
             "interviniente",
+            "seccion",
+            "nivel",
+            "tipo",
           ].includes(normalizedKey)
         ) {
           return text;
@@ -1382,6 +1501,12 @@ function makeArticleChunk(
     articulo,
     articleRefs,
     titulo: prefix && titulo ? `${prefix} - ${titulo}` : titulo || prefix || undefined,
+    descripcion: getObjectField(item, ["descripcion", "descripción"]),
+    otorgante: getObjectField(item, ["otorgante"]),
+    interviniente: getObjectField(item, ["interviniente"]),
+    seccion: getObjectField(item, ["seccion", "sección"]),
+    nivel: getObjectField(item, ["nivel"]),
+    tipo: getObjectField(item, ["tipo"]),
     text,
     raw: item,
   };
@@ -1399,11 +1524,17 @@ function makeResumenChunk(
   const descripcion = getObjectField(row, ["descripcion", "descripción"]);
   const otorgante = getObjectField(row, ["otorgante"]);
   const interviniente = getObjectField(row, ["interviniente"]);
+  const seccion = getObjectField(row, ["seccion", "sección"]);
+  const nivel = getObjectField(row, ["nivel"]);
+  const tipo = getObjectField(row, ["tipo"]);
 
   const text = [
     prefix,
     articulo ? `Artículo/s: ${articulo}` : "",
     descripcion ? `Descripción: ${descripcion}` : "",
+    seccion ? `Sección: ${seccion}` : "",
+    nivel ? `Nivel: ${nivel}` : "",
+    tipo ? `Tipo: ${tipo}` : "",
     otorgante ? `Funcionario otorgante: ${otorgante}` : "",
     interviniente ? `Funcionario interviniente: ${interviniente}` : "",
   ]
@@ -1425,6 +1556,9 @@ function makeResumenChunk(
     descripcion,
     otorgante,
     interviniente,
+    seccion,
+    nivel,
+    tipo,
     text,
     raw: row,
   };
@@ -1550,7 +1684,7 @@ function expandQuestion(pregunta: string, dominio: DominioBackend): string {
       : dominio === "estatuto"
       ? "estatuto docente ley 3122 derechos deberes carrera docente articulo"
       : dominio === "coberturas"
-      ? "asamblea publica cobertura cargos horas catedra interinato suplencia"
+      ? "asamblea publica cobertura cargos horas catedra interinato suplencia cabecera cero lom fua"
       : "consulta general sindicato afiliado tramite formulario beneficio";
 
   return `${pregunta} ${domainBase} ${expandedTerms}`.trim();
@@ -1577,9 +1711,10 @@ function articleMatches(chunk: LocalChunk, articleNumber: string): boolean {
   if (!articleNumber) return false;
 
   const article = normalizeText(chunk.articulo || "");
+  const target = normalizeText(articleNumber);
   const refs = chunk.articleRefs.map((ref) => normalizeText(ref));
 
-  return article === articleNumber || refs.includes(articleNumber);
+  return article === target || refs.includes(target);
 }
 
 function isGenericLicenseArticle(chunk: LocalChunk): boolean {
@@ -1639,6 +1774,8 @@ function scoreChunk(
   const normalizedChunk = normalizeText(chunk.text);
   const normalizedTitle = normalizeText(chunk.titulo || "");
   const normalizedDescription = normalizeText(chunk.descripcion || "");
+  const normalizedNivel = normalizeText(chunk.nivel || "");
+  const normalizedSeccion = normalizeText(chunk.seccion || "");
 
   const chunkSearchText = normalizeText(
     [
@@ -1648,6 +1785,9 @@ function scoreChunk(
       chunk.articulo,
       chunk.otorgante,
       chunk.interviniente,
+      chunk.seccion,
+      chunk.nivel,
+      chunk.tipo,
       chunk.text,
     ]
       .filter(Boolean)
@@ -1666,6 +1806,8 @@ function scoreChunk(
     if (normalizedTitle.includes(token)) score += 12;
     if (normalizedDescription.includes(token)) score += 14;
     if (normalizedChunk.includes(token)) score += 4;
+    if (normalizedNivel.includes(token)) score += 18;
+    if (normalizedSeccion.includes(token)) score += 8;
   }
 
   if (normalizedPregunta.length >= 8 && chunkSearchText.includes(normalizedPregunta)) {
@@ -1739,6 +1881,82 @@ function scoreChunk(
     !chunk.articleRefs.includes("41")
   ) {
     score -= 180;
+  }
+
+  const isCoberturasQuery = dominio === "coberturas";
+  const isSecundariaQuery =
+    normalizedPregunta.includes("secundaria") ||
+    normalizedPregunta.includes("secundario") ||
+    normalizedPregunta.includes("nivel secundario") ||
+    normalizedPregunta.includes("horas catedra") ||
+    normalizedPregunta.includes("horas cátedra");
+
+  const isPrimariaQuery =
+    normalizedPregunta.includes("primaria") ||
+    normalizedPregunta.includes("primario") ||
+    normalizedPregunta.includes("inicial") ||
+    normalizedPregunta.includes("nivel inicial") ||
+    normalizedPregunta.includes("nivel primario");
+
+  const isCabeceraCeroQuery =
+    normalizedPregunta.includes("cabecera cero") ||
+    normalizedPregunta.includes("cabecera 0");
+
+  if (isCoberturasQuery && isCabeceraCeroQuery) {
+    if (String(chunk.articulo || "") === "ANEXO II Punto 10") {
+      score += 220;
+    }
+
+    if (String(chunk.articulo || "") === "ANEXO I Punto 12") {
+      score += 140;
+    }
+
+    if (
+      String(chunk.articulo || "") === "ANEXO II Punto 4" ||
+      String(chunk.articulo || "") === "ANEXO I Punto 6"
+    ) {
+      score -= 90;
+    }
+  }
+
+  if (isCoberturasQuery && isSecundariaQuery) {
+    if (
+      chunk.nivel === "Secundario" ||
+      normalizedNivel.includes("secundario") ||
+      normalizedChunk.includes("nivel secundario")
+    ) {
+      score += 120;
+    }
+
+    if (
+      chunk.nivel === "Inicial y Primaria" ||
+      normalizedNivel.includes("inicial") ||
+      normalizedNivel.includes("primaria") ||
+      normalizedChunk.includes("nivel inicial") ||
+      normalizedChunk.includes("educacion primaria")
+    ) {
+      score -= 160;
+    }
+  }
+
+  if (isCoberturasQuery && isPrimariaQuery) {
+    if (
+      chunk.nivel === "Inicial y Primaria" ||
+      normalizedNivel.includes("inicial") ||
+      normalizedNivel.includes("primaria") ||
+      normalizedChunk.includes("nivel inicial") ||
+      normalizedChunk.includes("educacion primaria")
+    ) {
+      score += 120;
+    }
+
+    if (
+      chunk.nivel === "Secundario" ||
+      normalizedNivel.includes("secundario") ||
+      normalizedChunk.includes("nivel secundario")
+    ) {
+      score -= 100;
+    }
   }
 
   return score;
@@ -1909,6 +2127,8 @@ function buildContext(chunks: LocalChunk[]): string {
         `Tipo: ${chunk.kind}`,
         `Fuente: ${chunk.referencia}`,
         chunk.articulo ? `Artículo/s: ${chunk.articulo}` : "",
+        chunk.seccion ? `Sección: ${chunk.seccion}` : "",
+        chunk.nivel ? `Nivel: ${chunk.nivel}` : "",
         chunk.titulo ? `Título: ${chunk.titulo}` : "",
         chunk.descripcion ? `Descripción: ${chunk.descripcion}` : "",
         chunk.otorgante ? `Funcionario otorgante: ${chunk.otorgante}` : "",
@@ -1936,6 +2156,8 @@ function buildLocalFallbackAnswer(chunks: LocalChunk[]): string {
         : chunk.descripcion || chunk.titulo || "Fragmento encontrado";
 
       const extra = [
+        chunk.seccion ? `Sección: ${chunk.seccion}` : "",
+        chunk.nivel ? `Nivel: ${chunk.nivel}` : "",
         chunk.otorgante ? `Funcionario otorgante: ${chunk.otorgante}` : "",
         chunk.interviniente
           ? `Funcionario interviniente: ${chunk.interviniente}`
@@ -1981,6 +2203,9 @@ function toArticulos(chunks: LocalChunk[]): BackendArticulo[] {
     fuente: chunk.referencia,
     otorgante: chunk.otorgante,
     interviniente: chunk.interviniente,
+    seccion: chunk.seccion,
+    nivel: chunk.nivel,
+    tipo: chunk.tipo,
   }));
 }
 
@@ -2002,7 +2227,9 @@ function buildGroqSystemPrompt(): string {
     "No inventes artículos, plazos, requisitos, autoridades ni procedimientos.",
     "Si la información no está en los fragmentos, indicá que no se encontró información suficiente.",
     "Usá lenguaje claro, formal y útil para docentes afiliados.",
-    "Cuando corresponda, mencioná artículos, días, requisitos, funcionarios otorgantes e intervinientes presentes en los fragmentos.",
+    "Cuando corresponda, mencioná artículos, puntos, anexos, niveles, días, requisitos, funcionarios otorgantes e intervinientes presentes en los fragmentos.",
+    "Si la consulta menciona secundaria, priorizá fragmentos del Anexo II o nivel Secundario.",
+    "Si la consulta menciona inicial o primaria, priorizá fragmentos del Anexo I o nivel Inicial y Primaria.",
     "Si el fragmento de resumen indica funcionario otorgante o interviniente, incluilo al final de la respuesta.",
     "No confundas encabezados de secciones siguientes con el contenido del artículo consultado.",
     "Para Capacitación y Perfeccionamiento Docente, si aparece el Artículo 34 junto al Artículo 41, debe considerarse licencia extraordinaria con goce de haberes.",
