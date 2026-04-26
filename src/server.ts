@@ -9,10 +9,6 @@ import { runChatbotWorkflow } from "./openaiWorkflow.js";
 const app = express();
 const PORT = Number(process.env.PORT || 8080);
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
-
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
@@ -28,6 +24,18 @@ const bodySchema = z.object({
   maxResults: z.number().int().min(1).max(8).optional(),
 });
 
+function getOpenAITranscriptionClient(): OpenAI {
+  const apiKey = process.env.OPENAI_API_KEY?.trim();
+
+  if (!apiKey) {
+    throw new Error(
+      "Falta OPENAI_API_KEY. La consulta del chatbot usa Groq, pero la transcripción de audio todavía requiere OpenAI."
+    );
+  }
+
+  return new OpenAI({ apiKey });
+}
+
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
@@ -35,6 +43,8 @@ app.get("/health", (_req, res) => {
   res.status(200).json({
     ok: true,
     service: "sidca-chatbot-backend",
+    chatbot: "groq_rag",
+    endpoint: "/api/chatbot/query",
   });
 });
 
@@ -42,6 +52,7 @@ app.post("/api/chatbot/query", async (req, res) => {
   try {
     const input = bodySchema.parse(req.body);
     const result = await runChatbotWorkflow(input);
+
     res.status(200).json(result);
   } catch (error: any) {
     if (error instanceof z.ZodError) {
@@ -71,7 +82,7 @@ app.post("/api/chatbot/query", async (req, res) => {
       origen: "backend",
       consulta: req.body?.pregunta || "",
       consultaNormalizada: req.body?.pregunta || "",
-      respuesta: "Hubo un problema al consultar la IA.",
+      respuesta: "Servicio no disponible por el momento.",
       articulos: [],
       referencias: [],
       busqueda: [],
@@ -94,6 +105,8 @@ app.post(
         return;
       }
 
+      const openai = getOpenAITranscriptionClient();
+
       const audioFile = await toFile(
         req.file.buffer,
         req.file.originalname || "audio.m4a",
@@ -104,7 +117,7 @@ app.post(
 
       const transcription = await openai.audio.transcriptions.create({
         file: audioFile,
-        model: "gpt-4o-mini-transcribe",
+        model: process.env.OPENAI_TRANSCRIBE_MODEL || "gpt-4o-mini-transcribe",
         language: "es",
       });
 
@@ -125,4 +138,5 @@ app.post(
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`[sidca-chatbot-backend] running on http://0.0.0.0:${PORT}`);
+  console.log("[sidca-chatbot-backend] chatbot mode: groq_rag");
 });
