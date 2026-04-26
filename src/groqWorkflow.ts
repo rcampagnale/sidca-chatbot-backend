@@ -714,6 +714,23 @@ const QUERY_EXPANSIONS: QueryExpansion[] = [
   {
     dominio: "coberturas",
     triggers: [
+      "cobertura",
+      "coberturas",
+      "asamblea",
+      "asambleas",
+      "quiero saber de las asambleas",
+      "sistema de asamblea",
+      "asamblea publica",
+      "asamblea pública",
+    ],
+    terms: [
+      "sistema asamblea publica coberturas cargos horas catedras interinos suplentes decreto 636",
+    ],
+    preferredArticles: ["Decreto Artículo 1", "Decreto Artículo 2", "ANEXO I Punto 1", "ANEXO II Punto 1"],
+  },
+  {
+    dominio: "coberturas",
+    triggers: [
       "cabecera cero",
       "cabecera 0",
       "que es cabecera cero",
@@ -1048,7 +1065,6 @@ function classifyDomain(
   if (
     dominio === "licencias" ||
     dominio === "estatuto" ||
-    dominio === "general" ||
     dominio === "coberturas"
   ) {
     return dominio;
@@ -1064,14 +1080,23 @@ function classifyDomain(
     text.includes("cobertura") ||
     text.includes("coberturas") ||
     text.includes("asamblea") ||
+    text.includes("asambleas") ||
     text.includes("cabecera") ||
+    text.includes("cabecera cero") ||
+    text.includes("cabecera 0") ||
     text.includes("vacante") ||
     text.includes("vacantes") ||
     text.includes("lom") ||
     text.includes("fua") ||
+    text.includes("formulario unico") ||
     text.includes("cargo desierto") ||
+    text.includes("cargos desiertos") ||
     text.includes("horas catedra") ||
-    text.includes("horas cátedra")
+    text.includes("hora catedra") ||
+    text.includes("interino") ||
+    text.includes("interinos") ||
+    text.includes("suplente") ||
+    text.includes("suplentes")
   ) {
     return "coberturas";
   }
@@ -1159,6 +1184,7 @@ function classifyDomain(
       "cobertura",
       "coberturas",
       "asamblea",
+      "asambleas",
       "cargo",
       "cargos",
       "horas",
@@ -1684,7 +1710,7 @@ function expandQuestion(pregunta: string, dominio: DominioBackend): string {
       : dominio === "estatuto"
       ? "estatuto docente ley 3122 derechos deberes carrera docente articulo"
       : dominio === "coberturas"
-      ? "asamblea publica cobertura cargos horas catedra interinato suplencia cabecera cero lom fua"
+      ? "asamblea publica cobertura cargos horas catedra interinato suplencia cabecera cero lom fua decreto 636"
       : "consulta general sindicato afiliado tramite formulario beneficio";
 
   return `${pregunta} ${domainBase} ${expandedTerms}`.trim();
@@ -1888,8 +1914,7 @@ function scoreChunk(
     normalizedPregunta.includes("secundaria") ||
     normalizedPregunta.includes("secundario") ||
     normalizedPregunta.includes("nivel secundario") ||
-    normalizedPregunta.includes("horas catedra") ||
-    normalizedPregunta.includes("horas cátedra");
+    normalizedPregunta.includes("horas catedra");
 
   const isPrimariaQuery =
     normalizedPregunta.includes("primaria") ||
@@ -1901,6 +1926,40 @@ function scoreChunk(
   const isCabeceraCeroQuery =
     normalizedPregunta.includes("cabecera cero") ||
     normalizedPregunta.includes("cabecera 0");
+
+  if (isCoberturasQuery) {
+    if (normalizedPregunta.includes("cobertura") || normalizedPregunta.includes("coberturas")) {
+      if (
+        String(chunk.articulo || "") === "Decreto Artículo 1" ||
+        String(chunk.articulo || "") === "Decreto Artículo 2"
+      ) {
+        score += 180;
+      }
+
+      if (
+        String(chunk.articulo || "") === "ANEXO I Punto 1" ||
+        String(chunk.articulo || "") === "ANEXO II Punto 1"
+      ) {
+        score += 140;
+      }
+    }
+
+    if (normalizedPregunta.includes("asamblea") || normalizedPregunta.includes("asambleas")) {
+      if (
+        String(chunk.articulo || "") === "ANEXO I Punto 1" ||
+        String(chunk.articulo || "") === "ANEXO II Punto 1"
+      ) {
+        score += 160;
+      }
+
+      if (
+        String(chunk.articulo || "") === "Decreto Artículo 1" ||
+        String(chunk.articulo || "") === "Decreto Artículo 2"
+      ) {
+        score += 120;
+      }
+    }
+  }
 
   if (isCoberturasQuery && isCabeceraCeroQuery) {
     if (String(chunk.articulo || "") === "ANEXO II Punto 10") {
