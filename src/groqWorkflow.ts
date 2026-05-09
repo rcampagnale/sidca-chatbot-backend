@@ -2121,6 +2121,155 @@ function isGenericLicenseQuestion(pregunta: string): boolean {
   return (hasGenericPattern || hasOnlyGenericTokens) && !hasSpecificKeyword;
 }
 
+
+function isGenericTeacherQuestion(pregunta: string): boolean {
+  const text = normalizeText(pregunta);
+  const tokens = tokenize(text);
+  const compact = text.replace(/\s+/g, "");
+
+  const genericPatterns = [
+    "docente",
+    "docentes",
+    "cargo docente",
+    "cargos docentes",
+    "quiero saber sobre docente",
+    "quiero saber de docente",
+    "tema docente",
+    "sobre docente",
+  ];
+
+  const hasGenericPattern = genericPatterns.some((pattern) => text === pattern);
+
+  const hasOnlyGenericTokens =
+    tokens.length > 0 &&
+    tokens.length <= 3 &&
+    tokens.every((token) =>
+      [
+        "docente",
+        "docentes",
+        "cargo",
+        "cargos",
+        "profesor",
+        "profesora",
+        "maestro",
+        "maestra",
+      ].includes(token)
+    );
+
+  const hasSpecificKeyword =
+    text.includes("interino") ||
+    text.includes("interinos") ||
+    text.includes("suplente") ||
+    text.includes("suplentes") ||
+    text.includes("titular") ||
+    text.includes("titulares") ||
+    text.includes("licencia") ||
+    text.includes("licencias") ||
+    text.includes("estatuto") ||
+    text.includes("cobertura") ||
+    text.includes("asamblea") ||
+    text.includes("cabecera") ||
+    text.includes("funcion") ||
+    text.includes("funciones") ||
+    text.includes("director") ||
+    text.includes("secretario") ||
+    compact.includes("maestrogrado");
+
+  return (hasGenericPattern || hasOnlyGenericTokens) && !hasSpecificKeyword;
+}
+
+function isIncompleteTeacherComparisonQuestion(pregunta: string): boolean {
+  const text = normalizeText(pregunta);
+
+  const asksDifference =
+    text.includes("diferencia") ||
+    text.includes("diferencias") ||
+    text.includes("distingue") ||
+    text.includes("comparar");
+
+  if (!asksDifference) return false;
+
+  const mentionsTeacher =
+    text.includes("docente") ||
+    text.includes("maestro") ||
+    text.includes("profesor");
+
+  const mentionsOneStatus =
+    text.includes("suplente") ||
+    text.includes("interino") ||
+    text.includes("titular");
+
+  const statusCount = ["suplente", "interino", "titular"].reduce(
+    (acc, status) => acc + (text.includes(status) ? 1 : 0),
+    0
+  );
+
+  const endsWithGenericTeacher =
+    text.endsWith("y un docente") ||
+    text.endsWith("y una docente") ||
+    text.endsWith("y docente") ||
+    text.endsWith("con un docente") ||
+    text.endsWith("con una docente");
+
+  return mentionsTeacher && mentionsOneStatus && (statusCount < 2 || endsWithGenericTeacher);
+}
+
+function isMedicalLicenseAfterAppointmentQuestion(pregunta: string): boolean {
+  const text = normalizeText(pregunta);
+
+  const compact = text.replace(/\s+/g, "");
+
+  const mentionsMedicalLicense =
+    text.includes("licencia medica") ||
+    text.includes("licencia mdica") ||
+    text.includes("licencia por enfermedad") ||
+    text.includes("licencia de salud") ||
+    text.includes("certificado medico") ||
+    text.includes("certificado mdico") ||
+    text.includes("carpeta medica") ||
+    text.includes("carpeta mdica") ||
+    (text.includes("licencia") &&
+      (text.includes("medica") ||
+        text.includes("mdica") ||
+        text.includes("mdico") ||
+        text.includes("medic") ||
+        text.includes("mdic") ||
+        compact.includes("licenciamdica") ||
+        compact.includes("licenciamedica") ||
+        text.includes("salud") ||
+        text.includes("enfermedad") ||
+        text.includes("enfermo") ||
+        text.includes("enferma")));
+
+  const mentionsAppointmentOrPosition =
+    text.includes("optado") ||
+    text.includes("opte") ||
+    text.includes("optar") ||
+    text.includes("opcion") ||
+    text.includes("tomar cargo") ||
+    text.includes("tome cargo") ||
+    text.includes("tomado un cargo") ||
+    text.includes("haber tomado") ||
+    text.includes("designado") ||
+    text.includes("designacion") ||
+    text.includes("alta") ||
+    text.includes("cargo docente") ||
+    text.includes("cargo");
+
+  const asksMinimumTime =
+    text.includes("a partir") ||
+    text.includes("cuantos dias") ||
+    text.includes("cuanto dias") ||
+    text.includes("desde cuando") ||
+    text.includes("desde que dia") ||
+    text.includes("despues de") ||
+    text.includes("luego de") ||
+    text.includes("plazo") ||
+    text.includes("antiguedad");
+
+  return mentionsMedicalLicense && mentionsAppointmentOrPosition && asksMinimumTime;
+}
+
 function scoreChunk(
   chunk: LocalChunk,
   pregunta: string,
@@ -2797,6 +2946,8 @@ function buildGroqSystemPrompt(): string {
     "Si el fragmento de resumen indica funcionario otorgante o interviniente, incluilo al final de la respuesta.",
     "No confundas encabezados de secciones siguientes con el contenido del artículo consultado.",
     "Para Capacitación y Perfeccionamiento Docente, si aparece el Artículo 34 junto al Artículo 41, debe considerarse licencia extraordinaria con goce de haberes.",
+    "No infieras diferencias entre docente suplente, interino o titular si los fragmentos no contienen una definición explícita. Si la consulta está incompleta, pedí que se aclare qué situaciones de revista desea comparar.",
+    "Si la consulta pregunta desde cuándo o a partir de cuántos días después de optar, tomar o ser designado en un cargo se puede solicitar licencia médica, no respondas con el Artículo 52 de razones particulares. Si no hay un fragmento con ese plazo específico, indicá que no se encontró una regla específica sobre ese plazo.",
     "No digas que algo no existe si en los fragmentos aparece información relacionada y suficiente.",
     "Al final incluí una línea con el formato: Fuente consultada: nombre de la fuente.",
   ].join(" ");
@@ -2897,6 +3048,45 @@ export async function runGroqWorkflow(
   input: ChatbotQueryInput
 ): Promise<ChatbotWorkflowOutput> {
   const dominio = classifyDomain(input.pregunta, input.dominio);
+
+  if (isGenericTeacherQuestion(input.pregunta)) {
+    return buildOutput({
+      ok: true,
+      tipo: "sin_resultados",
+      origen: "local_rag",
+      dominio,
+      consulta: input.pregunta,
+      respuesta:
+        "Necesito que especifiques qué querés consultar sobre el docente. Por ejemplo: licencia, estatuto, coberturas, docente suplente, docente interino, titularidad, cabecera cero o funciones del cargo.",
+      chunks: [],
+    });
+  }
+
+  if (isIncompleteTeacherComparisonQuestion(input.pregunta)) {
+    return buildOutput({
+      ok: true,
+      tipo: "sin_resultados",
+      origen: "local_rag",
+      dominio: "coberturas",
+      consulta: input.pregunta,
+      respuesta:
+        "Necesito que completes la consulta. ¿Querés comparar docente suplente con docente interino, docente titular u otra situación de revista?",
+      chunks: [],
+    });
+  }
+
+  if (isMedicalLicenseAfterAppointmentQuestion(input.pregunta)) {
+    return buildOutput({
+      ok: true,
+      tipo: "sin_resultados",
+      origen: "local_rag",
+      dominio: "licencias",
+      consulta: input.pregunta,
+      respuesta:
+        "No encontré en los fragmentos cargados una regla que establezca una cantidad mínima de días desde haber optado, tomado o sido designado en un cargo para solicitar licencia médica. La base sí contiene licencias médicas o de salud, como corto tratamiento, largo tratamiento y accidentes o enfermedades profesionales, pero no se encontró un plazo específico vinculado a la fecha de opción o designación del cargo. Fuente consultada: Decreto Acuerdo Nº 1092/2015 – Régimen de Licencias Docentes.",
+      chunks: [],
+    });
+  }
 
   if (dominio === "licencias" && isGenericLicenseQuestion(input.pregunta)) {
     return buildOutput({
