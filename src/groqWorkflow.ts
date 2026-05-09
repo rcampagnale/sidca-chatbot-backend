@@ -100,6 +100,28 @@ const DEFAULT_ESTATUTO_URL =
 const DEFAULT_GENERAL_URL =
   "https://raw.githubusercontent.com/rcampagnale/sidca-chatbot-docs/main/consultas_generales.json";
 
+const DEFAULT_COBERTURAS_URL =
+  "https://raw.githubusercontent.com/rcampagnale/sidca-chatbot-docs/main/decreto_636_coberturas_docentes.json";
+
+const DEFAULT_MANIFEST_URL =
+  "https://raw.githubusercontent.com/rcampagnale/sidca-chatbot-docs/main/fuentes_chatbot.json";
+
+type ManifestFuente = {
+  id?: string;
+  dominio?: string;
+  nombre?: string;
+  referencia?: string;
+  url?: string;
+  activo?: boolean;
+};
+
+type SourcesManifest = {
+  version?: string;
+  actualizado?: string;
+  descripcion?: string;
+  fuentes?: ManifestFuente[];
+};
+
 let cachedChunks: LocalChunk[] | null = null;
 let cachedAt = 0;
 
@@ -501,6 +523,9 @@ const QUERY_EXPANSIONS: QueryExpansion[] = [
       "climaticas",
       "climática",
       "climáticas",
+      "climtica",
+      "climticas",
+      "clim",
       "clima",
       "lluvia",
       "temporal",
@@ -659,6 +684,31 @@ const QUERY_EXPANSIONS: QueryExpansion[] = [
   {
     dominio: "licencias",
     triggers: [
+      "falto 6 dias",
+      "falto 6 días",
+      "falte 6 dias",
+      "falté 6 días",
+      "6 dias sin justificar",
+      "6 días sin justificar",
+      "seis dias sin justificar",
+      "seis días sin justificar",
+      "no justifico",
+      "no justifique",
+      "no justifiqué",
+      "sin justificar",
+      "inasistencias sin justificar",
+      "faltas sin justificar",
+      "inasistencias injustificadas",
+      "abandono de servicio",
+    ],
+    terms: [
+      "abandono de servicio cinco dias laborales consecutivos diez dias año calendario ausencia injustificada sanciones descuento remuneracion articulo 80 articulo 84 articulo 85 articulo 86",
+    ],
+    preferredArticles: ["85", "86", "80", "84"],
+  },
+  {
+    dominio: "licencias",
+    triggers: [
       "inasistencia injustificada",
       "ausencia injustificada",
       "falta injustificada",
@@ -727,6 +777,26 @@ const QUERY_EXPANSIONS: QueryExpansion[] = [
       "sistema asamblea publica coberturas cargos horas catedras interinos suplentes decreto 636",
     ],
     preferredArticles: ["Decreto Artículo 1", "Decreto Artículo 2", "ANEXO I Punto 1", "ANEXO II Punto 1"],
+  },
+  {
+    dominio: "coberturas",
+    triggers: [
+      "procedimiento de asamblea",
+      "procedimiento asamblea",
+      "como es el procedimiento de asamblea",
+      "cómo es el procedimiento de asamblea",
+      "procedimiento para cobertura",
+      "procedimiento de cobertura",
+      "cobertura de cargos y horas catedra",
+      "cobertura de cargos y horas cátedra",
+      "asamblea ordinaria procedimiento",
+      "solicitud de cobertura",
+      "pedido de cobertura",
+    ],
+    terms: [
+      "asamblea ordinaria solicitud cobertura vacantes suplencias publicacion escuelas cabecera formulario unico asamblea cargos horas catedras directivos direcciones nivel",
+    ],
+    preferredArticles: ["ANEXO II Punto 9", "ANEXO I Punto 11", "ANEXO II Punto 1", "ANEXO I Punto 1"],
   },
   {
     dominio: "coberturas",
@@ -1072,6 +1142,10 @@ function classifyDomain(
 
   const text = normalizeText(pregunta);
 
+  if (isClimateQuestion(pregunta) || isUnjustifiedAbsenceQuestion(pregunta)) {
+    return "licencias";
+  }
+
   if (text.includes("estatuto") || text.includes("ley 3122")) {
     return "estatuto";
   }
@@ -1243,7 +1317,26 @@ function classifyDomain(
   return bestDomain;
 }
 
-function getSourceConfigs(): SourceConfig[] {
+function isDominioBackend(value: unknown): value is DominioBackend {
+  return (
+    value === "licencias" ||
+    value === "estatuto" ||
+    value === "general" ||
+    value === "coberturas"
+  );
+}
+
+function getFilenameFromUrl(url: string, fallback: string): string {
+  try {
+    const parsed = new URL(url);
+    const parts = parsed.pathname.split("/").filter(Boolean);
+    return parts[parts.length - 1] || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function getFallbackSourceConfigs(): SourceConfig[] {
   const licenciasUrl =
     getEnv("SIDCA_DOCS_LICENCIAS_URL") || DEFAULT_LICENCIAS_URL;
 
@@ -1252,7 +1345,8 @@ function getSourceConfigs(): SourceConfig[] {
 
   const generalUrl = getEnv("SIDCA_DOCS_GENERAL_URL") || DEFAULT_GENERAL_URL;
 
-  const coberturasUrl = getEnv("SIDCA_DOCS_COBERTURAS_URL");
+  const coberturasUrl =
+    getEnv("SIDCA_DOCS_COBERTURAS_URL") || DEFAULT_COBERTURAS_URL;
 
   const sources: SourceConfig[] = [
     {
@@ -1273,18 +1367,65 @@ function getSourceConfigs(): SourceConfig[] {
       filename: "consultas_generales.json",
       referencia: "Consultas generales SiDCa",
     },
-  ];
-
-  if (coberturasUrl) {
-    sources.push({
+    {
       dominio: "coberturas",
       source: coberturasUrl,
-      filename: "coberturas_docentes.json",
-      referencia: "Normativa de coberturas docentes",
-    });
+      filename: "decreto_636_coberturas_docentes.json",
+      referencia:
+        "Dcto. Acdo. Nº 636/2021 – Sistema de Asamblea Pública de Coberturas",
+    },
+  ];
+
+  return sources.filter((source) => Boolean(source.source));
+}
+
+async function getSourceConfigs(): Promise<SourceConfig[]> {
+  const manifestUrl =
+    getEnv("SIDCA_DOCS_MANIFEST_URL") || DEFAULT_MANIFEST_URL;
+
+  if (manifestUrl) {
+    try {
+      const manifest = (await loadJsonFromSource(manifestUrl)) as SourcesManifest;
+
+      const manifestSources = (manifest.fuentes || [])
+        .filter((fuente) => fuente.activo !== false)
+        .filter((fuente) => fuente.url && isDominioBackend(fuente.dominio))
+        .map((fuente) => {
+          const source = String(fuente.url);
+          const dominio = fuente.dominio as DominioBackend;
+
+          return {
+            dominio,
+            source,
+            filename: getFilenameFromUrl(source, `${fuente.id || dominio}.json`),
+            referencia:
+              fuente.referencia ||
+              fuente.nombre ||
+              fuente.id ||
+              getFilenameFromUrl(source, `${dominio}.json`),
+          };
+        });
+
+      if (manifestSources.length > 0) {
+        console.log(
+          `[groqWorkflow] Fuentes cargadas desde índice: ${manifestSources.length}`
+        );
+
+        return manifestSources;
+      }
+
+      console.warn(
+        "[groqWorkflow] El índice de fuentes no tiene fuentes activas válidas. Se usa fallback local."
+      );
+    } catch (error: any) {
+      console.warn(
+        "[groqWorkflow] No se pudo cargar SIDCA_DOCS_MANIFEST_URL. Se usa fallback local:",
+        error?.message || error
+      );
+    }
   }
 
-  return sources.filter((s) => Boolean(s.source));
+  return getFallbackSourceConfigs();
 }
 
 async function loadJsonFromSource(source: string): Promise<unknown> {
@@ -1679,7 +1820,7 @@ async function loadLocalChunks(): Promise<LocalChunk[]> {
     return cachedChunks;
   }
 
-  const sources = getSourceConfigs();
+  const sources = await getSourceConfigs();
   const chunks: LocalChunk[] = [];
 
   for (const source of sources) {
@@ -1781,6 +1922,49 @@ function queryIsGeneral(pregunta: string): boolean {
     text.includes("suplente") ||
     text.includes("derecho a las licencias") ||
     text.includes("quienes tienen derecho")
+  );
+}
+
+function isClimateQuestion(pregunta: string): boolean {
+  const text = normalizeText(pregunta);
+  const compact = text.replace(/\s+/g, "");
+
+  return (
+    text.includes("razones climaticas") ||
+    text.includes("razon climatica") ||
+    text.includes("fenomeno meteorologico") ||
+    text.includes("fenomenos meteorologicos") ||
+    text.includes("meteorolog") ||
+    text.includes("fuerza mayor") ||
+    text.includes("lluvia") ||
+    text.includes("temporal") ||
+    text.includes("tormenta") ||
+    compact.includes("climatic") ||
+    compact.includes("climtic") ||
+    compact.includes("clim")
+  );
+}
+
+function isUnjustifiedAbsenceQuestion(pregunta: string): boolean {
+  const text = normalizeText(pregunta);
+
+  return (
+    text.includes("abandono de servicio") ||
+    text.includes("sin justificar") ||
+    text.includes("no justific") ||
+    text.includes("inasistencia injustificada") ||
+    text.includes("inasistencias injustificadas") ||
+    text.includes("ausencia injustificada") ||
+    text.includes("ausencias injustificadas") ||
+    text.includes("falta injustificada") ||
+    text.includes("faltas injustificadas") ||
+    text.includes("falto 6") ||
+    text.includes("falte 6") ||
+    text.includes("falt 6") ||
+    text.includes("seis dias") ||
+    text.includes("seis dias laborales") ||
+    text.includes("6 dias") ||
+    text.includes("6 dias laborales")
   );
 }
 
@@ -1909,6 +2093,32 @@ function scoreChunk(
     score -= 180;
   }
 
+  const climateQuery = dominio === "licencias" && isClimateQuestion(pregunta);
+
+  if (climateQuery && chunk.dominio === "licencias") {
+    if (articleMatches(chunk, "49")) {
+      score += chunk.kind === "articulo" ? 360 : 220;
+    } else {
+      score -= 360;
+    }
+  }
+
+  const unjustifiedAbsenceQuery =
+    dominio === "licencias" && isUnjustifiedAbsenceQuestion(pregunta);
+
+  if (unjustifiedAbsenceQuery && chunk.dominio === "licencias") {
+    const isMainAbandonment = articleMatches(chunk, "85") || articleMatches(chunk, "86");
+    const isSanctionContext = articleMatches(chunk, "80") || articleMatches(chunk, "84");
+
+    if (isMainAbandonment) {
+      score += chunk.kind === "articulo" ? 360 : 220;
+    } else if (isSanctionContext) {
+      score += chunk.kind === "articulo" ? 220 : 140;
+    } else {
+      score -= 180;
+    }
+  }
+
   const isCoberturasQuery = dominio === "coberturas";
   const isSecundariaQuery =
     normalizedPregunta.includes("secundaria") ||
@@ -1958,6 +2168,28 @@ function scoreChunk(
       ) {
         score += 120;
       }
+    }
+  }
+
+  const isProcedimientoAsambleaQuery =
+    isCoberturasQuery &&
+    (normalizedPregunta.includes("procedimiento") ||
+      normalizedPregunta.includes("solicitud de cobertura") ||
+      normalizedPregunta.includes("pedido de cobertura"));
+
+  if (isProcedimientoAsambleaQuery) {
+    if (
+      String(chunk.articulo || "") === "ANEXO II Punto 9" ||
+      String(chunk.articulo || "") === "ANEXO I Punto 11"
+    ) {
+      score += 260;
+    }
+
+    if (
+      String(chunk.articulo || "") === "ANEXO II Punto 1" ||
+      String(chunk.articulo || "") === "ANEXO I Punto 1"
+    ) {
+      score += 130;
     }
   }
 
@@ -2083,12 +2315,68 @@ function uniqueInsertChunk(target: LocalChunk[], index: number, chunk: LocalChun
   }
 }
 
+function collectArticleAndSummaryChunks(
+  allChunks: LocalChunk[],
+  dominio: DominioBackend,
+  refs: string[],
+  maxResults: number
+): LocalChunk[] {
+  const selected: LocalChunk[] = [];
+  const articleChunks = getArticleChunksByRefs(allChunks, dominio, refs);
+  const summaryChunks = getResumenChunksByRefs(allChunks, dominio, refs);
+
+  for (const ref of refs) {
+    for (const articleChunk of articleChunks) {
+      if (selected.length >= maxResults) return selected;
+      if (articleMatches(articleChunk, ref)) {
+        uniquePushChunk(selected, articleChunk);
+      }
+    }
+
+    for (const summaryChunk of summaryChunks) {
+      if (selected.length >= maxResults) return selected;
+      if (summaryChunk.articleRefs.some((item) => normalizeText(item) === normalizeText(ref))) {
+        uniquePushChunk(selected, summaryChunk);
+      }
+    }
+  }
+
+  return selected;
+}
+
 async function searchLocalFragments(
   input: ChatbotQueryInput,
   dominio: DominioBackend
 ): Promise<LocalChunk[]> {
   const chunks = await loadLocalChunks();
   const maxResults = Math.min(Math.max(input.maxResults ?? 5, 1), 8);
+
+  if (dominio === "licencias" && isClimateQuestion(input.pregunta)) {
+    const onlyArticle49 = collectArticleAndSummaryChunks(
+      chunks,
+      dominio,
+      ["49"],
+      maxResults
+    );
+
+    if (onlyArticle49.length) {
+      return onlyArticle49;
+    }
+  }
+
+  if (dominio === "licencias" && isUnjustifiedAbsenceQuestion(input.pregunta)) {
+    const absenceChunks = collectArticleAndSummaryChunks(
+      chunks,
+      dominio,
+      ["85", "86", "80", "84"],
+      maxResults
+    );
+
+    if (absenceChunks.length) {
+      return absenceChunks;
+    }
+  }
+
   const matchedExpansions = getMatchedExpansions(input.pregunta, dominio);
   const preferredArticles = Array.from(
     new Set(matchedExpansions.flatMap((item) => item.preferredArticles || []))
@@ -2285,6 +2573,18 @@ function buildGroqSystemPrompt(): string {
     "Respondé únicamente con la información incluida en los fragmentos normativos proporcionados.",
     "No inventes artículos, plazos, requisitos, autoridades ni procedimientos.",
     "Si la información no está en los fragmentos, indicá que no se encontró información suficiente.",
+
+    "Si la consulta es por razones climáticas o fenómenos meteorológicos, respondé solo con el Artículo 49 si ese es el fragmento disponible; no mezcles el Artículo 52 ni menciones plazos de razones particulares.",
+
+    "Si la consulta trata sobre faltas sin justificar, inasistencias injustificadas o abandono de servicio, priorizá los artículos 85 y 86, y usá los artículos 80 y 84 como contexto de descuento y sanciones si están presentes.",
+
+    "REGLA NUMÉRICA OBLIGATORIA: cuando una norma establece un umbral mínimo, por ejemplo cinco (5) días, cualquier cantidad igual o superior cumple ese umbral. Ejemplo: si la consulta dice que faltó 6 días y el artículo establece abandono de servicio por cinco (5) días laborales consecutivos injustificados, debe interpretarse que 6 días sí supera el umbral de 5 días.",
+
+    "Para inasistencias injustificadas: si son cinco (5) o más días laborales consecutivos, corresponde analizar el Artículo 85 sobre abandono de servicio. Si son no consecutivas, corresponde analizar el Artículo 86, que establece abandono al llegar a diez (10) días injustificados en el año calendario. Siempre considerar el Artículo 80 para descuento del día no trabajado y el Artículo 84 para sanciones acumulativas por ausencia injustificada.",
+    "No uses la expresión 'pagar el descuento'. Cuando corresponda, indicá que se aplicará el descuento de la remuneración del día no trabajado.",
+
+    "Si la pregunta no aclara si las inasistencias fueron consecutivas o no consecutivas, no afirmes una sola consecuencia como definitiva. Respondé diferenciando ambos escenarios: 1) si fueron consecutivas; 2) si no fueron consecutivas.",
+
     "Usá lenguaje claro, formal y útil para docentes afiliados.",
     "Cuando corresponda, mencioná artículos, puntos, anexos, niveles, días, requisitos, funcionarios otorgantes e intervinientes presentes en los fragmentos.",
     "Si la consulta menciona secundaria, priorizá fragmentos del Anexo II o nivel Secundario.",
