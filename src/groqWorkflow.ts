@@ -191,6 +191,10 @@ const QUERY_EXPANSIONS: QueryExpansion[] = [
     dominio: "licencias",
     triggers: [
       "corto tratamiento",
+      "lesiones de corto tratamiento",
+      "afecciones de corto tratamiento",
+      "licencia corto tratamiento",
+      "licencia por corto tratamiento",
       "enfermedad comun",
       "enfermedad común",
       "afeccion comun",
@@ -285,9 +289,23 @@ const QUERY_EXPANSIONS: QueryExpansion[] = [
       "prenatal",
       "postnatal",
       "prematuro",
+      "mama",
+      "mamá",
+      "mam",
+      "soy mama",
+      "soy mamá",
+      "soy mam",
+      "madre",
+      "voy a ser mama",
+      "voy a ser mamá",
+      "voy a ser mam",
+      "estoy embarazada",
+      "licencia para madre",
+      "licencia por ser mama",
+      "licencia por ser mamá",
     ],
     terms: [
-      "maternidad embarazo parto nacimiento multiple prematuro defuncion fetal ciento veinte dias",
+      "maternidad embarazo parto nacimiento multiple prematuro defuncion fetal ciento veinte dias articulo 27",
     ],
     preferredArticles: ["27"],
   },
@@ -586,7 +604,20 @@ const QUERY_EXPANSIONS: QueryExpansion[] = [
     triggers: [
       "superposicion horaria",
       "superposición horaria",
+      "superposicin horaria",
+      "superposici horaria",
       "superposicion de horarios",
+      "superposición de horarios",
+      "superposicin de horarios",
+      "superposici de horarios",
+      "licencia por superposicion",
+      "licencia por superposición",
+      "licencia por superposicin",
+      "licencia por superposici",
+      "existe alguna licencia por superposicion",
+      "existe alguna licencia por superposición",
+      "existe alguna licencia por superposicin",
+      "existe alguna licencia por superposici",
       "dos escuelas",
     ],
     terms: [
@@ -1142,7 +1173,12 @@ function classifyDomain(
 
   const text = normalizeText(pregunta);
 
-  if (isClimateQuestion(pregunta) || isUnjustifiedAbsenceQuestion(pregunta)) {
+  if (
+    isClimateQuestion(pregunta) ||
+    isUnjustifiedAbsenceQuestion(pregunta) ||
+    isMaternityQuestion(pregunta) ||
+    isSuperpositionQuestion(pregunta)
+  ) {
     return "licencias";
   }
 
@@ -1968,6 +2004,123 @@ function isUnjustifiedAbsenceQuestion(pregunta: string): boolean {
   );
 }
 
+function isMaternityQuestion(pregunta: string): boolean {
+  const text = normalizeText(pregunta);
+  const compact = text.replace(/\s+/g, "");
+
+  return (
+    text.includes("maternidad") ||
+    text.includes("embarazo") ||
+    text.includes("embarazada") ||
+    text.includes("parto") ||
+    text.includes("prenatal") ||
+    text.includes("postnatal") ||
+    text.includes("prematuro") ||
+    text.includes("soy mama") ||
+    text.includes("soy mam") ||
+    text.includes("mama") ||
+    text.includes("mam") ||
+    text.includes("madre") ||
+    text.includes("voy a ser mama") ||
+    text.includes("voy a ser mam") ||
+    text.includes("licencia para madre") ||
+    text.includes("licencia por ser mama") ||
+    compact.includes("soymam") ||
+    compact.includes("licenciaparamam")
+  );
+}
+
+function isSuperpositionQuestion(pregunta: string): boolean {
+  const text = normalizeText(pregunta);
+  const compact = text.replace(/\s+/g, "");
+
+  return (
+    text.includes("superposicion") ||
+    text.includes("superposicin") ||
+    text.includes("superposici") ||
+    text.includes("superpuesto") ||
+    text.includes("superpuesta") ||
+    compact.includes("superposicion") ||
+    compact.includes("superposicin") ||
+    compact.includes("superposici")
+  );
+}
+
+function isGenericLicenseQuestion(pregunta: string): boolean {
+  const text = normalizeText(pregunta);
+  const tokens = tokenize(text);
+
+  const genericPatterns = [
+    "quiero saber sobre licencia",
+    "quiero saber de licencia",
+    "quiero saber sobre tema de licencia",
+    "tema de licencia",
+    "sobre tema de licencia",
+    "licencia de la",
+    "licencia del",
+    "licencia para",
+    "sobre licencia",
+  ];
+
+  const hasGenericPattern = genericPatterns.some((pattern) =>
+    text.includes(pattern)
+  );
+
+  const hasOnlyGenericTokens =
+    tokens.includes("licencia") &&
+    tokens.length <= 7 &&
+    !tokens.some((token) =>
+      [
+        "maternidad",
+        "embarazo",
+        "embarazada",
+        "mama",
+        "mam",
+        "madre",
+        "enfermedad",
+        "corto",
+        "largo",
+        "tratamiento",
+        "capacitacion",
+        "climatica",
+        "climaticas",
+        "clima",
+        "superposicion",
+        "superposicin",
+        "superposici",
+        "familiar",
+        "duelo",
+        "fallecimiento",
+        "examen",
+        "particulares",
+        "maternidad",
+        "lactancia",
+      ].includes(token)
+    );
+
+  const hasSpecificKeyword =
+    isMaternityQuestion(pregunta) ||
+    isClimateQuestion(pregunta) ||
+    isUnjustifiedAbsenceQuestion(pregunta) ||
+    text.includes("enfermedad") ||
+    text.includes("corto tratamiento") ||
+    text.includes("largo tratamiento") ||
+    text.includes("capacitacion") ||
+    text.includes("capacitaci") ||
+    text.includes("perfeccionamiento") ||
+    isSuperpositionQuestion(pregunta) ||
+    text.includes("familiar") ||
+    text.includes("duelo") ||
+    text.includes("fallecimiento") ||
+    text.includes("examen") ||
+    text.includes("razones particulares") ||
+    text.includes("grupo familiar") ||
+    text.includes("lactancia") ||
+    text.includes("matrimonio");
+
+  return (hasGenericPattern || hasOnlyGenericTokens) && !hasSpecificKeyword;
+}
+
 function scoreChunk(
   chunk: LocalChunk,
   pregunta: string,
@@ -2377,10 +2530,62 @@ async function searchLocalFragments(
     }
   }
 
+  if (dominio === "licencias" && isMaternityQuestion(input.pregunta)) {
+    const maternityChunks = collectArticleAndSummaryChunks(
+      chunks,
+      dominio,
+      ["27"],
+      maxResults
+    );
+
+    if (maternityChunks.length) {
+      return maternityChunks;
+    }
+  }
+
+  if (dominio === "licencias" && isSuperpositionQuestion(input.pregunta)) {
+    const superpositionChunks = collectArticleAndSummaryChunks(
+      chunks,
+      dominio,
+      ["53", "54"],
+      maxResults
+    );
+
+    if (superpositionChunks.length) {
+      return superpositionChunks;
+    }
+  }
+
   const matchedExpansions = getMatchedExpansions(input.pregunta, dominio);
   const preferredArticles = Array.from(
     new Set(matchedExpansions.flatMap((item) => item.preferredArticles || []))
   );
+
+  if (dominio === "licencias" && preferredArticles.includes("16")) {
+    const shortTreatmentChunks = collectArticleAndSummaryChunks(
+      chunks,
+      dominio,
+      ["16", "17"],
+      maxResults
+    );
+
+    if (shortTreatmentChunks.length) {
+      return shortTreatmentChunks;
+    }
+  }
+
+  if (dominio === "licencias" && preferredArticles.includes("53")) {
+    const superpositionChunks = collectArticleAndSummaryChunks(
+      chunks,
+      dominio,
+      ["53", "54"],
+      maxResults
+    );
+
+    if (superpositionChunks.length) {
+      return superpositionChunks;
+    }
+  }
 
   const scored = chunks
     .map((chunk) => ({
@@ -2575,15 +2780,15 @@ function buildGroqSystemPrompt(): string {
     "Si la información no está en los fragmentos, indicá que no se encontró información suficiente.",
 
     "Si la consulta es por razones climáticas o fenómenos meteorológicos, respondé solo con el Artículo 49 si ese es el fragmento disponible; no mezcles el Artículo 52 ni menciones plazos de razones particulares.",
+    "Si la consulta es por afecciones, lesiones o licencia de corto tratamiento, respondé solo con los artículos 16 y 17 y el resumen correspondiente si están disponibles. No desarrolles el Artículo 20 de largo tratamiento ni el Artículo 27 de maternidad salvo que el usuario los pregunte expresamente.",
+    "Si la consulta es por superposición de horarios, respondé solo con los artículos 53 y 54 y el resumen correspondiente si están disponibles. No desarrolles el Artículo 36 salvo que el usuario pregunte expresamente por prácticas obligatorias.",
+    "Si la consulta es por maternidad, mamá, madre, embarazo o parto, respondé con el Artículo 27 y el resumen correspondiente si está disponible. No mezcles artículos de corto o largo tratamiento salvo que el fragmento del Artículo 27 los mencione como referencia accesoria.",
 
     "Si la consulta trata sobre faltas sin justificar, inasistencias injustificadas o abandono de servicio, priorizá los artículos 85 y 86, y usá los artículos 80 y 84 como contexto de descuento y sanciones si están presentes.",
-
     "REGLA NUMÉRICA OBLIGATORIA: cuando una norma establece un umbral mínimo, por ejemplo cinco (5) días, cualquier cantidad igual o superior cumple ese umbral. Ejemplo: si la consulta dice que faltó 6 días y el artículo establece abandono de servicio por cinco (5) días laborales consecutivos injustificados, debe interpretarse que 6 días sí supera el umbral de 5 días.",
-
     "Para inasistencias injustificadas: si son cinco (5) o más días laborales consecutivos, corresponde analizar el Artículo 85 sobre abandono de servicio. Si son no consecutivas, corresponde analizar el Artículo 86, que establece abandono al llegar a diez (10) días injustificados en el año calendario. Siempre considerar el Artículo 80 para descuento del día no trabajado y el Artículo 84 para sanciones acumulativas por ausencia injustificada.",
-    "No uses la expresión 'pagar el descuento'. Cuando corresponda, indicá que se aplicará el descuento de la remuneración del día no trabajado.",
-
     "Si la pregunta no aclara si las inasistencias fueron consecutivas o no consecutivas, no afirmes una sola consecuencia como definitiva. Respondé diferenciando ambos escenarios: 1) si fueron consecutivas; 2) si no fueron consecutivas.",
+    "No uses la expresión 'pagar el descuento'. Cuando corresponda, indicá que se aplicará el descuento de la remuneración del día no trabajado.",
 
     "Usá lenguaje claro, formal y útil para docentes afiliados.",
     "Cuando corresponda, mencioná artículos, puntos, anexos, niveles, días, requisitos, funcionarios otorgantes e intervinientes presentes en los fragmentos.",
@@ -2692,6 +2897,19 @@ export async function runGroqWorkflow(
   input: ChatbotQueryInput
 ): Promise<ChatbotWorkflowOutput> {
   const dominio = classifyDomain(input.pregunta, input.dominio);
+
+  if (dominio === "licencias" && isGenericLicenseQuestion(input.pregunta)) {
+    return buildOutput({
+      ok: true,
+      tipo: "sin_resultados",
+      origen: "local_rag",
+      dominio,
+      consulta: input.pregunta,
+      respuesta:
+        "Necesito que especifiques qué tipo de licencia querés consultar. Por ejemplo: maternidad, corto tratamiento, largo tratamiento, grupo familiar, capacitación, superposición horaria, razones climáticas, examen o razones particulares.",
+      chunks: [],
+    });
+  }
 
   try {
     const chunks = await searchLocalFragments(input, dominio);
