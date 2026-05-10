@@ -5,7 +5,8 @@ export type DominioBackend =
   | "licencias"
   | "estatuto"
   | "general"
-  | "coberturas";
+  | "coberturas"
+  | "servicios";
 
 export type ChatbotQueryInput = {
   pregunta: string;
@@ -102,6 +103,9 @@ const DEFAULT_GENERAL_URL =
 
 const DEFAULT_COBERTURAS_URL =
   "https://raw.githubusercontent.com/rcampagnale/sidca-chatbot-docs/main/decreto_636_coberturas_docentes.json";
+
+const DEFAULT_SERVICIOS_URL =
+  "https://raw.githubusercontent.com/rcampagnale/sidca-chatbot-docs/main/servicios_sidca_app.json";
 
 const DEFAULT_MANIFEST_URL =
   "https://raw.githubusercontent.com/rcampagnale/sidca-chatbot-docs/main/fuentes_chatbot.json";
@@ -1166,7 +1170,8 @@ function classifyDomain(
   if (
     dominio === "licencias" ||
     dominio === "estatuto" ||
-    dominio === "coberturas"
+    dominio === "coberturas" ||
+    dominio === "servicios"
   ) {
     return dominio;
   }
@@ -1180,6 +1185,10 @@ function classifyDomain(
     isSuperpositionQuestion(pregunta)
   ) {
     return "licencias";
+  }
+
+  if (isServicesQuestion(pregunta)) {
+    return "servicios";
   }
 
   if (text.includes("estatuto") || text.includes("ley 3122")) {
@@ -1318,6 +1327,43 @@ function classifyDomain(
       "primaria",
       "inicial",
     ],
+    servicios: [
+      "servicio",
+      "servicios",
+      "contacto",
+      "whatsapp",
+      "telefono",
+      "sede",
+      "direccion",
+      "turismo",
+      "viajes",
+      "reserva",
+      "hoteleria",
+      "hotel",
+      "hoteles",
+      "convenio",
+      "convenios",
+      "comercios",
+      "casa del docente",
+      "predio",
+      "capacitaciones",
+      "cursos disponibles",
+      "aula virtual",
+      "certificados",
+      "entrega de certificados",
+      "oficina de gestion",
+      "oficina gesti",
+      "oficina de gesti",
+      "gestion expediente",
+      "gesti expediente",
+      "soporte tecnico",
+      "afiliado adherente",
+      "sidca radio",
+      "sala de reuniones",
+      "mi catamarca",
+      "enlaces utiles",
+      "simulador de sueldo",
+    ],
     general: [
       "afiliacion",
       "afiliado",
@@ -1358,7 +1404,8 @@ function isDominioBackend(value: unknown): value is DominioBackend {
     value === "licencias" ||
     value === "estatuto" ||
     value === "general" ||
-    value === "coberturas"
+    value === "coberturas" ||
+    value === "servicios"
   );
 }
 
@@ -1383,6 +1430,9 @@ function getFallbackSourceConfigs(): SourceConfig[] {
 
   const coberturasUrl =
     getEnv("SIDCA_DOCS_COBERTURAS_URL") || DEFAULT_COBERTURAS_URL;
+
+  const serviciosUrl =
+    getEnv("SIDCA_DOCS_SERVICIOS_URL") || DEFAULT_SERVICIOS_URL;
 
   const sources: SourceConfig[] = [
     {
@@ -1409,6 +1459,12 @@ function getFallbackSourceConfigs(): SourceConfig[] {
       filename: "decreto_636_coberturas_docentes.json",
       referencia:
         "Dcto. Acdo. Nº 636/2021 – Sistema de Asamblea Pública de Coberturas",
+    },
+    {
+      dominio: "servicios",
+      source: serviciosUrl,
+      filename: "servicios_sidca_app.json",
+      referencia: "Información institucional disponible en la App SiDCa",
     },
   ];
 
@@ -1555,6 +1611,16 @@ function objectToText(value: unknown, depth = 0): string {
             "seccion",
             "nivel",
             "tipo",
+            "categoria",
+            "contenido",
+            "respuesta_sugerida",
+            "ubicacion_app",
+            "preguntas_relacionadas",
+            "palabras_clave",
+            "whatsapp",
+            "url",
+            "direccion",
+            "aula_virtual",
           ].includes(normalizedKey)
         ) {
           return text;
@@ -1888,6 +1954,8 @@ function expandQuestion(pregunta: string, dominio: DominioBackend): string {
       ? "estatuto docente ley 3122 derechos deberes carrera docente articulo"
       : dominio === "coberturas"
       ? "asamblea publica cobertura cargos horas catedra interinato suplencia cabecera cero lom fua decreto 636"
+      : dominio === "servicios"
+      ? "servicios app sidca contacto whatsapp beneficios turismo viajes casa del docente convenios capacitaciones certificados oficina gestion asesoramiento"
       : "consulta general sindicato afiliado tramite formulario beneficio";
 
   return `${pregunta} ${domainBase} ${expandedTerms}`.trim();
@@ -2270,6 +2338,248 @@ function isMedicalLicenseAfterAppointmentQuestion(pregunta: string): boolean {
   return mentionsMedicalLicense && mentionsAppointmentOrPosition && asksMinimumTime;
 }
 
+
+type ServiceExpansion = {
+  triggers: string[];
+  terms: string[];
+  preferredIds: string[];
+};
+
+const SERVICE_EXPANSIONS: ServiceExpansion[] = [
+  {
+    triggers: ["contacto", "whatsapp", "telefono", "numero", "número", "sede", "direccion", "dirección", "donde queda sidca"],
+    terms: ["medios de contacto whatsapp telefono sede central ayacucho 227"],
+    preferredIds: ["sidca_contactos_institucionales"],
+  },
+  {
+    triggers: ["turismo", "viajes", "viaje", "paseo", "paseos", "paquete", "paquetes", "reserva de turismo", "consulto por viajes"],
+    terms: ["turismo viajes paquetes reservas sidca turismo whatsapp"],
+    preferredIds: ["sidca_turismo_viajes", "sidca_contactos_institucionales"],
+  },
+  {
+    triggers: ["casa del docente", "casa docente", "hospedaje", "alojamiento", "lavalle 815"],
+    terms: ["casa del docente hospedaje lavalle 815 reserva whatsapp"],
+    preferredIds: ["sidca_casa_docente", "sidca_contactos_institucionales"],
+  },
+  {
+    triggers: ["predio", "predio recreativo", "predio deportivo", "banda de varela", "cancha", "voley", "vóley", "futbol", "fútbol"],
+    terms: ["predio recreativo deportivo cultural banda de varela cancha futbol voley"],
+    preferredIds: ["sidca_predio_recreativo"],
+  },
+  {
+    triggers: ["convenio", "convenios", "red de convenios", "comercios", "comercios adheridos", "descuentos", "credencial para convenio"],
+    terms: ["red de convenios comercios adheridos descuentos credencial digital"],
+    preferredIds: ["sidca_red_convenios", "sidca_credencial_afiliado", "sidca_contactos_institucionales"],
+  },
+  {
+    triggers: ["hotel", "hoteles", "hoteleria", "hotelería", "hoteleria interprovincial", "hoteles interprovinciales"],
+    terms: ["convenio interprovincial hoteleros hoteleria interprovincial whatsapp"],
+    preferredIds: ["sidca_red_convenios", "sidca_contactos_institucionales"],
+  },
+  {
+    triggers: ["capacitaciones", "capacitacion", "capacitación", "cursos disponibles", "curso disponible", "inscribo a un curso", "inscripcion a curso", "inscripción a curso", "aula virtual", "registro de asistencia", "secretaria de capacitacion", "secretaría de capacitación"],
+    terms: ["capacitaciones cursos disponibles aula virtual secretaria de capacitacion whatsapp inscripcion registro asistencia"],
+    preferredIds: ["sidca_capacitaciones", "sidca_contactos_institucionales"],
+  },
+  {
+    triggers: ["certificado", "certificados", "entrega de certificados", "retiro de certificados", "curso aprobado", "imprimir certificado"],
+    terms: ["certificados cursos aprobados entrega de certificados whatsapp"],
+    preferredIds: ["sidca_certificados", "sidca_contactos_institucionales"],
+  },
+  {
+    triggers: ["enlaces", "enlaces utiles", "enlaces útiles", "mi catamarca", "directorio", "contactos docentes", "simulador de sueldo", "junta", "medicina laboral", "recursos humanos"],
+    terms: ["red de contactos informacion docente mi catamarca directorio simulador sueldo junta medicina laboral recursos humanos"],
+    preferredIds: ["sidca_enlaces_utilidad"],
+  },
+  {
+    triggers: ["asesoramiento gremial", "gremial", "paritarias", "escala salarial", "reclamo administrativo", "reclamos administrativos"],
+    terms: ["asesoramiento gremial paritarias escala salarial reclamos presentaciones administrativas whatsapp"],
+    preferredIds: ["sidca_asesoramiento_gremial", "sidca_contactos_institucionales"],
+  },
+  {
+    triggers: ["asesoramiento legal", "legal", "juridico", "jurídico", "departamento juridico", "departamento jurídico", "leyes", "decretos", "resoluciones", "normativa"],
+    terms: ["asesoramiento legal juridico normativas leyes decretos resoluciones departamento juridico whatsapp"],
+    preferredIds: ["sidca_asesoramiento_legal", "sidca_contactos_institucionales"],
+  },
+  {
+    triggers: [
+      "oficina de gestion",
+      "oficina gestión",
+      "oficina de gestión",
+      "oficina gestion",
+      "oficina gesti",
+      "oficina de gesti",
+      "oficina de gesti n",
+      "gesti n",
+      "gestion expediente",
+      "gestión expediente",
+      "gesti expediente",
+      "gesti n expediente",
+      "gestion de expedientes",
+      "gestión de expedientes",
+      "gesti de expedientes",
+      "gesti n de expedientes",
+      "formularios institucionales",
+      "formulario institucional",
+      "presentar documentacion",
+      "presentar documentación",
+      "presentar documentaci",
+      "presentar documentaci n",
+      "tramites del sindicato",
+      "trámites del sindicato",
+      "tr mites del sindicato",
+      "consulta dni",
+      "titularizacion",
+      "titularización",
+      "titularizaci",
+      "titularizaci n",
+    ],
+    terms: [
+      "oficina gestion formularios institucionales documentacion tramites gestion expedientes consulta dni titularizacion whatsapp",
+      "oficina gesti formularios documentaci tramites gesti expedientes consulta dni titularizaci whatsapp",
+    ],
+    preferredIds: ["sidca_oficina_gestion", "sidca_contactos_institucionales"],
+  },
+  {
+    triggers: ["credencial", "credencial digital", "credencial de afiliado"],
+    terms: ["credencial digital afiliado beneficios convenios"],
+    preferredIds: ["sidca_credencial_afiliado", "sidca_red_convenios"],
+  },
+  {
+    triggers: ["soporte", "soporte tecnico", "soporte técnico", "problema con la app", "app no funciona"],
+    terms: ["soporte tecnico whatsapp app"],
+    preferredIds: ["sidca_contactos_institucionales"],
+  },
+  {
+    triggers: ["afiliado adherente", "adherente", "cuota adherente", "cuotas adherentes"],
+    terms: ["afiliado adherente whatsapp cuotas adherentes"],
+    preferredIds: ["sidca_contactos_institucionales"],
+  },
+  {
+    triggers: ["radio", "sidca radio"],
+    terms: ["sidca radio whatsapp"],
+    preferredIds: ["sidca_contactos_institucionales"],
+  },
+  {
+    triggers: ["sala de reuniones", "reuniones", "meet"],
+    terms: ["sala de reuniones app informacion"],
+    preferredIds: ["sidca_sala_reuniones", "sidca_contactos_institucionales"],
+  },
+];
+
+function getServiceItemId(chunk: LocalChunk): string {
+  return normalizeText(getObjectField(chunk.raw, ["id"]) || "");
+}
+
+function getMatchedServiceExpansions(pregunta: string): ServiceExpansion[] {
+  const normalizedPregunta = normalizeText(pregunta);
+  const preguntaTokens = tokenize(normalizedPregunta);
+
+  return SERVICE_EXPANSIONS.filter((item) =>
+    item.triggers.some((trigger) =>
+      triggerMatchesQuery(trigger, normalizedPregunta, preguntaTokens)
+    )
+  );
+}
+
+function isServicesQuestion(pregunta: string): boolean {
+  const text = normalizeText(pregunta);
+
+  const mentionsLicense =
+    text.includes("licencia") ||
+    text.includes("licencias") ||
+    text.includes("regimen de licencias");
+
+  const isCertificateMedical =
+    text.includes("certificado medico") ||
+    text.includes("certificado mdico") ||
+    text.includes("carpeta medica") ||
+    text.includes("carpeta mdica");
+
+  const matched = getMatchedServiceExpansions(pregunta);
+
+  const isBrokenOfficeManagementQuery =
+    text.includes("oficina") &&
+    (text.includes("gestion") ||
+      text.includes("gesti") ||
+      text.includes("formulario") ||
+      text.includes("documentacion") ||
+      text.includes("documentaci") ||
+      text.includes("tramite") ||
+      text.includes("tramites") ||
+      text.includes("consulta dni") ||
+      text.includes("titularizacion") ||
+      text.includes("titularizaci"));
+
+  if (!matched.length && !isBrokenOfficeManagementQuery) return false;
+
+  const serviceIntent =
+    text.includes("contacto") ||
+    text.includes("whatsapp") ||
+    text.includes("telefono") ||
+    text.includes("donde") ||
+    text.includes("a quien") ||
+    text.includes("con quien") ||
+    text.includes("consulto") ||
+    text.includes("consulta") ||
+    text.includes("inscrib") ||
+    text.includes("reserva") ||
+    text.includes("ver") ||
+    text.includes("ubicacion") ||
+    text.includes("ubicación") ||
+    text.includes("oficina") ||
+    text.includes("servicio") ||
+    text.includes("beneficio") ||
+    text.includes("app") ||
+    text.includes("sede") ||
+    text.includes("direccion") ||
+    text.includes("dirección") ||
+    text.includes("aula virtual") ||
+    text.includes("mi catamarca") ||
+    text.includes("simulador") ||
+    text.includes("entrega de certificados") ||
+    text.includes("retiro de certificados") ||
+    text.includes("casa del docente") ||
+    text.includes("turismo") ||
+    text.includes("viajes") ||
+    text.includes("hotel") ||
+    text.includes("convenio") ||
+    text.includes("predio") ||
+    text.includes("soporte");
+
+  if (isCertificateMedical) return false;
+
+  if (mentionsLicense && !serviceIntent) return false;
+
+  return true;
+}
+
+function collectPreferredServiceChunks(
+  chunks: LocalChunk[],
+  pregunta: string,
+  maxResults: number
+): LocalChunk[] {
+  const matched = getMatchedServiceExpansions(pregunta);
+  const preferredIds = Array.from(
+    new Set(matched.flatMap((item) => item.preferredIds).map(normalizeText))
+  );
+
+  if (!preferredIds.length) return [];
+
+  const selected: LocalChunk[] = [];
+
+  for (const preferredId of preferredIds) {
+    const chunk = chunks.find(
+      (item) => item.dominio === "servicios" && getServiceItemId(item) === preferredId
+    );
+
+    if (chunk) uniquePushChunk(selected, chunk);
+    if (selected.length >= maxResults) break;
+  }
+
+  return selected.slice(0, maxResults);
+}
+
 function scoreChunk(
   chunk: LocalChunk,
   pregunta: string,
@@ -2552,6 +2862,44 @@ function scoreChunk(
     }
   }
 
+  if (dominio === "servicios") {
+    const serviceExpansions = getMatchedServiceExpansions(pregunta);
+    const serviceId = getServiceItemId(chunk);
+
+    for (const expansion of serviceExpansions) {
+      const preferredIds = expansion.preferredIds.map(normalizeText);
+
+      if (preferredIds.includes(serviceId)) {
+        score += 340;
+      }
+
+      for (const term of expansion.terms) {
+        const termTokens = tokenize(term);
+        let localMatches = 0;
+
+        for (const token of termTokens) {
+          if (chunkSearchText.includes(token)) {
+            localMatches++;
+          }
+        }
+
+        if (localMatches > 0) {
+          score += Math.min(localMatches * 8, 90);
+        }
+      }
+    }
+
+    if (normalizedPregunta.includes("whatsapp") || normalizedPregunta.includes("telefono") || normalizedPregunta.includes("contacto")) {
+      if (chunkSearchText.includes("whatsapp") || chunkSearchText.includes("wa me")) {
+        score += 65;
+      }
+    }
+
+    if (serviceId === "sidca_contactos_institucionales" && serviceExpansions.length > 0) {
+      score += 35;
+    }
+  }
+
   return score;
 }
 
@@ -2652,6 +3000,18 @@ async function searchLocalFragments(
 ): Promise<LocalChunk[]> {
   const chunks = await loadLocalChunks();
   const maxResults = Math.min(Math.max(input.maxResults ?? 5, 1), 8);
+
+  if (dominio === "servicios") {
+    const preferredServiceChunks = collectPreferredServiceChunks(
+      chunks,
+      input.pregunta,
+      maxResults
+    );
+
+    if (preferredServiceChunks.length) {
+      return preferredServiceChunks;
+    }
+  }
 
   if (dominio === "licencias" && isClimateQuestion(input.pregunta)) {
     const onlyArticle49 = collectArticleAndSummaryChunks(
@@ -2847,6 +3207,33 @@ function buildContext(chunks: LocalChunk[]): string {
 function buildLocalFallbackAnswer(chunks: LocalChunk[]): string {
   if (!chunks.length) return NO_ENCONTRADO;
 
+  if (chunks[0]?.dominio === "servicios") {
+    const respuestas = chunks
+      .slice(0, 3)
+      .map((chunk) => {
+        const sugerida = getObjectField(chunk.raw, ["respuesta_sugerida"]);
+        const titulo =
+          chunk.titulo ||
+          getObjectField(chunk.raw, ["categoria", "titulo", "nombre"]) ||
+          "Servicio SiDCa";
+
+        return sugerida
+          ? `${titulo}:\n${sugerida}`
+          : `${titulo}:\n${truncateText(chunk.text, 1200)}`;
+      })
+      .join("\n\n");
+
+    const referencias = Array.from(
+      new Set(chunks.map((chunk) => chunk.referencia).filter(Boolean))
+    );
+
+    return [
+      respuestas,
+      "",
+      `Fuente consultada: ${referencias.join(" | ")}`,
+    ].join("\n");
+  }
+
   const main = chunks
     .slice(0, 3)
     .map((chunk) => {
@@ -2927,6 +3314,9 @@ function buildGroqSystemPrompt(): string {
     "Respondé únicamente con la información incluida en los fragmentos normativos proporcionados.",
     "No inventes artículos, plazos, requisitos, autoridades ni procedimientos.",
     "Si la información no está en los fragmentos, indicá que no se encontró información suficiente.",
+    "Si el dominio detectado es servicios, respondé sobre servicios, contactos, beneficios y secciones de la App SiDCa. Priorizá la respuesta_sugerida, la ubicación en la app, el WhatsApp, la dirección, el aula virtual o el enlace que aparezca en los fragmentos. No inventes números, direcciones, horarios ni enlaces.",
+    "Para consultas de servicios como viajes, turismo, Casa del Docente, hotelería, convenios, certificados, capacitaciones, Oficina de Gestión, soporte técnico, asesoramiento gremial o legal, indicá el camino dentro de la app cuando esté disponible y el contacto correspondiente si figura en los fragmentos.",
+    "Cuando respondas sobre contactos, escribí el número de WhatsApp completo y, si aparece, el área a la que corresponde. No mezcles contactos de áreas no relacionadas salvo que el fragmento principal los incluya como medios generales de contacto.",
 
     "Si la consulta es por razones climáticas o fenómenos meteorológicos, respondé solo con el Artículo 49 si ese es el fragmento disponible; no mezcles el Artículo 52 ni menciones plazos de razones particulares.",
     "Si la consulta es por afecciones, lesiones o licencia de corto tratamiento, respondé solo con los artículos 16 y 17 y el resumen correspondiente si están disponibles. No desarrolles el Artículo 20 de largo tratamiento ni el Artículo 27 de maternidad salvo que el usuario los pregunte expresamente.",
