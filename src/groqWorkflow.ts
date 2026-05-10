@@ -1163,6 +1163,152 @@ function getMatchedExpansions(
   });
 }
 
+
+function isGremialRepresentationLicenseQuestion(pregunta: string): boolean {
+  const text = normalizeText(pregunta);
+
+  const mentionsGremial =
+    text.includes("gremial") ||
+    text.includes("representacion gremial") ||
+    text.includes("representación gremial") ||
+    text.includes("delegado gremial") ||
+    text.includes("delegados gremiales");
+
+  if (!mentionsGremial) return false;
+
+  const mentionsLicenseOrArticle =
+    text.includes("licencia") ||
+    text.includes("licencias") ||
+    text.includes("franquicia") ||
+    text.includes("franquicias") ||
+    text.includes("articulo 40") ||
+    text.includes("artículo 40") ||
+    text.includes("art 40") ||
+    text.includes("articulo 61") ||
+    text.includes("artículo 61") ||
+    text.includes("art 61") ||
+    text.includes("representacion gremial") ||
+    text.includes("representación gremial") ||
+    text.includes("delegado gremial") ||
+    text.includes("delegados gremiales");
+
+  const asksForContactOrAdvice =
+    text.includes("asesoramiento") ||
+    text.includes("contacto") ||
+    text.includes("whatsapp") ||
+    text.includes("telefono") ||
+    text.includes("teléfono") ||
+    text.includes("numero") ||
+    text.includes("número") ||
+    text.includes("a que numero") ||
+    text.includes("a qué número") ||
+    text.includes("con quien") ||
+    text.includes("con quién") ||
+    text.includes("comunicarme");
+
+  return mentionsLicenseOrArticle && !asksForContactOrAdvice;
+}
+
+function isGremialAdviceServiceQuestion(pregunta: string): boolean {
+  const text = normalizeText(pregunta);
+
+  if (isGremialRepresentationLicenseQuestion(pregunta)) return false;
+
+  const mentionsGremial =
+    text.includes("asesoramiento gremial") ||
+    text.includes("contacto gremial") ||
+    text.includes("consulta gremial") ||
+    text.includes("numero gremial") ||
+    text.includes("número gremial") ||
+    text.includes("area gremial") ||
+    text.includes("área gremial") ||
+    text.includes("gremial");
+
+  if (!mentionsGremial) return false;
+
+  const serviceIntent =
+    text.includes("asesoramiento") ||
+    text.includes("contacto") ||
+    text.includes("whatsapp") ||
+    text.includes("telefono") ||
+    text.includes("teléfono") ||
+    text.includes("numero") ||
+    text.includes("número") ||
+    text.includes("a que numero") ||
+    text.includes("a qué número") ||
+    text.includes("con quien") ||
+    text.includes("con quién") ||
+    text.includes("comunicarme") ||
+    text.includes("sindicato") ||
+    text.includes("sidca") ||
+    text.includes("necesito");
+
+  return serviceIntent;
+}
+
+function isAppNavigationServicesQuestion(pregunta: string): boolean {
+  const text = normalizeText(pregunta);
+
+  const navigationIntent =
+    text.includes("en que parte de la app") ||
+    text.includes("en qué parte de la app") ||
+    text.includes("en que parte") ||
+    text.includes("en qué parte") ||
+    text.includes("donde ingreso") ||
+    text.includes("dónde ingreso") ||
+    text.includes("donde debo ingresar") ||
+    text.includes("dónde debo ingresar") ||
+    text.includes("donde entrar") ||
+    text.includes("dónde entrar") ||
+    text.includes("donde buscar") ||
+    text.includes("dónde buscar") ||
+    text.includes("buscar en la app") ||
+    text.includes("ingresar en la app") ||
+    text.includes("entrar en la app") ||
+    (text.includes("app") &&
+      (text.includes("ingresar") ||
+        text.includes("entrar") ||
+        text.includes("buscar") ||
+        text.includes("donde") ||
+        text.includes("dónde") ||
+        text.includes("parte") ||
+        text.includes("seccion") ||
+        text.includes("sección")));
+
+  if (!navigationIntent) return false;
+
+  return (
+    text.includes("decreto") ||
+    text.includes("decretos") ||
+    text.includes("resolucion") ||
+    text.includes("resolución") ||
+    text.includes("ley") ||
+    text.includes("leyes") ||
+    text.includes("normativa") ||
+    text.includes("legal") ||
+    text.includes("titularizacion") ||
+    text.includes("titularización") ||
+    text.includes("titularizaci") ||
+    text.includes("oficina") ||
+    text.includes("tramite") ||
+    text.includes("trámite") ||
+    text.includes("tramites") ||
+    text.includes("trámites") ||
+    text.includes("documentacion") ||
+    text.includes("documentación") ||
+    text.includes("formulario") ||
+    text.includes("formularios") ||
+    text.includes("certificado") ||
+    text.includes("certificados") ||
+    text.includes("convenio") ||
+    text.includes("convenios") ||
+    text.includes("capacitacion") ||
+    text.includes("capacitación") ||
+    text.includes("curso") ||
+    text.includes("cursos")
+  );
+}
+
 function classifyDomain(
   pregunta: string,
   dominio?: DominioBackend
@@ -1177,6 +1323,10 @@ function classifyDomain(
   }
 
   const text = normalizeText(pregunta);
+
+  if (isGremialAdviceServiceQuestion(pregunta) || isAppNavigationServicesQuestion(pregunta)) {
+    return "servicios";
+  }
 
   if (
     isClimateQuestion(pregunta) ||
@@ -2403,6 +2553,30 @@ const SERVICE_EXPANSIONS: ServiceExpansion[] = [
   },
   {
     triggers: [
+      "en que parte de la app",
+      "en qué parte de la app",
+      "donde ingreso en la app",
+      "dónde ingreso en la app",
+      "donde debo ingresar",
+      "dónde debo ingresar",
+      "donde buscar en la app",
+      "dónde buscar en la app",
+      "buscar decretos",
+      "buscar los decretos",
+      "decretos de titularizacion",
+      "decretos de titularización",
+      "decretos de titularizaci",
+      "normativa de titularizacion",
+      "normativa de titularización",
+    ],
+    terms: [
+      "app asesoramiento legal decretos resoluciones normativa titularizacion oficina gestion tramites documentacion",
+      "legal decretos resoluciones otras disposiciones oficina gestion titularizacion",
+    ],
+    preferredIds: ["sidca_asesoramiento_legal", "sidca_oficina_gestion", "sidca_contactos_institucionales"],
+  },
+  {
+    triggers: [
       "oficina de gestion",
       "oficina gestión",
       "oficina de gestión",
@@ -2498,6 +2672,10 @@ function isServicesQuestion(pregunta: string): boolean {
 
   const matched = getMatchedServiceExpansions(pregunta);
 
+  if (isGremialAdviceServiceQuestion(pregunta) || isAppNavigationServicesQuestion(pregunta)) {
+    return true;
+  }
+
   const isBrokenOfficeManagementQuery =
     text.includes("oficina") &&
     (text.includes("gestion") ||
@@ -2517,6 +2695,13 @@ function isServicesQuestion(pregunta: string): boolean {
     text.includes("contacto") ||
     text.includes("whatsapp") ||
     text.includes("telefono") ||
+    text.includes("numero") ||
+    text.includes("número") ||
+    text.includes("comunicarme") ||
+    text.includes("asesoramiento") ||
+    text.includes("gremial") ||
+    text.includes("sindicato") ||
+    text.includes("sidca") ||
     text.includes("donde") ||
     text.includes("a quien") ||
     text.includes("con quien") ||
@@ -3316,6 +3501,8 @@ function buildGroqSystemPrompt(): string {
     "Si la información no está en los fragmentos, indicá que no se encontró información suficiente.",
     "Si el dominio detectado es servicios, respondé sobre servicios, contactos, beneficios y secciones de la App SiDCa. Priorizá la respuesta_sugerida, la ubicación en la app, el WhatsApp, la dirección, el aula virtual o el enlace que aparezca en los fragmentos. No inventes números, direcciones, horarios ni enlaces.",
     "Para consultas de servicios como viajes, turismo, Casa del Docente, hotelería, convenios, certificados, capacitaciones, Oficina de Gestión, soporte técnico, asesoramiento gremial o legal, indicá el camino dentro de la app cuando esté disponible y el contacto correspondiente si figura en los fragmentos.",
+    "Si el usuario pide asesoramiento gremial, contacto gremial, número gremial o con quién comunicarse por asesoramiento gremial del sindicato, respondé con el servicio de Asesoramiento Gremial y el WhatsApp de Asesoramiento General si aparece en los fragmentos. No lo confundas con licencia por representación gremial, delegados gremiales ni franquicias gremiales.",
+    "Si el usuario pregunta en qué parte de la app debe ingresar, dónde buscar o dónde encontrar decretos, resoluciones, leyes o normativa, respondé con la sección Asesoramiento > Legal. Si además menciona titularización, trámite, documentación o formularios, agregá también Asesoramiento > Oficina de Gestión.",
     "Cuando respondas sobre contactos, escribí el número de WhatsApp completo y, si aparece, el área a la que corresponde. No mezcles contactos de áreas no relacionadas salvo que el fragmento principal los incluya como medios generales de contacto.",
 
     "Si la consulta es por razones climáticas o fenómenos meteorológicos, respondé solo con el Artículo 49 si ese es el fragmento disponible; no mezcles el Artículo 52 ni menciones plazos de razones particulares.",
