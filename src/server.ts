@@ -28,6 +28,12 @@ const bodySchema = z.object({
 
 const secureMercadoPagoPreferenceSchema = z.object({
   dni: z.string().trim().min(5, "El DNI es obligatorio"),
+  pagoId: z.string().trim().min(1, "El identificador de la orden es obligatorio").optional(),
+});
+
+const firebaseBootstrapSchema = z.object({
+  dni: z.string().trim().min(5, "El DNI es obligatorio"),
+  usuarioId: z.string().trim().min(1, "El usuario autenticado es obligatorio"),
 });
 
 type FirestoreDocument = {
@@ -57,6 +63,12 @@ type FirestoreRecord = Record<string, any> & {
 type AuthenticatedUser = {
   uid: string;
   email?: string;
+};
+
+type FirebaseServiceAccount = {
+  client_email?: string;
+  private_key?: string;
+  project_id?: string;
 };
 
 type CuotaAdherenteConfig = {
@@ -97,13 +109,66 @@ const firebaseJwks = createRemoteJWKSet(
 );
 
 const firestoreBaseUrl = `https://firestore.googleapis.com/v1/projects/${firebaseProjectId}/databases/(default)/documents`;
+function base64UrlEncode(input: Buffer | string): string {
+  return Buffer.from(input).toString("base64url");
+}
+
+function getFirebaseServiceAccount(): FirebaseServiceAccount {
+  const encoded = process.env.FIREBASE_SERVICE_ACCOUNT_BASE64?.trim();
+  const rawJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON?.trim();
+
+  if (!encoded && !rawJson) {
+    throw Object.assign(
+      new Error(
+        "Falta configurar FIREBASE_SERVICE_ACCOUNT_JSON o FIREBASE_SERVICE_ACCOUNT_BASE64 para emitir tokens Firebase."
+      ),
+      { statusCode: 500 }
+    );
+  }
+
+  try {
+    const raw = encoded ? Buffer.from(encoded, "base64").toString("utf8") : rawJson!;
+    const account = JSON.parse(raw) as FirebaseServiceAccount;
+
+    if (!account.client_email || !account.private_key) {
+      throw new Error("El service account no contiene client_email o private_key.");
+    }
+
+    account.private_key = account.private_key.replace(/\\n/g, "\n");
+    return account;
+  } catch (error: any) {
+    throw Object.assign(
+      new Error(`Credenciales Firebase Admin inválidas: ${error?.message || "no se pudo leer el service account"}`),
+      { statusCode: 500 }
+    );
+  }
+}
+
+function createFirebaseCustomToken(uid: string, claims: Record<string, unknown> = {}): string {
+  const account = getFirebaseServiceAccount();
+  const now = Math.floor(Date.now() / 1000);
+  const header = { alg: "RS256", typ: "JWT" };
+  const payload = {
+    iss: account.client_email,
+    sub: account.client_email,
+    aud: "https://identitytoolkit.googleapis.com/google.identity.identitytoolkit.v1.IdentityToolkit",
+    iat: now,
+    exp: now + 3600,
+    uid,
+    claims,
+  };
+
+  const unsignedToken = `${base64UrlEncode(JSON.stringify(header))}.${base64UrlEncode(JSON.stringify(payload))}`;
+  const signature = crypto.sign("RSA-SHA256", Buffer.from(unsignedToken), account.private_key!);
+  return `${unsignedToken}.${base64UrlEncode(signature)}`;
+}
 
 function getOpenAITranscriptionClient(): OpenAI {
   const apiKey = process.env.OPENAI_API_KEY?.trim();
 
   if (!apiKey) {
     throw new Error(
-      "Falta OPENAI_API_KEY. La consulta del chatbot usa Groq, pero la transcripción de audio todavía requiere OpenAI."
+      "Falta OPENAI_API_KEY. La consulta del chatbot usa Groq, pero la transcripciÃ³n de audio todavÃ­a requiere OpenAI."
     );
   }
 
@@ -238,13 +303,13 @@ async function getGoogleAccessToken(): Promise<string> {
 
   if (!metadataResponse.ok) {
     throw new Error(
-      "No se pudo obtener token de Google para Firestore. Configurá GOOGLE_OAUTH_ACCESS_TOKEN en local o ejecutá en Cloud Run con service account."
+      "No se pudo obtener token de Google para Firestore. ConfigurÃ¡ GOOGLE_OAUTH_ACCESS_TOKEN en local o ejecutÃ¡ en Cloud Run con service account."
     );
   }
 
   const data = await metadataResponse.json();
   if (!data?.access_token) {
-    throw new Error("La metadata de Google no devolvió access_token para Firestore.");
+    throw new Error("La metadata de Google no devolviÃ³ access_token para Firestore.");
   }
 
   return data.access_token;
@@ -412,7 +477,7 @@ async function verifyFirebaseIdToken(authorization?: string): Promise<Authentica
   });
 
   if (!payload.sub) {
-    throw Object.assign(new Error("Token Firebase inválido: falta UID."), {
+    throw Object.assign(new Error("Token Firebase invÃ¡lido: falta UID."), {
       statusCode: 401,
     });
   }
@@ -473,7 +538,7 @@ async function validateDniBelongsToUser(dni: string, uid: string): Promise<void>
 
   if (!hasUidMatch) {
     throw Object.assign(
-      new Error("No se encontró vínculo entre este DNI y el usuario autenticado."),
+      new Error("No se encontrÃ³ vÃ­nculo entre este DNI y el usuario autenticado."),
       { statusCode: 403 }
     );
   }
@@ -485,7 +550,7 @@ async function getAfiliadoDocs(dni: string) {
   const source = usuarios[0] || nuevoAfiliado[0];
 
   if (!source) {
-    throw Object.assign(new Error("No se encontró el afiliado para el DNI indicado."), {
+    throw Object.assign(new Error("No se encontrÃ³ el afiliado para el DNI indicado."), {
       statusCode: 404,
     });
   }
@@ -502,7 +567,7 @@ async function getCuotaAdherenteConfig(): Promise<CuotaAdherenteConfig> {
 
   if (!config) {
     throw Object.assign(
-      new Error("No existe la configuración config/cuotaAdherente."),
+      new Error("No existe la configuraciÃ³n config/cuotaAdherente."),
       { statusCode: 500 }
     );
   }
@@ -518,7 +583,7 @@ async function getCuotaAdherenteConfig(): Promise<CuotaAdherenteConfig> {
   };
 
   if (!parsed.habilitada) {
-    throw Object.assign(new Error("El pago de cuota adherente no está habilitado."), {
+    throw Object.assign(new Error("El pago de cuota adherente no estÃ¡ habilitado."), {
       statusCode: 409,
     });
   }
@@ -530,7 +595,7 @@ async function getCuotaAdherenteConfig(): Promise<CuotaAdherenteConfig> {
     parsed.moneda !== "ARS"
   ) {
     throw Object.assign(
-      new Error("La configuración de cuota adherente está incompleta o inválida."),
+      new Error("La configuraciÃ³n de cuota adherente estÃ¡ incompleta o invÃ¡lida."),
       { statusCode: 500 }
     );
   }
@@ -558,6 +623,32 @@ async function findExistingPagoAdherente(uid: string, dni: string, periodo: numb
   return pagos;
 }
 
+function getPagoEstadoInterno(payment: FirestoreRecord): string {
+  return String(payment.estadoInterno || payment.estado || "pendiente").toLowerCase();
+}
+
+function assertPagoAdminValido(payment: FirestoreRecord, dni: string) {
+  if (normalizeDni(payment.dni) !== dni) {
+    throw Object.assign(new Error("La orden de pago no corresponde al DNI indicado."), {
+      statusCode: 403,
+    });
+  }
+
+  const estado = getPagoEstadoInterno(payment);
+  if (["aprobado", "approved", "pagado", "cancelado", "cancelled", "vencido", "rechazado", "rejected"].includes(estado)) {
+    throw Object.assign(new Error("La orden de pago no se encuentra disponible para abonar."), {
+      statusCode: 409,
+    });
+  }
+
+  const importe = Number(payment.importe);
+  const moneda = String(payment.moneda || "ARS");
+  if (!Number.isFinite(importe) || importe <= 0 || moneda !== "ARS") {
+    throw Object.assign(new Error("La orden de pago tiene importe o moneda inválidos."), {
+      statusCode: 500,
+    });
+  }
+}
 function getCheckoutUrl(data: any): string {
   const ambiente = process.env.MP_ENV?.trim() || "test";
   if (ambiente === "test" && data?.sandbox_init_point) return data.sandbox_init_point;
@@ -659,7 +750,7 @@ function verifyMercadoPagoWebhookSignature(
     expectedBuffer.length !== receivedBuffer.length ||
     !crypto.timingSafeEqual(expectedBuffer, receivedBuffer)
   ) {
-    throw Object.assign(new Error("Firma de webhook Mercado Pago inválida."), {
+    throw Object.assign(new Error("Firma de webhook Mercado Pago invÃ¡lida."), {
       statusCode: 401,
     });
   }
@@ -746,7 +837,7 @@ function publicPagoFields(payment: FirestoreRecord) {
     comprobante:
       payment.estadoInterno === "aprobado"
         ? {
-            leyenda: "Comprobante de pago. No válido como factura.",
+            leyenda: "Comprobante de pago. No vÃ¡lido como factura.",
             mercadoPagoPaymentId: payment.mercadoPagoPaymentId,
             comprobanteUrl: payment.comprobanteUrl || null,
           }
@@ -781,7 +872,7 @@ app.post("/api/chatbot/query", async (req, res) => {
         origen: "backend",
         consulta: req.body?.pregunta || "",
         consultaNormalizada: req.body?.pregunta || "",
-        respuesta: "Solicitud inválida.",
+        respuesta: "Solicitud invÃ¡lida.",
         articulos: [],
         referencias: [],
         busqueda: [],
@@ -810,11 +901,192 @@ app.post("/api/chatbot/query", async (req, res) => {
   }
 });
 
+app.post("/api/auth/firebase/bootstrap", async (req, res) => {
+  try {
+    const input = firebaseBootstrapSchema.parse(req.body);
+    const dni = normalizeDni(input.dni);
+    const usuarioId = input.usuarioId.trim();
+
+    if (!dni) {
+      res.status(400).json({ ok: false, error: "DNI inválido." });
+      return;
+    }
+
+    const dniIndex = await getFirestoreDoc(`usuarios_dni/${dni}`);
+    const linkedUid = String(dniIndex?.usuarioId || dniIndex?.uid || dniIndex?.userId || "").trim();
+
+    if (!dniIndex || !linkedUid) {
+      res.status(404).json({
+        ok: false,
+        error: "No se encontró el vínculo entre este DNI y un usuario autenticado.",
+      });
+      return;
+    }
+
+    if (linkedUid !== usuarioId) {
+      res.status(403).json({ ok: false, error: "El DNI no corresponde al usuario autenticado." });
+      return;
+    }
+
+    const indexedDni = normalizeDni(dniIndex.dni || dni);
+    if (indexedDni && indexedDni !== dni) {
+      res.status(403).json({ ok: false, error: "El documento usuarios_dni no coincide con el DNI solicitado." });
+      return;
+    }
+
+    let affiliateDoc: FirestoreRecord | null = null;
+    const userDoc = await getFirestoreDoc(`usuarios/${linkedUid}`).catch(() => null);
+
+    if (userDoc) {
+      const userDni = normalizeDni(userDoc.dni || userDoc.DNI || userDoc.documento || "");
+      if (userDni && userDni !== dni) {
+        res.status(403).json({ ok: false, error: "El usuario vinculado no coincide con el DNI solicitado." });
+        return;
+      }
+      affiliateDoc = userDoc;
+    } else {
+      const usuarios = await findDocsByDni("usuarios", dni).catch(() => []);
+      const nuevosAfiliados = await findDocsByDni("nuevoAfiliado", dni).catch(() => []);
+      affiliateDoc = usuarios[0] || nuevosAfiliados[0] || null;
+    }
+
+    const customToken = createFirebaseCustomToken(linkedUid, { dni });
+
+    res.status(200).json({
+      ok: true,
+      customToken,
+      uid: linkedUid,
+      dni,
+      afiliadoNombre: affiliateDoc ? buildNombreAfiliado(affiliateDoc) : null,
+    });
+  } catch (error: any) {
+    const statusCode = Number(error?.statusCode || (error?.name === "ZodError" ? 400 : 500));
+    console.error("[sidca-chatbot-backend] Error Firebase bootstrap:", {
+      statusCode,
+      message: error?.message || "Error interno",
+    });
+    res.status(statusCode).json({
+      ok: false,
+      error: error?.message || "No se pudo iniciar la sesión segura de Firebase.",
+    });
+  }
+});
 app.post("/api/pagos/mercadopago/preference", async (req, res) => {
   try {
     const authUser = await verifyFirebaseIdToken(req.headers.authorization);
     const input = secureMercadoPagoPreferenceSchema.parse(req.body);
     const dni = normalizeDni(input.dni);
+
+    if (input.pagoId) {
+      const pagoId = input.pagoId;
+      const orden = await getFirestoreDoc(`pagos_adherentes/${pagoId}`);
+
+      if (!orden) {
+        res.status(404).json({ ok: false, error: "No se encontró la orden de pago." });
+        return;
+      }
+
+      assertPagoAdminValido(orden, dni);
+
+      const estado = getPagoEstadoInterno(orden);
+      if (
+        ["creada", "preferencia_creada", "pendiente", "en_proceso"].includes(estado) &&
+        orden.checkoutUrl &&
+        isRecentlyCreated(orden)
+      ) {
+        res.status(200).json({
+          ok: true,
+          pagoId,
+          preferenceId: orden.preferenceId || orden.mercadoPagoPreferenceId || null,
+          checkoutUrl: orden.checkoutUrl,
+          ambiente: orden.ambiente || process.env.MP_ENV?.trim() || "test",
+          reutilizada: true,
+        });
+        return;
+      }
+
+      const importe = Number(orden.importe);
+      const moneda = String(orden.moneda || "ARS");
+      const concepto = String(orden.concepto || "Pago SIDCA").trim();
+      const detalle = String(orden.detalle || concepto).trim();
+      const afiliadoNombre = String(orden.afiliadoNombre || "Afiliado SIDCA").trim();
+      const ambiente = process.env.MP_ENV?.trim() || "test";
+      const externalReference = orden.externalReference || `SIDCA-PAGO-${pagoId}`;
+      const backUrls = getMercadoPagoBackUrls();
+      const notificationUrl = process.env.MP_WEBHOOK_URL?.trim();
+
+      await updateFirestoreDoc(`pagos_adherentes/${pagoId}`, {
+        pagoId,
+        uid: authUser.uid,
+        dni,
+        afiliadoNombre,
+        moneda,
+        ambiente,
+        estadoInterno: "creada",
+        externalReference,
+        procesado: false,
+        requiereRevisionAdministrativa: Boolean(orden.requiereRevisionAdministrativa),
+        updatedAt: new Date(),
+      });
+
+      const preferenceBody = {
+        items: [
+          {
+            id: pagoId,
+            title: concepto,
+            description: detalle,
+            quantity: 1,
+            currency_id: moneda,
+            unit_price: importe,
+          },
+        ],
+        payer: {
+          name: afiliadoNombre,
+          identification: { type: "DNI", number: dni },
+        },
+        external_reference: externalReference,
+        metadata: {
+          pagoId,
+          periodo: orden.periodo || null,
+          concepto,
+        },
+        back_urls: backUrls,
+        auto_return: "approved",
+        ...(notificationUrl ? { notification_url: notificationUrl } : {}),
+        statement_descriptor: "SIDCA",
+      };
+
+      const mpPreference = await createMercadoPagoPreference(preferenceBody);
+      const checkoutUrl = getCheckoutUrl(mpPreference);
+
+      await updateFirestoreDoc(`pagos_adherentes/${pagoId}`, {
+        preferenceId: mpPreference.id,
+        mercadoPagoPreferenceId: mpPreference.id,
+        initPoint: mpPreference.init_point || null,
+        sandboxInitPoint: mpPreference.sandbox_init_point || null,
+        checkoutUrl,
+        estadoInterno: "preferencia_creada",
+        estado: "pendiente",
+        updatedAt: new Date(),
+      });
+
+      await appendPagoEvento(pagoId, {
+        tipo: "preferencia_creada",
+        estadoAnterior: estado,
+        estadoNuevo: "preferencia_creada",
+        origen: "backend",
+        detalle: "Preferencia creada desde orden administrativa.",
+      });
+
+      res.status(200).json({
+        ok: true,
+        pagoId,
+        preferenceId: mpPreference.id,
+        checkoutUrl,
+        ambiente,
+      });
+      return;
+    }
 
     await validateDniBelongsToUser(dni, authUser.uid);
 
@@ -844,7 +1116,7 @@ app.post("/api/pagos/mercadopago/preference", async (req, res) => {
     if (approved) {
       res.status(409).json({
         ok: false,
-        error: "La cuota adherente de este período ya fue abonada.",
+        error: "La cuota adherente de este perÃ­odo ya fue abonada.",
         pago: publicPagoFields(approved),
       });
       return;
@@ -1101,12 +1373,12 @@ app.get("/api/pagos/mercadopago/estado/:pagoId", async (req, res) => {
     const payment = await getFirestoreDoc(`pagos_adherentes/${pagoId}`);
 
     if (!payment) {
-      res.status(404).json({ ok: false, error: "No se encontró el pago." });
+      res.status(404).json({ ok: false, error: "No se encontrÃ³ el pago." });
       return;
     }
 
     if (payment.uid !== authUser.uid) {
-      res.status(403).json({ ok: false, error: "No tenés acceso a este pago." });
+      res.status(403).json({ ok: false, error: "No tenÃ©s acceso a este pago." });
       return;
     }
 
@@ -1156,7 +1428,7 @@ app.post(
       if (!req.file) {
         res.status(400).json({
           ok: false,
-          error: "No se recibió ningún archivo de audio.",
+          error: "No se recibiÃ³ ningÃºn archivo de audio.",
         });
         return;
       }
