@@ -516,27 +516,29 @@ function buildNombreAfiliado(doc: FirestoreRecord): string {
 }
 
 function docBelongsToUid(doc: FirestoreRecord, uid: string): boolean {
-  return [doc.uid, doc.usuarioId, doc.userId, doc.authUid].some((value) => value === uid);
+  return [doc.uid, doc.usuarioId, doc.userId, doc.authUid, doc.id].some(
+    (value) => String(value || "").trim() === uid
+  );
+}
+
+async function findAfiliadoByDni(dni: string): Promise<FirestoreRecord | null> {
+  const usuarios = await findDocsByDni("usuarios", dni);
+  if (usuarios.length > 0) return usuarios[0];
+
+  const nuevosAfiliados = await findDocsByDni("nuevoAfiliado", dni);
+  return nuevosAfiliados[0] || null;
 }
 
 async function validateDniBelongsToUser(dni: string, uid: string): Promise<void> {
-  const dniIndex = await getFirestoreDoc(`usuarios_dni/${dni}`);
-  if (dniIndex?.usuarioId && dniIndex.usuarioId !== uid) {
-    throw Object.assign(
-      new Error("El DNI solicitado pertenece a otro usuario autenticado."),
-      { statusCode: 403 }
-    );
+  const afiliado = await findAfiliadoByDni(dni);
+
+  if (!afiliado) {
+    throw Object.assign(new Error("No existe un afiliado para el DNI indicado."), {
+      statusCode: 404,
+    });
   }
 
-  if (dniIndex?.usuarioId === uid) return;
-
-  const usuarios = await findDocsByDni("usuarios", dni);
-  const nuevoAfiliado = await findDocsByDni("nuevoAfiliado", dni);
-  const hasUidMatch = [...usuarios, ...nuevoAfiliado].some((doc) =>
-    docBelongsToUid(doc, uid)
-  );
-
-  if (!hasUidMatch) {
+  if (!docBelongsToUid(afiliado, uid)) {
     throw Object.assign(
       new Error("No se encontrÃ³ vÃ­nculo entre este DNI y el usuario autenticado."),
       { statusCode: 403 }
@@ -912,50 +914,27 @@ app.post("/api/auth/firebase/bootstrap", async (req, res) => {
       return;
     }
 
-    const dniIndex = await getFirestoreDoc(`usuarios_dni/${dni}`);
-    const linkedUid = String(dniIndex?.usuarioId || dniIndex?.uid || dniIndex?.userId || "").trim();
+    const affiliateDoc = await findAfiliadoByDni(dni);
 
-    if (!dniIndex || !linkedUid) {
+    if (!affiliateDoc) {
       res.status(404).json({
         ok: false,
-        error: "No se encontró el vínculo entre este DNI y un usuario autenticado.",
+        error: "No se encontró el afiliado para el DNI indicado.",
       });
       return;
     }
 
-    if (linkedUid !== usuarioId) {
+    if (!docBelongsToUid(affiliateDoc, usuarioId)) {
       res.status(403).json({ ok: false, error: "El DNI no corresponde al usuario autenticado." });
       return;
     }
 
-    const indexedDni = normalizeDni(dniIndex.dni || dni);
-    if (indexedDni && indexedDni !== dni) {
-      res.status(403).json({ ok: false, error: "El documento usuarios_dni no coincide con el DNI solicitado." });
-      return;
-    }
-
-    let affiliateDoc: FirestoreRecord | null = null;
-    const userDoc = await getFirestoreDoc(`usuarios/${linkedUid}`).catch(() => null);
-
-    if (userDoc) {
-      const userDni = normalizeDni(userDoc.dni || userDoc.DNI || userDoc.documento || "");
-      if (userDni && userDni !== dni) {
-        res.status(403).json({ ok: false, error: "El usuario vinculado no coincide con el DNI solicitado." });
-        return;
-      }
-      affiliateDoc = userDoc;
-    } else {
-      const usuarios = await findDocsByDni("usuarios", dni).catch(() => []);
-      const nuevosAfiliados = await findDocsByDni("nuevoAfiliado", dni).catch(() => []);
-      affiliateDoc = usuarios[0] || nuevosAfiliados[0] || null;
-    }
-
-    const customToken = createFirebaseCustomToken(linkedUid, { dni });
+    const customToken = createFirebaseCustomToken(usuarioId, { dni });
 
     res.status(200).json({
       ok: true,
       customToken,
-      uid: linkedUid,
+      uid: usuarioId,
       dni,
       afiliadoNombre: affiliateDoc ? buildNombreAfiliado(affiliateDoc) : null,
     });

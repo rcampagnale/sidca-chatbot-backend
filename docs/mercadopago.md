@@ -45,7 +45,7 @@ Requiere:
 - `Authorization: Bearer FIREBASE_ID_TOKEN`
 - Body: `{ "dni": "12345678" }`
 
-Valida que el DNI pertenezca al UID autenticado mediante `usuarios_dni/{dni}` o campos UID equivalentes en `usuarios` / `nuevoAfiliado`.
+Valida que el DNI pertenezca al UID autenticado consultando primero `usuarios` y, si no existe allí, `nuevoAfiliado`.
 
 Respuesta:
 
@@ -85,7 +85,6 @@ Lista segura de pagos propios, ordenados del más reciente al más antiguo.
 - `pagos_mercadopago`: idempotencia por pago Mercado Pago.
 - `pagos_adherentes/{pagoId}/eventos`: auditoría.
 - `usuarios`, `nuevoAfiliado`: activación del adherente.
-- `usuarios_dni`: vínculo DNI ↔ UID autenticado.
 
 ## Comprobante
 
