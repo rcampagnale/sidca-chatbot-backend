@@ -10,6 +10,25 @@ import { runChatbotWorkflow } from "./openaiWorkflow.js";
 
 const app = express();
 const PORT = Number(process.env.PORT || 8080);
+const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 15000);
+const WEBHOOK_MAX_AGE_MS = Number(process.env.MP_WEBHOOK_MAX_AGE_MS || 5 * 60 * 1000);
+
+type MercadoPagoEnvironment = "test" | "production";
+type PagoTipo = "cuota_adherente" | "orden_administrativa";
+
+type RateLimitOptions = {
+  windowMs: number;
+  max: number;
+  message: string;
+};
+
+type RateLimitEntry = {
+  count: number;
+  resetAt: number;
+};
+
+const rateLimitStore = new Map<string, RateLimitEntry>();
+
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -28,12 +47,26 @@ const bodySchema = z.object({
 
 const secureMercadoPagoPreferenceSchema = z.object({
   dni: z.string().trim().min(5, "El DNI es obligatorio"),
-  pagoId: z.string().trim().min(1, "El identificador de la orden es obligatorio").optional(),
+  pagoId: z
+    .string()
+    .trim()
+    .regex(
+      /^[A-Za-z0-9_-]{1,128}$/,
+      "El identificador de la orden es inválido."
+    )
+    .optional(),
+  forzarNuevaPreferencia: z.boolean().optional().default(false),
 });
 
 const firebaseBootstrapSchema = z.object({
   dni: z.string().trim().min(5, "El DNI es obligatorio"),
-  usuarioId: z.string().trim().min(1, "El usuario autenticado es obligatorio"),
+  usuarioId: z
+    .string()
+    .trim()
+    .regex(
+      /^[A-Za-z0-9:_-]{1,128}$/,
+      "El identificador del usuario es inválido."
+    ),
 });
 
 type FirestoreDocument = {
@@ -168,25 +201,67 @@ function getOpenAITranscriptionClient(): OpenAI {
 
   if (!apiKey) {
     throw new Error(
-      "Falta OPENAI_API_KEY. La consulta del chatbot usa Groq, pero la transcripciÃ³n de audio todavÃ­a requiere OpenAI."
+      "Falta OPENAI_API_KEY. La consulta del chatbot usa Groq, pero la transcripción de audio todavía requiere OpenAI."
     );
   }
 
   return new OpenAI({ apiKey });
 }
 
+function getMercadoPagoEnvironment(): MercadoPagoEnvironment {
+  const environment = String(process.env.MP_ENV || "test")
+    .trim()
+    .toLowerCase();
+
+  if (environment !== "test" && environment !== "production") {
+    throw Object.assign(
+      new Error("MP_ENV debe ser test o production."),
+      { statusCode: 500 }
+    );
+  }
+
+  return environment;
+}
+
 function getMercadoPagoAccessToken(): string {
+  const environment = getMercadoPagoEnvironment();
   const accessToken =
-    process.env.MP_ACCESS_TOKEN_TEST?.trim() ||
-    process.env.MP_ACCESS_TOKEN?.trim();
+    environment === "production"
+      ? process.env.MP_ACCESS_TOKEN?.trim()
+      : process.env.MP_ACCESS_TOKEN_TEST?.trim();
 
   if (!accessToken) {
-    throw new Error(
-      "Falta configurar MP_ACCESS_TOKEN_TEST o MP_ACCESS_TOKEN en el backend."
+    throw Object.assign(
+      new Error(
+        environment === "production"
+          ? "Falta configurar MP_ACCESS_TOKEN en el backend."
+          : "Falta configurar MP_ACCESS_TOKEN_TEST en el backend."
+      ),
+      { statusCode: 500 }
     );
   }
 
   return accessToken;
+}
+
+function buildMercadoPagoPayer(
+  environment: MercadoPagoEnvironment,
+  afiliadoNombre: string,
+  dni: string
+): Record<string, unknown> {
+  if (environment === "test") {
+    return {};
+  }
+
+  return {
+    payer: {
+      name: afiliadoNombre,
+      identification: {
+        type: "DNI",
+        number: dni,
+      },
+    },
+  };
 }
 
 function getMercadoPagoBackUrls(): {
@@ -220,6 +295,16 @@ function getMercadoPagoBackUrls(): {
 
 function normalizeDni(dni: string | number | null | undefined): string {
   return String(dni ?? "").replace(/\D/g, "");
+}
+
+function assertValidDni(dni: string): string {
+  if (!/^\d{6,9}$/.test(dni)) {
+    throw Object.assign(new Error("DNI inválido."), {
+      statusCode: 400,
+    });
+  }
+
+  return dni;
 }
 
 function getDocumentoId(name: string): string {
@@ -288,9 +373,23 @@ function jsToFirestoreFields(data: Record<string, any>): Record<string, Firestor
   );
 }
 
+let googleAccessTokenCache:
+  | {
+      token: string;
+      expiresAt: number;
+    }
+  | null = null;
+
 async function getGoogleAccessToken(): Promise<string> {
   const explicitToken = process.env.GOOGLE_OAUTH_ACCESS_TOKEN?.trim();
   if (explicitToken) return explicitToken;
+
+  if (
+    googleAccessTokenCache &&
+    googleAccessTokenCache.expiresAt > Date.now() + 60_000
+  ) {
+    return googleAccessTokenCache.token;
+  }
 
   const metadataResponse = await fetch(
     "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
@@ -298,21 +397,28 @@ async function getGoogleAccessToken(): Promise<string> {
       headers: {
         "Metadata-Flavor": "Google",
       },
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     }
   );
 
   if (!metadataResponse.ok) {
     throw new Error(
-      "No se pudo obtener token de Google para Firestore. ConfigurÃ¡ GOOGLE_OAUTH_ACCESS_TOKEN en local o ejecutÃ¡ en Cloud Run con service account."
+      "No se pudo obtener token de Google para Firestore. Configurá GOOGLE_OAUTH_ACCESS_TOKEN en local o ejecutá en Cloud Run con service account."
     );
   }
 
   const data = await metadataResponse.json();
   if (!data?.access_token) {
-    throw new Error("La metadata de Google no devolviÃ³ access_token para Firestore.");
+    throw new Error("La metadata de Google no devolvió access_token para Firestore.");
   }
 
-  return data.access_token;
+  const expiresInSeconds = Number(data.expires_in || 3000);
+  googleAccessTokenCache = {
+    token: String(data.access_token),
+    expiresAt: Date.now() + Math.max(60, expiresInSeconds) * 1000,
+  };
+
+  return googleAccessTokenCache.token;
 }
 
 async function firestoreRequest<T>(
@@ -322,6 +428,7 @@ async function firestoreRequest<T>(
   const accessToken = await getGoogleAccessToken();
   const response = await fetch(url, {
     ...init,
+    signal: init.signal || AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     headers: {
       Authorization: `Bearer ${accessToken}`,
       "Content-Type": "application/json",
@@ -477,7 +584,7 @@ async function verifyFirebaseIdToken(authorization?: string): Promise<Authentica
   });
 
   if (!payload.sub) {
-    throw Object.assign(new Error("Token Firebase invÃ¡lido: falta UID."), {
+    throw Object.assign(new Error("Token Firebase inválido: falta UID."), {
       statusCode: 401,
     });
   }
@@ -540,7 +647,7 @@ async function validateDniBelongsToUser(dni: string, uid: string): Promise<void>
 
   if (!docBelongsToUid(afiliado, uid)) {
     throw Object.assign(
-      new Error("No se encontrÃ³ vÃ­nculo entre este DNI y el usuario autenticado."),
+      new Error("No se encontró vínculo entre este DNI y el usuario autenticado."),
       { statusCode: 403 }
     );
   }
@@ -552,7 +659,7 @@ async function getAfiliadoDocs(dni: string) {
   const source = usuarios[0] || nuevoAfiliado[0];
 
   if (!source) {
-    throw Object.assign(new Error("No se encontrÃ³ el afiliado para el DNI indicado."), {
+    throw Object.assign(new Error("No se encontró el afiliado para el DNI indicado."), {
       statusCode: 404,
     });
   }
@@ -569,7 +676,7 @@ async function getCuotaAdherenteConfig(): Promise<CuotaAdherenteConfig> {
 
   if (!config) {
     throw Object.assign(
-      new Error("No existe la configuraciÃ³n config/cuotaAdherente."),
+      new Error("No existe la configuración config/cuotaAdherente."),
       { statusCode: 500 }
     );
   }
@@ -585,7 +692,7 @@ async function getCuotaAdherenteConfig(): Promise<CuotaAdherenteConfig> {
   };
 
   if (!parsed.habilitada) {
-    throw Object.assign(new Error("El pago de cuota adherente no estÃ¡ habilitado."), {
+    throw Object.assign(new Error("El pago de cuota adherente no está habilitado."), {
       statusCode: 409,
     });
   }
@@ -597,7 +704,7 @@ async function getCuotaAdherenteConfig(): Promise<CuotaAdherenteConfig> {
     parsed.moneda !== "ARS"
   ) {
     throw Object.assign(
-      new Error("La configuraciÃ³n de cuota adherente estÃ¡ incompleta o invÃ¡lida."),
+      new Error("La configuración de cuota adherente está incompleta o inválida."),
       { statusCode: 500 }
     );
   }
@@ -626,7 +733,49 @@ async function findExistingPagoAdherente(uid: string, dni: string, periodo: numb
 }
 
 function getPagoEstadoInterno(payment: FirestoreRecord): string {
-  return String(payment.estadoInterno || payment.estado || "pendiente").toLowerCase();
+  const raw = String(
+    payment.estadoInterno ||
+      payment.estadoMercadoPago ||
+      payment.estado ||
+      "pendiente"
+  )
+    .trim()
+    .toLowerCase();
+
+  const aliases: Record<string, string> = {
+    approved: "aprobado",
+    pending: "pendiente",
+    in_process: "en_proceso",
+    rejected: "rechazado",
+    cancelled: "cancelado",
+    refunded: "devuelto",
+    charged_back: "contracargo",
+  };
+
+  return aliases[raw] || raw;
+}
+
+function inferPagoTipo(payment: FirestoreRecord): PagoTipo {
+  const explicit = String(payment.tipoPago || "").trim().toLowerCase();
+  if (explicit === "cuota_adherente") return "cuota_adherente";
+  if (explicit === "orden_administrativa") return "orden_administrativa";
+
+  const concepto = String(payment.concepto || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+
+  return concepto.includes("cuota sindical") && concepto.includes("adherente")
+    ? "cuota_adherente"
+    : "orden_administrativa";
+}
+
+function shouldActivateAdherente(payment: FirestoreRecord): boolean {
+  const tipoPago = inferPagoTipo(payment);
+  if (tipoPago !== "cuota_adherente") return false;
+
+  if (payment.habilitaAdherente === false) return false;
+  return true;
 }
 
 function assertPagoAdminValido(payment: FirestoreRecord, dni: string) {
@@ -652,8 +801,11 @@ function assertPagoAdminValido(payment: FirestoreRecord, dni: string) {
   }
 }
 function getCheckoutUrl(data: any): string {
-  const ambiente = process.env.MP_ENV?.trim() || "test";
-  if (ambiente === "test" && data?.sandbox_init_point) return data.sandbox_init_point;
+  const environment = getMercadoPagoEnvironment();
+  if (environment === "test" && data?.sandbox_init_point) {
+    return data.sandbox_init_point;
+  }
+
   return data?.init_point || data?.sandbox_init_point || "";
 }
 
@@ -665,6 +817,7 @@ async function createMercadoPagoPreference(preferenceBody: Record<string, any>) 
       "Content-Type": "application/json",
     },
     body: JSON.stringify(preferenceBody),
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
 
   const data = await response.json();
@@ -690,6 +843,7 @@ async function fetchMercadoPagoPayment(paymentId: string): Promise<MercadoPagoPa
       headers: {
         Authorization: `Bearer ${getMercadoPagoAccessToken()}`,
       },
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     }
   );
 
@@ -743,6 +897,18 @@ function verifyMercadoPagoWebhookSignature(
     });
   }
 
+  const timestamp = Number(ts);
+  const timestampMs = timestamp > 1_000_000_000_000
+    ? timestamp
+    : timestamp * 1000;
+  const age = Math.abs(Date.now() - timestampMs);
+
+  if (!Number.isFinite(timestamp) || age > WEBHOOK_MAX_AGE_MS) {
+    throw Object.assign(new Error("La firma del webhook está vencida."), {
+      statusCode: 401,
+    });
+  }
+
   const manifest = `id:${paymentId};request-id:${requestId};ts:${ts};`;
   const expected = crypto.createHmac("sha256", secret).update(manifest).digest("hex");
   const expectedBuffer = Buffer.from(expected, "hex");
@@ -752,7 +918,7 @@ function verifyMercadoPagoWebhookSignature(
     expectedBuffer.length !== receivedBuffer.length ||
     !crypto.timingSafeEqual(expectedBuffer, receivedBuffer)
   ) {
-    throw Object.assign(new Error("Firma de webhook Mercado Pago invÃ¡lida."), {
+    throw Object.assign(new Error("Firma de webhook Mercado Pago inválida."), {
       statusCode: 401,
     });
   }
@@ -785,6 +951,13 @@ async function activateAdherenteAfterPayment(
   mercadoPagoPaymentId: string,
   pagoAdherenteId: string
 ) {
+  if (!Number.isFinite(periodo)) {
+    throw Object.assign(
+      new Error("El período de la cuota adherente es inválido."),
+      { statusCode: 409 }
+    );
+  }
+
   const { usuarios, nuevoAfiliado } = await getAfiliadoDocs(dni);
   const update = {
     adherente: true,
@@ -823,6 +996,8 @@ async function appendPagoEvento(
 }
 
 function publicPagoFields(payment: FirestoreRecord) {
+  const estado = getPagoEstadoInterno(payment);
+
   return {
     pagoId: payment.pagoId || payment.id,
     dni: payment.dni,
@@ -832,22 +1007,141 @@ function publicPagoFields(payment: FirestoreRecord) {
     moneda: payment.moneda,
     concepto: payment.concepto,
     detalle: payment.detalle,
-    estadoInterno: payment.estadoInterno,
-    estadoMercadoPago: payment.estadoMercadoPago,
-    fechaCreacion: payment.createdAt,
-    fechaPago: payment.fechaPago,
+    tipoPago: inferPagoTipo(payment),
+    habilitaAdherente: shouldActivateAdherente(payment),
+    estado,
+    estadoInterno: estado,
+    estadoMercadoPago: payment.estadoMercadoPago || null,
+    estadoMercadoPagoDetalle: payment.estadoMercadoPagoDetalle || null,
+    mercadoPagoPreferenceId:
+      payment.mercadoPagoPreferenceId || payment.preferenceId || null,
+    mercadoPagoPaymentId: payment.mercadoPagoPaymentId || null,
+    paymentMethodId: payment.paymentMethodId || null,
+    paymentTypeId: payment.paymentTypeId || null,
+    fechaCreacion: payment.createdAt || payment.fechaCreacion || null,
+    fechaPago: payment.fechaPago || null,
+    requiereRevisionAdministrativa: Boolean(
+      payment.requiereRevisionAdministrativa ||
+        payment.revisionAdministrativa
+    ),
     comprobante:
-      payment.estadoInterno === "aprobado"
+      estado === "aprobado"
         ? {
-            leyenda: "Comprobante de pago. No vÃ¡lido como factura.",
-            mercadoPagoPaymentId: payment.mercadoPagoPaymentId,
+            leyenda: "Comprobante de pago. No válido como factura.",
+            mercadoPagoPaymentId: payment.mercadoPagoPaymentId || null,
             comprobanteUrl: payment.comprobanteUrl || null,
           }
         : null,
   };
 }
 
-app.use(cors());
+function getAllowedOrigins(): Set<string> {
+  const configured = String(process.env.CORS_ALLOWED_ORIGINS || "")
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+
+  return new Set([
+    "http://localhost:3000",
+    "https://sidcagremio.com",
+    "https://www.sidcagremio.com",
+    "https://sidca-a33f0.web.app",
+    "https://sidca-a33f0.firebaseapp.com",
+    ...configured,
+  ]);
+}
+
+function createRateLimit(options: RateLimitOptions) {
+  return (
+    req: express.Request,
+    res: express.Response,
+    next: express.NextFunction
+  ) => {
+    const now = Date.now();
+    const clientIp =
+      String(req.headers["x-forwarded-for"] || "")
+        .split(",")[0]
+        .trim() ||
+      req.ip ||
+      req.socket.remoteAddress ||
+      "unknown";
+    const key = `${req.path}:${clientIp}`;
+    const current = rateLimitStore.get(key);
+
+    if (!current || current.resetAt <= now) {
+      rateLimitStore.set(key, {
+        count: 1,
+        resetAt: now + options.windowMs,
+      });
+      next();
+      return;
+    }
+
+    if (current.count >= options.max) {
+      const retryAfterSeconds = Math.max(
+        1,
+        Math.ceil((current.resetAt - now) / 1000)
+      );
+      res.setHeader("Retry-After", String(retryAfterSeconds));
+      res.status(429).json({
+        ok: false,
+        error: options.message,
+      });
+      return;
+    }
+
+    current.count += 1;
+    rateLimitStore.set(key, current);
+
+    if (rateLimitStore.size > 10_000) {
+      for (const [storedKey, entry] of rateLimitStore.entries()) {
+        if (entry.resetAt <= now) rateLimitStore.delete(storedKey);
+      }
+    }
+
+    next();
+  };
+}
+
+const allowedOrigins = getAllowedOrigins();
+const bootstrapRateLimit = createRateLimit({
+  windowMs: 60_000,
+  max: 10,
+  message: "Demasiados intentos de autenticación. Esperá un minuto.",
+});
+const paymentRateLimit = createRateLimit({
+  windowMs: 60_000,
+  max: 20,
+  message: "Demasiados intentos de pago. Esperá un minuto.",
+});
+const chatbotRateLimit = createRateLimit({
+  windowMs: 60_000,
+  max: 60,
+  message: "Demasiadas consultas. Esperá un minuto.",
+});
+
+app.disable("x-powered-by");
+app.set("trust proxy", 1);
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (!origin || allowedOrigins.has(origin)) {
+        callback(null, true);
+        return;
+      }
+
+      callback(new Error("Origen no permitido por CORS."));
+    },
+    credentials: true,
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization",
+      "X-Request-Id",
+      "X-Signature",
+    ],
+  })
+);
 app.use(express.json({ limit: "1mb" }));
 
 app.get("/health", (_req, res) => {
@@ -859,7 +1153,7 @@ app.get("/health", (_req, res) => {
   });
 });
 
-app.post("/api/chatbot/query", async (req, res) => {
+app.post("/api/chatbot/query", chatbotRateLimit, async (req, res) => {
   try {
     const input = bodySchema.parse(req.body);
     const result = await runChatbotWorkflow(input);
@@ -874,7 +1168,7 @@ app.post("/api/chatbot/query", async (req, res) => {
         origen: "backend",
         consulta: req.body?.pregunta || "",
         consultaNormalizada: req.body?.pregunta || "",
-        respuesta: "Solicitud invÃ¡lida.",
+        respuesta: "Solicitud inválida.",
         articulos: [],
         referencias: [],
         busqueda: [],
@@ -903,16 +1197,11 @@ app.post("/api/chatbot/query", async (req, res) => {
   }
 });
 
-app.post("/api/auth/firebase/bootstrap", async (req, res) => {
+app.post("/api/auth/firebase/bootstrap", bootstrapRateLimit, async (req, res) => {
   try {
     const input = firebaseBootstrapSchema.parse(req.body);
-    const dni = normalizeDni(input.dni);
+    const dni = assertValidDni(normalizeDni(input.dni));
     const usuarioId = input.usuarioId.trim();
-
-    if (!dni) {
-      res.status(400).json({ ok: false, error: "DNI inválido." });
-      return;
-    }
 
     const affiliateDoc = await findAfiliadoByDni(dni);
 
@@ -950,11 +1239,13 @@ app.post("/api/auth/firebase/bootstrap", async (req, res) => {
     });
   }
 });
-app.post("/api/pagos/mercadopago/preference", async (req, res) => {
+app.post("/api/pagos/mercadopago/preference", paymentRateLimit, async (req, res) => {
   try {
     const authUser = await verifyFirebaseIdToken(req.headers.authorization);
     const input = secureMercadoPagoPreferenceSchema.parse(req.body);
-    const dni = normalizeDni(input.dni);
+    const dni = assertValidDni(normalizeDni(input.dni));
+
+    await validateDniBelongsToUser(dni, authUser.uid);
 
     if (input.pagoId) {
       const pagoId = input.pagoId;
@@ -967,8 +1258,17 @@ app.post("/api/pagos/mercadopago/preference", async (req, res) => {
 
       assertPagoAdminValido(orden, dni);
 
+      if (orden.uid && String(orden.uid) !== authUser.uid) {
+        res.status(403).json({
+          ok: false,
+          error: "La orden de pago pertenece a otro usuario.",
+        });
+        return;
+      }
+
       const estado = getPagoEstadoInterno(orden);
       if (
+        !input.forzarNuevaPreferencia &&
         ["creada", "preferencia_creada", "pendiente", "en_proceso"].includes(estado) &&
         orden.checkoutUrl &&
         isRecentlyCreated(orden)
@@ -978,7 +1278,7 @@ app.post("/api/pagos/mercadopago/preference", async (req, res) => {
           pagoId,
           preferenceId: orden.preferenceId || orden.mercadoPagoPreferenceId || null,
           checkoutUrl: orden.checkoutUrl,
-          ambiente: orden.ambiente || process.env.MP_ENV?.trim() || "test",
+          ambiente: orden.ambiente || getMercadoPagoEnvironment(),
           reutilizada: true,
         });
         return;
@@ -989,10 +1289,16 @@ app.post("/api/pagos/mercadopago/preference", async (req, res) => {
       const concepto = String(orden.concepto || "Pago SIDCA").trim();
       const detalle = String(orden.detalle || concepto).trim();
       const afiliadoNombre = String(orden.afiliadoNombre || "Afiliado SIDCA").trim();
-      const ambiente = process.env.MP_ENV?.trim() || "test";
+      const ambiente = getMercadoPagoEnvironment();
       const externalReference = orden.externalReference || `SIDCA-PAGO-${pagoId}`;
       const backUrls = getMercadoPagoBackUrls();
       const notificationUrl = process.env.MP_WEBHOOK_URL?.trim();
+      const tipoPago = inferPagoTipo(orden);
+      const habilitaAdherente =
+        tipoPago === "cuota_adherente" &&
+        orden.habilitaAdherente !== false;
+      const createdAt =
+        orden.createdAt || orden.fechaCreacion || new Date();
 
       await updateFirestoreDoc(`pagos_adherentes/${pagoId}`, {
         pagoId,
@@ -1001,10 +1307,18 @@ app.post("/api/pagos/mercadopago/preference", async (req, res) => {
         afiliadoNombre,
         moneda,
         ambiente,
+        tipoPago,
+        habilitaAdherente,
         estadoInterno: "creada",
+        estado: "pendiente",
         externalReference,
         procesado: false,
-        requiereRevisionAdministrativa: Boolean(orden.requiereRevisionAdministrativa),
+        requiereRevisionAdministrativa: Boolean(
+          orden.requiereRevisionAdministrativa ||
+            orden.revisionAdministrativa
+        ),
+        createdAt,
+        fechaCreacion: orden.fechaCreacion || createdAt,
         updatedAt: new Date(),
       });
 
@@ -1019,10 +1333,7 @@ app.post("/api/pagos/mercadopago/preference", async (req, res) => {
             unit_price: importe,
           },
         ],
-        payer: {
-          name: afiliadoNombre,
-          identification: { type: "DNI", number: dni },
-        },
+        ...buildMercadoPagoPayer(ambiente, afiliadoNombre, dni),
         external_reference: externalReference,
         metadata: {
           pagoId,
@@ -1067,8 +1378,6 @@ app.post("/api/pagos/mercadopago/preference", async (req, res) => {
       return;
     }
 
-    await validateDniBelongsToUser(dni, authUser.uid);
-
     const config = await getCuotaAdherenteConfig();
     const { afiliadoNombre, usuarios, nuevoAfiliado } = await getAfiliadoDocs(dni);
     const afiliadoDocs = [...usuarios, ...nuevoAfiliado];
@@ -1095,20 +1404,22 @@ app.post("/api/pagos/mercadopago/preference", async (req, res) => {
     if (approved) {
       res.status(409).json({
         ok: false,
-        error: "La cuota adherente de este perÃ­odo ya fue abonada.",
+        error: "La cuota adherente de este período ya fue abonada.",
         pago: publicPagoFields(approved),
       });
       return;
     }
 
-    const reusable = existingPayments.find(
-      (payment) =>
-        ["creada", "preferencia_creada", "pendiente", "en_proceso"].includes(
-          String(payment.estadoInterno || "")
-        ) &&
-        payment.checkoutUrl &&
-        isRecentlyCreated(payment)
-    );
+    const reusable = input.forzarNuevaPreferencia
+      ? undefined
+      : existingPayments.find(
+          (payment) =>
+            ["creada", "preferencia_creada", "pendiente", "en_proceso"].includes(
+              getPagoEstadoInterno(payment)
+            ) &&
+            payment.checkoutUrl &&
+            isRecentlyCreated(payment)
+        );
 
     if (reusable) {
       res.status(200).json({
@@ -1116,7 +1427,7 @@ app.post("/api/pagos/mercadopago/preference", async (req, res) => {
         pagoId: reusable.pagoId || reusable.id,
         preferenceId: reusable.preferenceId,
         checkoutUrl: reusable.checkoutUrl,
-        ambiente: reusable.ambiente || process.env.MP_ENV?.trim() || "test",
+        ambiente: reusable.ambiente || getMercadoPagoEnvironment(),
         reutilizada: true,
       });
       return;
@@ -1124,7 +1435,7 @@ app.post("/api/pagos/mercadopago/preference", async (req, res) => {
 
     const pagoId = crypto.randomUUID();
     const externalReference = `SIDCA-CUOTA-${config.periodo}-${pagoId}`;
-    const ambiente = process.env.MP_ENV?.trim() || "test";
+    const ambiente = getMercadoPagoEnvironment();
     const createdAt = new Date();
 
     await createFirestoreDoc("pagos_adherentes", pagoId, {
@@ -1138,12 +1449,16 @@ app.post("/api/pagos/mercadopago/preference", async (req, res) => {
       concepto: config.concepto,
       detalle: config.detalle,
       ambiente,
+      tipoPago: "cuota_adherente",
+      habilitaAdherente: true,
       estadoInterno: "creada",
+      estado: "pendiente",
       estadoMercadoPago: null,
       externalReference,
       procesado: false,
       requiereRevisionAdministrativa: false,
       createdAt,
+      fechaCreacion: createdAt,
       updatedAt: createdAt,
     });
 
@@ -1160,13 +1475,7 @@ app.post("/api/pagos/mercadopago/preference", async (req, res) => {
           unit_price: config.importe,
         },
       ],
-      payer: {
-        name: afiliadoNombre,
-        identification: {
-          type: "DNI",
-          number: dni,
-        },
-      },
+      ...buildMercadoPagoPayer(ambiente, afiliadoNombre, dni),
       external_reference: externalReference,
       metadata: {
         pagoId,
@@ -1184,10 +1493,12 @@ app.post("/api/pagos/mercadopago/preference", async (req, res) => {
 
     await updateFirestoreDoc(`pagos_adherentes/${pagoId}`, {
       preferenceId: mpPreference.id,
+      mercadoPagoPreferenceId: mpPreference.id,
       initPoint: mpPreference.init_point || null,
       sandboxInitPoint: mpPreference.sandbox_init_point || null,
       checkoutUrl,
       estadoInterno: "preferencia_creada",
+      estado: "pendiente",
       updatedAt: new Date(),
     });
 
@@ -1245,19 +1556,35 @@ app.post("/api/pagos/mercadopago/webhook", async (req, res) => {
       req.headers["x-signature"] as string | undefined
     );
 
-    const idempotencyDoc = await getFirestoreDoc(`pagos_mercadopago/${paymentId}`);
-    if (idempotencyDoc) {
+    const payment = await fetchMercadoPagoPayment(paymentId);
+    const idempotencyDoc = await getFirestoreDoc(
+      `pagos_mercadopago/${paymentId}`
+    );
+
+    if (
+      idempotencyDoc &&
+      String(idempotencyDoc.status || "") === String(payment.status || "") &&
+      String(idempotencyDoc.statusDetail || "") ===
+        String(payment.status_detail || "")
+    ) {
       res.status(200).json({ ok: true, duplicate: true });
       return;
     }
 
-    const payment = await fetchMercadoPagoPayment(paymentId);
     const externalReference = String(payment.external_reference || "");
     const internalPayments = await queryFirestoreCollection(
       "pagos_adherentes",
       [{ field: "externalReference", value: externalReference }],
-      1
+      2
     );
+
+    if (internalPayments.length > 1) {
+      throw Object.assign(
+        new Error("Existen varias órdenes internas para la misma referencia."),
+        { statusCode: 409 }
+      );
+    }
+
     const internalPayment = internalPayments[0];
 
     if (!internalPayment) {
@@ -1270,10 +1597,12 @@ app.post("/api/pagos/mercadopago/webhook", async (req, res) => {
     const actualAmount = Number(payment.transaction_amount);
     const expectedCurrency = String(internalPayment.moneda || "ARS");
     const actualCurrency = String(payment.currency_id || "");
-    const expectedLiveMode = String(internalPayment.ambiente || "test") !== "test";
+    const expectedLiveMode =
+      String(internalPayment.ambiente || "test") === "production";
 
     if (
       externalReference !== internalPayment.externalReference ||
+      !Number.isFinite(actualAmount) ||
       Math.abs(actualAmount - expectedAmount) > 0.01 ||
       actualCurrency !== expectedCurrency ||
       Boolean(payment.live_mode) !== expectedLiveMode
@@ -1288,31 +1617,37 @@ app.post("/api/pagos/mercadopago/webhook", async (req, res) => {
       );
     }
 
-    await createFirestoreDoc("pagos_mercadopago", paymentId, {
-      mercadoPagoPaymentId: String(payment.id),
-      pagoAdherenteId: internalPayment.id,
-      externalReference,
-      status: payment.status || null,
-      statusDetail: payment.status_detail || null,
-      createdAt: new Date(),
-    });
-
     const mappedStatus = mapMercadoPagoStatus(payment.status);
-    const previousStatus = internalPayment.estadoInterno || null;
+    const previousStatus = getPagoEstadoInterno(internalPayment);
+    const fechaPago =
+      payment.date_approved || internalPayment.fechaPago || null;
 
     await updateFirestoreDoc(`pagos_adherentes/${internalPayment.id}`, {
+      estado: mappedStatus.estadoInterno,
       estadoInterno: mappedStatus.estadoInterno,
       estadoMercadoPago: payment.status || null,
       estadoMercadoPagoDetalle: payment.status_detail || null,
       mercadoPagoPaymentId: String(payment.id),
       paymentMethodId: payment.payment_method_id || null,
       paymentTypeId: payment.payment_type_id || null,
-      fechaPago: payment.date_approved || null,
+      fechaPago,
       mercadoPagoDateCreated: payment.date_created || null,
       procesado: mappedStatus.procesado,
       requiereRevisionAdministrativa: mappedStatus.revision,
       updatedAt: new Date(),
     });
+
+    if (
+      mappedStatus.estadoInterno === "aprobado" &&
+      shouldActivateAdherente(internalPayment)
+    ) {
+      await activateAdherenteAfterPayment(
+        String(internalPayment.dni),
+        Number(internalPayment.periodo),
+        String(payment.id),
+        String(internalPayment.id)
+      );
+    }
 
     await appendPagoEvento(String(internalPayment.id), {
       tipo: "webhook_payment",
@@ -1322,14 +1657,15 @@ app.post("/api/pagos/mercadopago/webhook", async (req, res) => {
       detalle: payment.status_detail || undefined,
     });
 
-    if (mappedStatus.estadoInterno === "aprobado") {
-      await activateAdherenteAfterPayment(
-        String(internalPayment.dni),
-        Number(internalPayment.periodo),
-        String(payment.id),
-        String(internalPayment.id)
-      );
-    }
+    await setFirestoreDoc(`pagos_mercadopago/${paymentId}`, {
+      mercadoPagoPaymentId: String(payment.id),
+      pagoAdherenteId: internalPayment.id,
+      externalReference,
+      status: payment.status || null,
+      statusDetail: payment.status_detail || null,
+      updatedAt: new Date(),
+      createdAt: idempotencyDoc?.createdAt || new Date(),
+    });
 
     res.status(200).json({ ok: true, estado: mappedStatus.estadoInterno });
   } catch (error: any) {
@@ -1348,16 +1684,43 @@ app.post("/api/pagos/mercadopago/webhook", async (req, res) => {
 app.get("/api/pagos/mercadopago/estado/:pagoId", async (req, res) => {
   try {
     const authUser = await verifyFirebaseIdToken(req.headers.authorization);
-    const pagoId = String(req.params.pagoId || "").trim();
-    const payment = await getFirestoreDoc(`pagos_adherentes/${pagoId}`);
+    const reference = String(req.params.pagoId || "").trim();
 
-    if (!payment) {
-      res.status(404).json({ ok: false, error: "No se encontrÃ³ el pago." });
+    if (!/^[A-Za-z0-9_-]{1,200}$/.test(reference)) {
+      res.status(400).json({
+        ok: false,
+        error: "El identificador del pago es inválido.",
+      });
       return;
     }
 
-    if (payment.uid !== authUser.uid) {
-      res.status(403).json({ ok: false, error: "No tenÃ©s acceso a este pago." });
+    let payment = await getFirestoreDoc(`pagos_adherentes/${reference}`);
+
+    if (!payment) {
+      const matches = await queryFirestoreCollection(
+        "pagos_adherentes",
+        [{ field: "externalReference", value: reference }],
+        2
+      );
+
+      if (matches.length > 1) {
+        res.status(409).json({
+          ok: false,
+          error: "La referencia corresponde a más de una orden.",
+        });
+        return;
+      }
+
+      payment = matches[0] || null;
+    }
+
+    if (!payment) {
+      res.status(404).json({ ok: false, error: "No se encontró el pago." });
+      return;
+    }
+
+    if (String(payment.uid || "") !== authUser.uid) {
+      res.status(403).json({ ok: false, error: "No tenés acceso a este pago." });
       return;
     }
 
@@ -1381,8 +1744,8 @@ app.get("/api/pagos/mercadopago/mis-pagos", async (req, res) => {
     );
 
     const sorted = payments.sort((a, b) => {
-      const aDate = new Date(a.createdAt || 0).getTime();
-      const bDate = new Date(b.createdAt || 0).getTime();
+      const aDate = new Date(a.createdAt || a.fechaCreacion || 0).getTime();
+      const bDate = new Date(b.createdAt || b.fechaCreacion || 0).getTime();
       return bDate - aDate;
     });
 
@@ -1407,7 +1770,7 @@ app.post(
       if (!req.file) {
         res.status(400).json({
           ok: false,
-          error: "No se recibiÃ³ ningÃºn archivo de audio.",
+          error: "No se recibió ningún archivo de audio.",
         });
         return;
       }
