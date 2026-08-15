@@ -595,6 +595,104 @@ async function verifyFirebaseIdToken(authorization?: string): Promise<Authentica
   };
 }
 
+/**
+ * Busca el documento del usuario autenticado.
+ * Primero intenta usuarios/{uid}; si el proyecto usa otro ID de documento,
+ * busca el UID en los campos históricos más habituales.
+ */
+async function findUsuarioByAuthUid(uid: string): Promise<FirestoreRecord | null> {
+  const direct = await getFirestoreDoc(`usuarios/${uid}`);
+  if (direct) return direct;
+
+  const uidFields = ["uid", "usuarioId", "userId", "authUid"];
+
+  for (const field of uidFields) {
+    const matches = await queryFirestoreCollection(
+      "usuarios",
+      [{ field, value: uid }],
+      2
+    );
+
+    if (matches.length > 0) {
+      return matches[0];
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Exige que el usuario tenga permiso explícito para validar certificados.
+ * El permiso se controla mediante:
+ *
+ * validarCertificados: true
+ *
+ * en el documento correspondiente de la colección usuarios.
+ */
+async function requireValidadorCertificados(
+  authUser: AuthenticatedUser
+): Promise<FirestoreRecord> {
+  const usuario = await findUsuarioByAuthUid(authUser.uid);
+
+  if (!usuario) {
+    throw Object.assign(
+      new Error("El usuario autenticado no está registrado en SIDCA."),
+      { statusCode: 403 }
+    );
+  }
+
+  if (usuario.validarCertificados !== true) {
+    throw Object.assign(
+      new Error("No tenés autorización para validar certificados SIDCA."),
+      { statusCode: 403 }
+    );
+  }
+
+  return usuario;
+}
+
+/**
+ * Firebase UIDs autorizados a administrar el módulo de certificados.
+ *
+ * Se configuran exclusivamente por variable de entorno, separados por coma.
+ * No se hardcodea ningún UID en el código.
+ *
+ * Si la variable está vacía, el Set queda vacío y ningún usuario obtiene
+ * permisos administrativos de forma automática.
+ */
+const certificadosAdminUids = new Set(
+  String(process.env.CERTIFICADOS_ADMIN_UIDS || "")
+    .split(",")
+    .map((uid) => uid.trim())
+    .filter(Boolean)
+);
+
+/**
+ * Exige que el usuario autenticado sea administrador del módulo de
+ * certificados.
+ *
+ * Recibe únicamente el resultado ya verificado de verifyFirebaseIdToken(),
+ * de modo que el UID comparado proviene de la firma del Firebase ID Token
+ * y nunca de body, query o headers enviados por el cliente.
+ *
+ * Este permiso es independiente de validarCertificados, que corresponde a
+ * los validadores designados.
+ */
+async function requireAdministrador(
+  authUser: AuthenticatedUser
+): Promise<AuthenticatedUser> {
+  if (!certificadosAdminUids.has(authUser.uid)) {
+    throw Object.assign(
+      new Error(
+        "No tenés autorización administrativa para gestionar certificados SIDCA."
+      ),
+      { statusCode: 403 }
+    );
+  }
+
+  return authUser;
+}
+
 async function findDocsByDni(collectionId: "usuarios" | "nuevoAfiliado", dni: string) {
   const numericDni = Number(dni);
   const byString = await queryFirestoreCollection(collectionId, [
@@ -1151,6 +1249,139 @@ app.get("/health", (_req, res) => {
     status: "running",
     timestamp: new Date().toISOString(),
   });
+});
+
+// ============================================================
+// CERTIFICADOS SIDCA
+// Endpoint inicial protegido para comprobar autenticación.
+// No modifica Firestore y no afecta Mercado Pago ni chatbot.
+//
+// DECISIONES DEFINIDAS PARA ETAPAS POSTERIORES (todavía NO implementadas):
+//
+//   Colección raíz : "certificados" (ya existente en producción).
+//                    Las nuevas estructuras serán subcolecciones:
+//                      certificados/{certificadoId}/emitidos/{token}
+//                      certificados/{certificadoId}/emitidos/{token}/verificaciones/{id}
+//                    NO se crea ninguna colección "certificaciones".
+//
+//   Token del QR   : crypto.randomBytes(24).toString("hex")
+//                    -> 48 caracteres hexadecimales en minúscula
+//                    -> validación prevista: /^[a-f0-9]{48}$/
+//
+//   certificadoId  : validación prevista: /^[A-Za-z0-9_-]{1,128}$/
+//                    No se limita a 20 caracteres (formato actual de los IDs
+//                    automáticos de Firestore) para mantener compatibilidad
+//                    con IDs existentes o futuros.
+// ============================================================
+
+/**
+ * Códigos de error de jose que indican un Firebase ID Token inválido
+ * y por lo tanto deben responderse como 401.
+ */
+const JOSE_UNAUTHORIZED_CODES = new Set([
+  "ERR_JWT_EXPIRED", // token vencido
+  "ERR_JWT_INVALID", // token malformado
+  "ERR_JWS_INVALID", // JWS inválido
+  "ERR_JWS_SIGNATURE_VERIFICATION_FAILED", // firma inválida
+  "ERR_JWT_CLAIM_VALIDATION_FAILED", // claims inválidos (iss / aud / exp)
+  "ERR_JWKS_NO_MATCHING_KEY", // firmado con una clave desconocida
+  "ERR_JOSE_ALG_NOT_ALLOWED", // algoritmo no permitido
+  "ERR_JOSE_NOT_SUPPORTED", // alg del header no soportado por el JWKS (ej. "none")
+]);
+
+/**
+ * Códigos HTTP que el módulo de certificados propaga tal cual cuando el
+ * error los declara explícitamente.
+ */
+const CERTIFICADOS_STATUS_CODES = new Set([400, 401, 403, 404, 409]);
+
+/**
+ * Traduce un error del módulo de certificados a una respuesta HTTP segura.
+ *
+ * - Respeta statusCode / status cuando vale 400, 401, 403, 404 o 409.
+ * - Mapea los errores de verificación JWT de jose a 401.
+ * - Cualquier otro error responde 500 con un mensaje genérico; el detalle
+ *   real queda únicamente en console.error, para no exponer service account,
+ *   variables de entorno, tokens, credenciales ni rutas internas.
+ */
+function sendCertificadosError(
+  res: express.Response,
+  error: any
+): express.Response {
+  const explicitStatus = Number(error?.statusCode ?? error?.status);
+
+  if (CERTIFICADOS_STATUS_CODES.has(explicitStatus)) {
+    return res.status(explicitStatus).json({
+      ok: false,
+      modulo: "certificados",
+      error: String(error?.message || "No se pudo completar la operación."),
+    });
+  }
+
+  if (JOSE_UNAUTHORIZED_CODES.has(String(error?.code || ""))) {
+    return res.status(401).json({
+      ok: false,
+      modulo: "certificados",
+      error: "Token de autenticación inválido o vencido.",
+    });
+  }
+
+  console.error("[sidca-chatbot-backend] Error certificados:", error);
+
+  return res.status(500).json({
+    ok: false,
+    modulo: "certificados",
+    error: "Error interno del servicio de certificados.",
+  });
+}
+
+app.get("/api/certificados/health", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(
+      req.headers.authorization
+    );
+
+    const usuario = await requireValidadorCertificados(authUser);
+
+    return res.status(200).json({
+      ok: true,
+      modulo: "certificados",
+      mensaje: "Servicio de certificados SIDCA operativo.",
+      autenticado: true,
+      autorizado: true,
+      usuario: {
+        uid: authUser.uid,
+        email: authUser.email || null,
+        nombre: buildNombreAfiliado(usuario),
+        dni: usuario.dni || null,
+      },
+    });
+  } catch (error: any) {
+    return sendCertificadosError(res, error);
+  }
+});
+
+// Endpoint de comprobación administrativa.
+// Autoriza exclusivamente por CERTIFICADOS_ADMIN_UIDS; no consulta Firestore
+// y no expone la lista de UIDs configurados.
+app.get("/api/certificados/admin/health", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+
+    await requireAdministrador(authUser);
+
+    return res.status(200).json({
+      ok: true,
+      modulo: "certificados",
+      administrador: true,
+      usuario: {
+        uid: authUser.uid,
+        email: authUser.email || null,
+      },
+    });
+  } catch (error: any) {
+    return sendCertificadosError(res, error);
+  }
 });
 
 app.post("/api/chatbot/query", chatbotRateLimit, async (req, res) => {
