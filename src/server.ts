@@ -1231,7 +1231,7 @@ app.use(
       callback(new Error("Origen no permitido por CORS."));
     },
     credentials: true,
-    methods: ["GET", "POST", "OPTIONS"],
+    methods: ["GET", "POST", "PUT", "OPTIONS"],
     allowedHeaders: [
       "Content-Type",
       "Authorization",
