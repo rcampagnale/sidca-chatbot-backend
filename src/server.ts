@@ -1707,6 +1707,69 @@ app.put("/api/certificados/admin/configuracion/:cursoId", async (req, res) => {
 });
 
 // ============================================================
+// LISTADO DE CONFIGURACIONES DE CERTIFICADO
+//
+// Fuente de la pestaña EMITIR. A diferencia de CONFIGURAR — que lista la
+// colección "cursos" para poder elegir cuál configurar — acá sólo interesan
+// los cursos que YA tienen configuración creada por este módulo.
+//
+// La colección "certificados" es anterior al módulo y contiene documentos
+// históricos con ID automático que no siguen este modelo. Se los distingue
+// por el campo cursoId, que sólo escribe el PUT de configuración: los
+// históricos no lo tienen. Se filtran en memoria porque Firestore no ofrece
+// un operador "existe campo"; la alternativa (cursoId != "") obligaría a
+// ordenar por ese campo y no aporta nada con este volumen.
+//
+// Los documentos históricos no se leen para modificarlos: se ignoran.
+// ============================================================
+
+const CONFIGURACIONES_MAX_RESULTADOS = 2000;
+
+app.get("/api/certificados/admin/configuraciones", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    await requireAdministrador(authUser);
+
+    const documentos = await queryFirestoreCollection(
+      "certificados",
+      [],
+      CONFIGURACIONES_MAX_RESULTADOS
+    );
+
+    const configuraciones = documentos
+      // Sólo el modelo nuevo: los históricos no tienen cursoId.
+      .filter((record) => Boolean(String(record.cursoId || "").trim()))
+      .map((record) => ({
+        certificadoId: record.id || record.cursoId,
+        cursoId: record.cursoId,
+        cursoTitulo: record.cursoTitulo || "",
+        titulo: record.titulo || "",
+        resolucion: record.resolucion || "",
+        modalidad: record.modalidad || "",
+        estadoConfiguracion: record.estadoConfiguracion || "borrador",
+        actualizadoEn: record.actualizadoEn || null,
+      }))
+      .sort((a, b) =>
+        String(a.cursoTitulo || a.titulo).localeCompare(
+          String(b.cursoTitulo || b.titulo),
+          "es",
+          { sensitivity: "base" }
+        )
+      );
+
+    return res.status(200).json({
+      ok: true,
+      modulo: "certificados",
+      total: configuraciones.length,
+      revisados: documentos.length,
+      configuraciones,
+    });
+  } catch (error: any) {
+    return sendCertificadosError(res, error);
+  }
+});
+
+// ============================================================
 // APROBADOS DE UN CURSO
 //
 // La aprobación NO vive en el módulo de certificados: la crea el importador
