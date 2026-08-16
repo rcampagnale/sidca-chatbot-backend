@@ -1384,6 +1384,243 @@ app.get("/api/certificados/admin/health", async (req, res) => {
   }
 });
 
+// ============================================================
+// CONFIGURACIÓN DE CERTIFICADO POR CURSO
+//
+// Documento: certificados/{cursoId}
+//
+// El ID del documento es el ID real de cursos/{cursoId}, de modo que la
+// configuración principal de un curso se resuelve con un lookup directo y
+// no puede duplicarse.
+//
+// Los documentos históricos de "certificados" tienen IDs automáticos y no
+// se tocan: estos endpoints sólo leen/escriben el documento cuyo ID es un
+// cursoId válido, y las escrituras usan updateMask, por lo que cualquier
+// campo ajeno al módulo (por ejemplo el histórico "imagen") permanece
+// intacto.
+// ============================================================
+
+/**
+ * Formato admitido para cursoId / certificadoId.
+ * No se limita a 20 caracteres para no atarse al formato de los IDs
+ * automáticos de Firestore.
+ */
+const CERTIFICADO_ID_REGEX = /^[A-Za-z0-9_-]{1,128}$/;
+
+/**
+ * Valida el parámetro de ruta antes de construir cualquier path de Firestore.
+ * Evita que un valor con barras o puntos escape de la colección esperada.
+ */
+function parseCursoIdParam(valor: unknown): string {
+  const cursoId = String(valor ?? "").trim();
+
+  if (!CERTIFICADO_ID_REGEX.test(cursoId)) {
+    throw Object.assign(new Error("El identificador del curso es inválido."), {
+      statusCode: 400,
+    });
+  }
+
+  return cursoId;
+}
+
+/**
+ * Firma que se imprime en el certificado.
+ *
+ * Las imágenes se alojan en Cloudinary (el proyecto migró desde Firebase
+ * Storage por límite de cuota), por eso se guarda imagenPublicId y no
+ * storagePath. Durante el borrador la imagen puede faltar todavía.
+ */
+const firmaCertificadoSchema = z.strictObject({
+  nombre: z.string().trim().min(1, "El nombre de la firma es obligatorio.").max(160),
+  cargo: z.string().trim().min(1, "El cargo de la firma es obligatorio.").max(200),
+  imagenUrl: z.string().trim().max(1000).optional().default(""),
+  imagenPublicId: z.string().trim().max(300).optional().default(""),
+  proveedor: z.string().trim().max(40).optional().default("cloudinary"),
+  orden: z.number().int().positive().max(50),
+});
+
+/**
+ * Cuerpo aceptado por PUT.
+ *
+ * Es estricto a propósito: el cliente no puede inyectar campos arbitrarios.
+ * cursoId, cursoTitulo, estadoConfiguracion y la auditoría NO se aceptan
+ * desde el body; los resuelve el backend.
+ */
+const configuracionCertificadoSchema = z.strictObject({
+  titulo: z.string().trim().min(1, "El título del certificado es obligatorio.").max(300),
+  resolucion: z.string().trim().min(1, "La resolución es obligatoria.").max(200),
+  cargaHoraria: z.string().trim().min(1, "La carga horaria es obligatoria.").max(100),
+  dias: z.string().trim().min(1, "Las fechas de realización son obligatorias.").max(300),
+  fecha: z.string().trim().min(1, "La fecha del certificado es obligatoria.").max(200),
+  modalidad: z.string().trim().min(1, "La modalidad es obligatoria.").max(120),
+  firmas: z.array(firmaCertificadoSchema).max(10).optional().default([]),
+});
+
+const ESTADOS_CONFIGURACION_CERTIFICADO = new Set(["borrador", "lista"]);
+
+/**
+ * Proyecta el documento de Firestore a la respuesta pública del módulo.
+ *
+ * Devuelve únicamente los campos que administra esta pantalla. No expone
+ * _name / path ni campos históricos como "imagen", cuyo significado no está
+ * definido en el código actual.
+ */
+function mapConfiguracionCertificado(
+  record: FirestoreRecord,
+  cursoId: string
+): Record<string, any> {
+  return {
+    cursoId: record.cursoId || cursoId,
+    cursoTitulo: record.cursoTitulo || "",
+    titulo: record.titulo || "",
+    resolucion: record.resolucion || "",
+    cargaHoraria: record.cargaHoraria || "",
+    dias: record.dias || "",
+    fecha: record.fecha || "",
+    modalidad: record.modalidad || "",
+    firmas: Array.isArray(record.firmas) ? record.firmas : [],
+    estadoConfiguracion: record.estadoConfiguracion || "borrador",
+    creadoEn: record.creadoEn || null,
+    actualizadoEn: record.actualizadoEn || null,
+    creadoPor: record.creadoPor || null,
+    actualizadoPor: record.actualizadoPor || null,
+  };
+}
+
+/**
+ * Ordena las firmas y reasigna orden 1..n.
+ * Así el orden guardado es siempre consistente aunque el cliente envíe
+ * valores repetidos o con huecos.
+ */
+function normalizarFirmasCertificado(
+  firmas: z.infer<typeof firmaCertificadoSchema>[]
+): Record<string, any>[] {
+  return [...firmas]
+    .sort((a, b) => a.orden - b.orden)
+    .map((firma, indice) => ({
+      nombre: firma.nombre,
+      cargo: firma.cargo,
+      imagenUrl: firma.imagenUrl || "",
+      imagenPublicId: firma.imagenPublicId || "",
+      proveedor: firma.proveedor || "cloudinary",
+      orden: indice + 1,
+    }));
+}
+
+app.get("/api/certificados/admin/configuracion/:cursoId", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    await requireAdministrador(authUser);
+
+    const cursoId = parseCursoIdParam(req.params.cursoId);
+    const record = await getFirestoreDoc(`certificados/${cursoId}`);
+
+    if (!record) {
+      throw Object.assign(
+        new Error("Todavía no hay una configuración de certificado para este curso."),
+        { statusCode: 404 }
+      );
+    }
+
+    return res.status(200).json({
+      ok: true,
+      modulo: "certificados",
+      configuracion: mapConfiguracionCertificado(record, cursoId),
+    });
+  } catch (error: any) {
+    return sendCertificadosError(res, error);
+  }
+});
+
+app.put("/api/certificados/admin/configuracion/:cursoId", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    await requireAdministrador(authUser);
+
+    const cursoId = parseCursoIdParam(req.params.cursoId);
+
+    // El curso debe existir: certificados/{cursoId} sólo tiene sentido si
+    // cursos/{cursoId} existe realmente.
+    const curso = await getFirestoreDoc(`cursos/${cursoId}`);
+
+    if (!curso) {
+      throw Object.assign(new Error("El curso indicado no existe."), {
+        statusCode: 404,
+      });
+    }
+
+    let datosValidados: z.infer<typeof configuracionCertificadoSchema>;
+
+    try {
+      datosValidados = configuracionCertificadoSchema.parse(req.body);
+    } catch (error: any) {
+      if (error instanceof z.ZodError) {
+        const detalle = error.issues[0];
+        throw Object.assign(
+          new Error(
+            detalle?.message
+              ? `${detalle.path.join(".") || "body"}: ${detalle.message}`
+              : "Los datos enviados no son válidos."
+          ),
+          { statusCode: 400 }
+        );
+      }
+      throw error;
+    }
+
+    const existente = await getFirestoreDoc(`certificados/${cursoId}`);
+    const ahora = new Date();
+
+    // El estado no se promueve automáticamente: si ya estaba en "lista" se
+    // respeta, y cualquier configuración nueva nace como "borrador".
+    const estadoPrevio = String(existente?.estadoConfiguracion || "");
+    const estadoConfiguracion = ESTADOS_CONFIGURACION_CERTIFICADO.has(estadoPrevio)
+      ? estadoPrevio
+      : "borrador";
+
+    const datos: Record<string, any> = {
+      cursoId,
+      // cursoTitulo proviene siempre del documento real de cursos, nunca del
+      // cliente. El campo "titulo" del certificado sí es libre y editable.
+      cursoTitulo: String(curso.titulo || ""),
+
+      titulo: datosValidados.titulo,
+      resolucion: datosValidados.resolucion,
+      cargaHoraria: datosValidados.cargaHoraria,
+      dias: datosValidados.dias,
+      fecha: datosValidados.fecha,
+      modalidad: datosValidados.modalidad,
+
+      firmas: normalizarFirmasCertificado(datosValidados.firmas || []),
+
+      estadoConfiguracion,
+
+      actualizadoEn: ahora,
+      actualizadoPor: authUser.uid,
+    };
+
+    // creadoEn / creadoPor se escriben una sola vez. Al no incluirlos en el
+    // updateMask cuando ya existen, quedan intactos y además se evita
+    // reescribir el timestamp como string al releerlo.
+    if (!existente?.creadoEn) datos.creadoEn = ahora;
+    if (!existente?.creadoPor) datos.creadoPor = authUser.uid;
+
+    // updateFirestoreDoc usa updateMask: los campos no listados (por ejemplo
+    // el histórico "imagen") no se borran ni se sobrescriben.
+    const guardado = await updateFirestoreDoc(`certificados/${cursoId}`, datos);
+
+    return res.status(200).json({
+      ok: true,
+      modulo: "certificados",
+      creado: !existente,
+      certificadoId: cursoId,
+      configuracion: mapConfiguracionCertificado(guardado, cursoId),
+    });
+  } catch (error: any) {
+    return sendCertificadosError(res, error);
+  }
+});
+
 app.post("/api/chatbot/query", chatbotRateLimit, async (req, res) => {
   try {
     const input = bodySchema.parse(req.body);
