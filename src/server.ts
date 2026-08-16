@@ -567,6 +567,91 @@ async function queryFirestoreCollection(
     .map((doc) => firestoreDocToJs(doc));
 }
 
+/**
+ * Consulta un COLLECTION GROUP: todas las subcolecciones que se llaman igual,
+ * sin importar bajo qué documento cuelguen.
+ *
+ * Es una función aparte de queryFirestoreCollection() a propósito: aquella
+ * consulta colecciones raíz y la usan Mercado Pago, el bootstrap y las
+ * búsquedas por DNI. Acá se agrega allDescendants: true, que cambia por
+ * completo el conjunto consultado, así que no se mezclan.
+ *
+ * Pagina internamente ordenando por __name__ y avanzando con un cursor
+ * startAt/before:false (equivalente a startAfter), porque runQuery no
+ * devuelve pageToken. Así un curso con cientos o miles de aprobaciones se
+ * resuelve completo y no queda truncado por el límite de una sola llamada.
+ *
+ * Nota sobre índices: se recomienda pasar un único filtro de igualdad. Una
+ * igualdad + orderBy __name__ la resuelve el índice de campo único que
+ * Firestore mantiene solo. Con dos o más igualdades haría falta un índice
+ * compuesto de ámbito COLLECTION_GROUP creado a mano.
+ */
+async function queryFirestoreCollectionGroup(
+  collectionId: string,
+  filters: Array<{ field: string; op?: string; value: any }>,
+  limit = 10_000,
+  pageSize = 300
+): Promise<FirestoreRecord[]> {
+  const where =
+    filters.length === 0
+      ? undefined
+      : filters.length === 1
+      ? makeFieldFilter(filters[0].field, filters[0].op || "EQUAL", filters[0].value)
+      : {
+          compositeFilter: {
+            op: "AND",
+            filters: filters.map((filter) =>
+              makeFieldFilter(filter.field, filter.op || "EQUAL", filter.value)
+            ),
+          },
+        };
+
+  const documentos: FirestoreRecord[] = [];
+  let cursor: string | null = null;
+
+  while (documentos.length < limit) {
+    const restantes = limit - documentos.length;
+    const tamanoPagina = Math.min(pageSize, restantes);
+
+    const structuredQuery: Record<string, any> = {
+      from: [{ collectionId, allDescendants: true }],
+      ...(where ? { where } : {}),
+      orderBy: [{ field: { fieldPath: "__name__" }, direction: "ASCENDING" }],
+      limit: tamanoPagina,
+    };
+
+    if (cursor) {
+      structuredQuery.startAt = {
+        values: [{ referenceValue: cursor }],
+        before: false,
+      };
+    }
+
+    const result = await firestoreRequest<Array<{ document?: FirestoreDocument }>>(
+      `${firestoreBaseUrl}:runQuery`,
+      {
+        method: "POST",
+        body: JSON.stringify({ structuredQuery }),
+      }
+    );
+
+    const pagina = (result || [])
+      .map((row) => row.document)
+      .filter((doc): doc is FirestoreDocument => Boolean(doc));
+
+    if (pagina.length === 0) break;
+
+    for (const doc of pagina) documentos.push(firestoreDocToJs(doc));
+
+    cursor = pagina[pagina.length - 1].name;
+
+    // Página incompleta ⇒ no quedan más resultados.
+    if (pagina.length < tamanoPagina) break;
+  }
+
+  return documentos;
+}
+
 async function verifyFirebaseIdToken(authorization?: string): Promise<AuthenticatedUser> {
   const token = authorization?.startsWith("Bearer ")
     ? authorization.slice("Bearer ".length).trim()
@@ -1615,6 +1700,234 @@ app.put("/api/certificados/admin/configuracion/:cursoId", async (req, res) => {
       creado: !existente,
       certificadoId: cursoId,
       configuracion: mapConfiguracionCertificado(guardado, cursoId),
+    });
+  } catch (error: any) {
+    return sendCertificadosError(res, error);
+  }
+});
+
+// ============================================================
+// APROBADOS DE UN CURSO
+//
+// La aprobación NO vive en el módulo de certificados: la crea el importador
+// de Excel existente (uploadUserCursosInfo) en
+//
+//   usuarios/{usuarioDocId}/cursos/{aprobacionId}
+//
+// con { aprobo: true, curso: "cursos/{cursoId}", ... }. El documento de
+// aprobación no guarda DNI: la identidad sale del documento padre.
+//
+// Por eso hay que consultar el collection group "cursos" (las subcolecciones
+// de usuarios), que es distinto de la colección raíz "cursos" (el catálogo de
+// capacitaciones). Ambos se llaman igual.
+//
+// El importador usa addDoc sin verificar existencia previa, así que un mismo
+// usuario puede tener varias aprobaciones del mismo curso. Se deduplica por
+// usuarioDocId, que es la identidad real.
+// ============================================================
+
+const APROBADOS_MAX_RESULTADOS = 10_000;
+const USUARIOS_LOTE_CONCURRENTE = 20;
+
+/**
+ * Extrae el ID del documento de usuario desde el name completo de una
+ * aprobación:
+ *
+ *   projects/.../documents/usuarios/{usuarioDocId}/cursos/{aprobacionId}
+ *
+ * Devuelve null si la ruta no tiene esa forma, para poder clasificar el
+ * registro como anómalo en vez de romper toda la respuesta.
+ */
+function extraerUsuarioDocIdDeAprobacion(name: unknown): string | null {
+  const ruta = String(name ?? "");
+  const marcador = "/documents/";
+  const indice = ruta.indexOf(marcador);
+
+  if (indice === -1) return null;
+
+  const segmentos = ruta.slice(indice + marcador.length).split("/");
+
+  if (segmentos.length !== 4) return null;
+  if (segmentos[0] !== "usuarios" || segmentos[2] !== "cursos") return null;
+  if (!segmentos[1]) return null;
+
+  return segmentos[1];
+}
+
+/** Enmascara un DNI para logs de diagnóstico. */
+function enmascararDni(dni: string): string {
+  if (dni.length <= 4) return "***";
+  return `${dni.slice(0, 2)}***${dni.slice(-2)}`;
+}
+
+/** Ejecuta tareas en lotes para no abrir cientos de conexiones a la vez. */
+async function resolverEnLotes<T, R>(
+  items: T[],
+  tamanoLote: number,
+  tarea: (item: T) => Promise<R>
+): Promise<R[]> {
+  const salida: R[] = [];
+
+  for (let i = 0; i < items.length; i += tamanoLote) {
+    const lote = items.slice(i, i + tamanoLote);
+    const resueltos = await Promise.all(lote.map((item) => tarea(item)));
+    salida.push(...resueltos);
+  }
+
+  return salida;
+}
+
+app.get("/api/certificados/admin/aprobados/:cursoId", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    await requireAdministrador(authUser);
+
+    const cursoId = parseCursoIdParam(req.params.cursoId);
+
+    const curso = await getFirestoreDoc(`cursos/${cursoId}`);
+
+    if (!curso) {
+      throw Object.assign(new Error("El curso indicado no existe."), {
+        statusCode: 404,
+      });
+    }
+
+    // Un solo filtro de igualdad: lo resuelve el índice de campo único que
+    // Firestore mantiene automáticamente. "aprobo" se evalúa en memoria para
+    // no exigir un índice compuesto de ámbito COLLECTION_GROUP y, de paso,
+    // poder contar los registros que no están aprobados.
+    const aprobaciones = await queryFirestoreCollectionGroup(
+      "cursos",
+      [{ field: "curso", value: `cursos/${cursoId}` }],
+      APROBADOS_MAX_RESULTADOS
+    );
+
+    const documentosAprobacion = aprobaciones.length;
+    const truncado = documentosAprobacion >= APROBADOS_MAX_RESULTADOS;
+
+    let rutasInesperadas = 0;
+    let noAprobados = 0;
+    let duplicados = 0;
+
+    // usuarioDocId -> cantidad de documentos de aprobación de ese usuario.
+    const porUsuario = new Map<string, number>();
+
+    for (const aprobacion of aprobaciones) {
+      const usuarioDocId = extraerUsuarioDocIdDeAprobacion(aprobacion._name);
+
+      if (!usuarioDocId) {
+        rutasInesperadas += 1;
+        continue;
+      }
+
+      if (aprobacion.aprobo !== true) {
+        noAprobados += 1;
+        continue;
+      }
+
+      const previos = porUsuario.get(usuarioDocId);
+
+      if (previos === undefined) {
+        porUsuario.set(usuarioDocId, 1);
+      } else {
+        porUsuario.set(usuarioDocId, previos + 1);
+        duplicados += 1;
+      }
+    }
+
+    const usuarioDocIds = [...porUsuario.keys()];
+
+    const resueltos = await resolverEnLotes(
+      usuarioDocIds,
+      USUARIOS_LOTE_CONCURRENTE,
+      async (usuarioDocId) => {
+        const usuario = await getFirestoreDoc(`usuarios/${usuarioDocId}`);
+        return { usuarioDocId, usuario };
+      }
+    );
+
+    let sinUsuario = 0;
+    let datosIncompletos = 0;
+
+    const participantes = resueltos.map(({ usuarioDocId, usuario }) => {
+      const aprobacionesDelUsuario = porUsuario.get(usuarioDocId) || 1;
+
+      if (!usuario) {
+        sinUsuario += 1;
+        return {
+          usuarioDocId,
+          dni: "",
+          apellidoNombre: "",
+          estado: "sin_usuario" as const,
+          aprobaciones: aprobacionesDelUsuario,
+        };
+      }
+
+      const dni = normalizeDni(usuario.dni);
+      const apellidoNombre = buildNombreAfiliado(usuario);
+
+      // buildNombreAfiliado nunca devuelve vacío: si no hay datos cae en su
+      // texto por defecto, así que se comprueban los campos de origen.
+      const tieneNombre = Boolean(
+        String(usuario.apellidoNombre || usuario.apellido_y_nombre || "").trim() ||
+          String(usuario.apellido || "").trim() ||
+          String(usuario.nombre || "").trim()
+      );
+
+      const completo = Boolean(dni) && tieneNombre;
+      if (!completo) datosIncompletos += 1;
+
+      // apellido / nombre sólo si existen de verdad en el documento: no se
+      // parte artificialmente un apellidoNombre.
+      const apellido = String(usuario.apellido || "").trim();
+      const nombre = String(usuario.nombre || "").trim();
+
+      return {
+        usuarioDocId,
+        dni,
+        apellidoNombre,
+        ...(apellido ? { apellido } : {}),
+        ...(nombre ? { nombre } : {}),
+        estado: completo ? ("aprobado" as const) : ("datos_incompletos" as const),
+        aprobaciones: aprobacionesDelUsuario,
+      };
+    });
+
+    participantes.sort((a, b) =>
+      a.apellidoNombre.localeCompare(b.apellidoNombre, "es", {
+        sensitivity: "base",
+      })
+    );
+
+    const identificados = participantes.filter(
+      (participante) => participante.estado === "aprobado"
+    ).length;
+
+    console.log(
+      `[sidca-chatbot-backend] aprobados curso=${cursoId} documentos=${documentosAprobacion} unicos=${participantes.length} duplicados=${duplicados}`
+    );
+
+    return res.status(200).json({
+      ok: true,
+      modulo: "certificados",
+      curso: {
+        id: cursoId,
+        titulo: curso.titulo || "",
+        estado: curso.estado || "",
+        categoria: curso.categoria || "",
+      },
+      resumen: {
+        documentosAprobacion,
+        aprobados: participantes.length,
+        identificados,
+        sinUsuario,
+        datosIncompletos,
+        duplicados,
+        noAprobados,
+        rutasInesperadas,
+        truncado,
+      },
+      participantes,
     });
   } catch (error: any) {
     return sendCertificadosError(res, error);
