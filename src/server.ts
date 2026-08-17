@@ -518,6 +518,25 @@ async function addFirestoreDoc(
   return firestoreDocToJs(doc);
 }
 
+/**
+ * Elimina UN documento de Firestore.
+ *
+ * Firestore REST borra únicamente el documento indicado: sus subcolecciones,
+ * si las hubiera, quedan huérfanas pero intactas, y ningún otro documento se
+ * ve afectado. No hay borrado en cascada.
+ *
+ * Devuelve true si la operación se ejecutó y false si el documento no existía
+ * (firestoreRequest traduce el 404 a null).
+ */
+async function deleteFirestoreDoc(path: string): Promise<boolean> {
+  const resultado = await firestoreRequest<Record<string, never>>(
+    `${firestoreBaseUrl}/${path}`,
+    { method: "DELETE" }
+  );
+
+  return resultado !== null;
+}
+
 function makeFieldFilter(field: string, op: string, value: any) {
   return {
     fieldFilter: {
@@ -1316,7 +1335,7 @@ app.use(
       callback(new Error("Origen no permitido por CORS."));
     },
     credentials: true,
-    methods: ["GET", "POST", "PUT", "OPTIONS"],
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: [
       "Content-Type",
       "Authorization",
@@ -1700,6 +1719,59 @@ app.put("/api/certificados/admin/configuracion/:cursoId", async (req, res) => {
       creado: !existente,
       certificadoId: cursoId,
       configuracion: mapConfiguracionCertificado(guardado, cursoId),
+    });
+  } catch (error: any) {
+    return sendCertificadosError(res, error);
+  }
+});
+
+/**
+ * Elimina la configuración de certificado de un curso.
+ *
+ * Borra EXCLUSIVAMENTE el documento certificados/{cursoId}. No toca —ni
+ * podría, porque es un borrado de documento único sin cascada—:
+ *
+ *   cursos/{cursoId}                     el curso académico sigue existiendo
+ *   usuarios/{usuarioDocId}              los usuarios siguen existiendo
+ *   usuarios/{usuarioDocId}/cursos/*     las aprobaciones siguen existiendo
+ *   nuevoAfiliado                        intacta
+ *
+ * Efecto: el curso desaparece de Emitir (que lista sólo documentos de
+ * certificados) y vuelve a aparecer en Configurar como curso sin configurar,
+ * porque Configurar se alimenta de la colección cursos.
+ *
+ * Nota para más adelante: cuando exista la subcolección emitidos, borrar la
+ * configuración dejaría certificados emitidos huérfanos. En esa etapa habrá
+ * que bloquear el borrado si hay emisiones.
+ */
+app.delete("/api/certificados/admin/configuracion/:cursoId", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    await requireAdministrador(authUser);
+
+    const cursoId = parseCursoIdParam(req.params.cursoId);
+
+    const existente = await getFirestoreDoc(`certificados/${cursoId}`);
+
+    if (!existente) {
+      throw Object.assign(
+        new Error("Este curso no tiene configuración de certificado."),
+        { statusCode: 404 }
+      );
+    }
+
+    await deleteFirestoreDoc(`certificados/${cursoId}`);
+
+    console.log(
+      `[sidca-chatbot-backend] configuracion de certificado eliminada curso=${cursoId} por=${authUser.uid}`
+    );
+
+    return res.status(200).json({
+      ok: true,
+      modulo: "certificados",
+      eliminado: true,
+      certificadoId: cursoId,
+      cursoId,
     });
   } catch (error: any) {
     return sendCertificadosError(res, error);
