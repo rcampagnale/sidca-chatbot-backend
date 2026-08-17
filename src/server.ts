@@ -852,6 +852,35 @@ async function requireAdministrador(
   return authUser;
 }
 
+/** Permiso resuelto para operar sobre la validación de certificados. */
+type PermisoCertificados =
+  | { tipo: "administrador"; usuario: null }
+  | { tipo: "validador"; usuario: FirestoreRecord };
+
+/**
+ * Exige ser administrador del módulo O validador designado.
+ *
+ * Es el permiso de la VALIDACIÓN de certificados, más amplio que el
+ * administrativo: un validador designado puede verificar un certificado
+ * escaneado sin poder configurar ni emitir.
+ *
+ * Comprueba la allowlist administrativa de forma directa en vez de llamar a
+ * requireAdministrador() y atrapar su 403: capturar excepciones como control
+ * de flujo confundiría un error de infraestructura con una falta de permiso.
+ */
+async function requireAdministradorOValidadorCertificados(
+  authUser: AuthenticatedUser
+): Promise<PermisoCertificados> {
+  if (certificadosAdminUids.has(authUser.uid)) {
+    return { tipo: "administrador", usuario: null };
+  }
+
+  // Lanza 403 con su propio mensaje si no está designado.
+  const usuario = await requireValidadorCertificados(authUser);
+
+  return { tipo: "validador", usuario };
+}
+
 async function findDocsByDni(collectionId: "usuarios" | "nuevoAfiliado", dni: string) {
   const numericDni = Number(dni);
   const byString = await queryFirestoreCollection(collectionId, [
@@ -1580,6 +1609,33 @@ function parseCursoIdParam(valor: unknown): string {
   }
 
   return cursoId;
+}
+
+/**
+ * Formato del token de validación que viaja en el QR.
+ *
+ * Es exactamente lo que produce crypto.randomBytes(24).toString("hex"):
+ * 48 caracteres hexadecimales en minúscula. Deliberadamente más estricta que
+ * CERTIFICADO_ID_REGEX — un token no es un ID de documento cualquiera, y
+ * cerrar el formato reduce la superficie de lo que puede llegar a Firestore.
+ */
+const CERTIFICADO_TOKEN_REGEX = /^[a-f0-9]{48}$/;
+
+/**
+ * Valida el token del certificado antes de usarlo en un path de Firestore.
+ * Rechaza barras, espacios, mayúsculas y cualquier longitud distinta de 48.
+ */
+function parseCertificadoTokenParam(valor: unknown): string {
+  const token = String(valor ?? "").trim();
+
+  if (!CERTIFICADO_TOKEN_REGEX.test(token)) {
+    throw Object.assign(
+      new Error("El código de validación del certificado es inválido."),
+      { statusCode: 400 }
+    );
+  }
+
+  return token;
 }
 
 /**
@@ -2735,6 +2791,88 @@ app.post("/api/certificados/admin/emision/:cursoId/emitir", async (req, res) => 
         certificado: certificadoSnapshot,
         urlValidacion,
         emitidoEn: ahora.toISOString(),
+      },
+    });
+  } catch (error: any) {
+    return sendCertificadosError(res, error);
+  }
+});
+
+// ============================================================
+// VALIDACIÓN DE UN CERTIFICADO ESCANEADO
+//
+// Es el endpoint al que llega la página que abre el QR.
+//
+// NO va bajo /admin porque también lo usan los validadores designados, que no
+// son administradores. Pero NO es público: el token del QR es difícil de
+// adivinar, y eso no reemplaza autenticación. Sin Firebase ID Token no
+// devuelve nada.
+//
+// Sólo LECTURA: no registra el escaneo ni toca el documento. La auditoría de
+// verificaciones, si se decide llevarla, será otra etapa.
+// ============================================================
+
+const EMITIDOS_ESTADOS_CONOCIDOS = new Set([
+  "vigente",
+  "anulado",
+  "reemplazado",
+]);
+
+app.get("/api/certificados/validar/:cursoId/:token", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    const permiso = await requireAdministradorOValidadorCertificados(authUser);
+
+    const cursoId = parseCursoIdParam(req.params.cursoId);
+    const token = parseCertificadoTokenParam(req.params.token);
+
+    // El token ES el ID del documento: lectura directa, sin query.
+    const emision = await getFirestoreDoc(
+      `certificados/${cursoId}/emitidos/${token}`
+    );
+
+    const noEncontrado = () =>
+      Object.assign(
+        new Error("Certificado no encontrado o código de validación inválido."),
+        { statusCode: 404 }
+      );
+
+    if (!emision) throw noEncontrado();
+
+    // Comprobación defensiva: el path ya identifica el documento, pero si su
+    // contenido no coincide con la ruta, algo está mal y no se afirma nada.
+    // No se intenta reparar el documento.
+    if (String(emision.cursoId || "") !== cursoId) throw noEncontrado();
+    if (emision.token && String(emision.token) !== token) throw noEncontrado();
+
+    const estado = String(emision.estado || "");
+    const valido = estado === EMITIDOS_ESTADO_VIGENTE;
+
+    // Un certificado anulado o reemplazado EXISTE: responde 200 con
+    // valido:false, no 404. La diferencia importa — el validador tiene que
+    // poder distinguir "este QR es falso" de "este certificado es real pero
+    // ya no está vigente".
+    if (!EMITIDOS_ESTADOS_CONOCIDOS.has(estado)) {
+      console.warn(
+        `[sidca-chatbot-backend] estado de certificado desconocido curso=${cursoId} estado=${estado || "(vacio)"}`
+      );
+    }
+
+    console.log(
+      `[sidca-chatbot-backend] certificado validado curso=${cursoId} estado=${estado} por=${permiso.tipo}`
+    );
+
+    return res.status(200).json({
+      ok: true,
+      modulo: "certificados",
+      validacion: {
+        valido,
+        estado,
+        certificadoId: emision.certificadoId || token,
+        cursoId,
+        participante: emision.participante || null,
+        certificado: emision.certificado || null,
+        emitidoEn: emision.emitidoEn || null,
       },
     });
   } catch (error: any) {
