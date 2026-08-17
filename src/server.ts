@@ -2395,6 +2395,26 @@ const emitirCertificadoSchema = z.strictObject({
     .regex(CERTIFICADO_ID_REGEX, "El identificador del participante es inválido."),
 });
 
+/**
+ * Valida usuarioDocId cuando llega como parámetro de RUTA.
+ *
+ * Mismo criterio que el schema del body, pero acá el valor se concatena en un
+ * path de Firestore, así que la validación no es opcional: un valor con barras
+ * o puntos podría escapar de la colección esperada.
+ */
+function parseUsuarioDocIdParam(valor: unknown): string {
+  const usuarioDocId = String(valor ?? "").trim();
+
+  if (!CERTIFICADO_ID_REGEX.test(usuarioDocId)) {
+    throw Object.assign(
+      new Error("El identificador del participante es inválido."),
+      { statusCode: 400 }
+    );
+  }
+
+  return usuarioDocId;
+}
+
 const EMITIDOS_ESTADO_VIGENTE = "vigente";
 const TOKEN_BYTES = 24;
 const TOKEN_MAX_INTENTOS = 3;
@@ -2430,6 +2450,97 @@ async function generarTokenCertificado(cursoId: string): Promise<string> {
     { statusCode: 500 }
   );
 }
+
+/**
+ * Proyecta una emisión guardada a la respuesta pública del módulo.
+ *
+ * Devuelve el SNAPSHOT tal como quedó guardado: no recalcula participante,
+ * certificado ni urlValidacion. Si el nombre del usuario o la resolución del
+ * curso cambiaron después de emitir, el certificado sigue diciendo lo que
+ * decía — que es exactamente el sentido de guardar una foto.
+ *
+ * emitidoPor queda fuera: es dato de auditoría interna y el frontend no lo
+ * necesita.
+ */
+function mapEmisionCertificado(emision: FirestoreRecord): Record<string, any> {
+  return {
+    certificadoId: emision.certificadoId || emision.id,
+    token: emision.token || emision.id,
+    cursoId: emision.cursoId || "",
+    usuarioDocId: emision.usuarioDocId || "",
+    estado: emision.estado || "",
+    participante: emision.participante || null,
+    certificado: emision.certificado || null,
+    urlValidacion: emision.urlValidacion || "",
+    emitidoEn: emision.emitidoEn || null,
+  };
+}
+
+/**
+ * Devuelve el certificado VIGENTE ya emitido para un participante y curso.
+ *
+ * Sólo LECTURA. Existe para que la pantalla de emisión pueda reconocer, al
+ * abrir el preview, que ese participante ya tiene certificado — y mostrar su
+ * QR — sin depender del estado en memoria, que se pierde al recargar.
+ *
+ * 404 cuando no hay emisión vigente: no es un error, es la respuesta normal
+ * para alguien que todavía no fue emitido.
+ */
+app.get(
+  "/api/certificados/admin/emision/:cursoId/usuario/:usuarioDocId",
+  async (req, res) => {
+    try {
+      const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+      await requireAdministrador(authUser);
+
+      const cursoId = parseCursoIdParam(req.params.cursoId);
+      const usuarioDocId = parseUsuarioDocIdParam(req.params.usuarioDocId);
+
+      // Sólo la subcolección de ESTE curso: no mezcla emitidos de otros.
+      const emitidos = await queryFirestoreChildCollection(
+        `certificados/${cursoId}`,
+        "emitidos",
+        [{ field: "usuarioDocId", value: usuarioDocId }],
+        20
+      );
+
+      const vigentes = emitidos.filter(
+        (emitido) => emitido.estado === EMITIDOS_ESTADO_VIGENTE
+      );
+
+      if (vigentes.length === 0) {
+        throw Object.assign(
+          new Error(
+            "Este participante todavía no tiene un certificado vigente emitido para este curso."
+          ),
+          { statusCode: 404 }
+        );
+      }
+
+      // No debería haber más de uno: el POST de emisión lo impide. Si aparece,
+      // se avisa en el log sin elegir en silencio y se devuelve el más
+      // reciente por emitidoEn, que Firestore guarda como timestamp ISO y por
+      // lo tanto ordena bien de forma lexicográfica.
+      if (vigentes.length > 1) {
+        console.warn(
+          `[sidca-chatbot-backend] multiples certificados vigentes curso=${cursoId} usuario=${usuarioDocId} cantidad=${vigentes.length}`
+        );
+      }
+
+      const emision = [...vigentes].sort((a, b) =>
+        String(b.emitidoEn || "").localeCompare(String(a.emitidoEn || ""))
+      )[0];
+
+      return res.status(200).json({
+        ok: true,
+        modulo: "certificados",
+        emision: mapEmisionCertificado(emision),
+      });
+    } catch (error: any) {
+      return sendCertificadosError(res, error);
+    }
+  }
+);
 
 app.post("/api/certificados/admin/emision/:cursoId/emitir", async (req, res) => {
   try {
