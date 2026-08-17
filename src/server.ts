@@ -1739,6 +1739,9 @@ app.get("/api/certificados/admin/configuraciones", async (req, res) => {
     const configuraciones = documentos
       // Sólo el modelo nuevo: los históricos no tienen cursoId.
       .filter((record) => Boolean(String(record.cursoId || "").trim()))
+      // Cursos apartados de la emisión. El documento sigue existiendo con
+      // toda su configuración: sólo deja de ofrecerse para emitir.
+      .filter((record) => record.ocultarEnEmitir !== true)
       .map((record) => ({
         certificadoId: record.id || record.cursoId,
         cursoId: record.cursoId,
@@ -1855,6 +1858,17 @@ app.get("/api/certificados/admin/aprobados/:cursoId", async (req, res) => {
       });
     }
 
+    // Exclusiones administrativas de la emisión. Viven en el documento del
+    // certificado: la aprobación original en usuarios/{id}/cursos NUNCA se
+    // toca, sólo se omite de esta respuesta.
+    const certificado = await getFirestoreDoc(`certificados/${cursoId}`);
+    const usuariosExcluidos = new Set(
+      (Array.isArray(certificado?.usuariosExcluidos)
+        ? certificado.usuariosExcluidos
+        : []
+      ).map((valor: any) => String(valor || "").trim())
+    );
+
     // Un solo filtro de igualdad: lo resuelve el índice de campo único que
     // Firestore mantiene automáticamente. "aprobo" se evalúa en memoria para
     // no exigir un índice compuesto de ámbito COLLECTION_GROUP y, de paso,
@@ -1871,9 +1885,11 @@ app.get("/api/certificados/admin/aprobados/:cursoId", async (req, res) => {
     let rutasInesperadas = 0;
     let noAprobados = 0;
     let duplicados = 0;
+    let excluidos = 0;
 
     // usuarioDocId -> cantidad de documentos de aprobación de ese usuario.
     const porUsuario = new Map<string, number>();
+    const excluidosVistos = new Set<string>();
 
     for (const aprobacion of aprobaciones) {
       const usuarioDocId = extraerUsuarioDocIdDeAprobacion(aprobacion._name);
@@ -1885,6 +1901,17 @@ app.get("/api/certificados/admin/aprobados/:cursoId", async (req, res) => {
 
       if (aprobacion.aprobo !== true) {
         noAprobados += 1;
+        continue;
+      }
+
+      // Apartado de la emisión por decisión administrativa: no entra al mapa
+      // de participantes. Se cuenta una sola vez por usuario, aunque tenga
+      // aprobaciones duplicadas.
+      if (usuariosExcluidos.has(usuarioDocId)) {
+        if (!excluidosVistos.has(usuarioDocId)) {
+          excluidosVistos.add(usuarioDocId);
+          excluidos += 1;
+        }
         continue;
       }
 
@@ -1981,21 +2008,220 @@ app.get("/api/certificados/admin/aprobados/:cursoId", async (req, res) => {
       },
       resumen: {
         documentosAprobacion,
-        aprobados: participantes.length,
+        // Total de personas aprobadas del curso, INCLUYENDO las apartadas de
+        // la emisión. Es el dato académico y no baja al excluir a alguien:
+        // excluir no borra ninguna aprobación.
+        //   aprobados = identificados + datosIncompletos + sinUsuario + excluidos
+        aprobados: participantes.length + excluidos,
+        // Personas que siguen disponibles para emitir.
+        disponibles: participantes.length,
         identificados,
         sinUsuario,
         datosIncompletos,
         duplicados,
         noAprobados,
         rutasInesperadas,
+        excluidos,
         truncado,
       },
+      ocultarEnEmitir: certificado?.ocultarEnEmitir === true,
       participantes,
     });
   } catch (error: any) {
     return sendCertificadosError(res, error);
   }
 });
+
+// ============================================================
+// EXCLUSIONES ADMINISTRATIVAS DE LA EMISIÓN
+//
+// "Quitar de la emisión" NO borra nada del sistema académico. La aprobación
+// original vive en usuarios/{usuarioDocId}/cursos y queda intacta; el curso
+// y su configuración también. Lo único que ocurre es que este módulo deja de
+// ofrecerlos para emitir certificados.
+//
+// Por eso la ÚNICA escritura de estos endpoints es sobre
+// certificados/{cursoId}, y sólo sobre dos campos:
+//
+//   usuariosExcluidos : string[]  - participantes apartados
+//   ocultarEnEmitir   : boolean   - curso apartado
+//
+// Se usa updateFirestoreDoc, que envía updateMask, así que ningún otro campo
+// del documento se toca. Todo es reversible.
+// ============================================================
+
+const excluirUsuarioSchema = z.strictObject({
+  usuarioDocId: z
+    .string()
+    .trim()
+    .regex(CERTIFICADO_ID_REGEX, "El identificador del participante es inválido."),
+});
+
+/**
+ * Lee el documento de certificado exigiendo que exista.
+ * Sin configuración previa no hay dónde registrar la exclusión.
+ */
+async function obtenerCertificadoParaEmision(
+  cursoId: string
+): Promise<FirestoreRecord> {
+  const certificado = await getFirestoreDoc(`certificados/${cursoId}`);
+
+  if (!certificado) {
+    throw Object.assign(
+      new Error("Todavía no hay una configuración de certificado para este curso."),
+      { statusCode: 404 }
+    );
+  }
+
+  return certificado;
+}
+
+/** Lista de excluidos normalizada y sin duplicados. */
+function leerUsuariosExcluidos(certificado: FirestoreRecord): string[] {
+  const valores = Array.isArray(certificado.usuariosExcluidos)
+    ? certificado.usuariosExcluidos
+    : [];
+
+  return [
+    ...new Set(
+      valores.map((valor: any) => String(valor || "").trim()).filter(Boolean)
+    ),
+  ];
+}
+
+app.put(
+  "/api/certificados/admin/emision/:cursoId/excluir-usuario",
+  async (req, res) => {
+    try {
+      const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+      await requireAdministrador(authUser);
+
+      const cursoId = parseCursoIdParam(req.params.cursoId);
+      const { usuarioDocId } = excluirUsuarioSchema.parse(req.body);
+
+      const certificado = await obtenerCertificadoParaEmision(cursoId);
+      const actuales = leerUsuariosExcluidos(certificado);
+
+      const yaEstaba = actuales.includes(usuarioDocId);
+      const usuariosExcluidos = yaEstaba
+        ? actuales
+        : [...actuales, usuarioDocId];
+
+      if (!yaEstaba) {
+        await updateFirestoreDoc(`certificados/${cursoId}`, {
+          usuariosExcluidos,
+          actualizadoEn: new Date().toISOString(),
+          actualizadoPor: authUser.uid,
+        });
+      }
+
+      return res.status(200).json({
+        ok: true,
+        modulo: "certificados",
+        cursoId,
+        usuarioDocId,
+        yaEstaba,
+        usuariosExcluidos,
+      });
+    } catch (error: any) {
+      if (error instanceof z.ZodError) {
+        return sendCertificadosError(
+          res,
+          Object.assign(
+            new Error(error.issues.map((issue) => issue.message).join(" | ")),
+            { statusCode: 400 }
+          )
+        );
+      }
+      return sendCertificadosError(res, error);
+    }
+  }
+);
+
+app.put(
+  "/api/certificados/admin/emision/:cursoId/reincluir-usuario",
+  async (req, res) => {
+    try {
+      const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+      await requireAdministrador(authUser);
+
+      const cursoId = parseCursoIdParam(req.params.cursoId);
+      const { usuarioDocId } = excluirUsuarioSchema.parse(req.body);
+
+      const certificado = await obtenerCertificadoParaEmision(cursoId);
+      const actuales = leerUsuariosExcluidos(certificado);
+
+      const estaba = actuales.includes(usuarioDocId);
+      const usuariosExcluidos = actuales.filter((id) => id !== usuarioDocId);
+
+      if (estaba) {
+        await updateFirestoreDoc(`certificados/${cursoId}`, {
+          usuariosExcluidos,
+          actualizadoEn: new Date().toISOString(),
+          actualizadoPor: authUser.uid,
+        });
+      }
+
+      return res.status(200).json({
+        ok: true,
+        modulo: "certificados",
+        cursoId,
+        usuarioDocId,
+        estaba,
+        usuariosExcluidos,
+      });
+    } catch (error: any) {
+      if (error instanceof z.ZodError) {
+        return sendCertificadosError(
+          res,
+          Object.assign(
+            new Error(error.issues.map((issue) => issue.message).join(" | ")),
+            { statusCode: 400 }
+          )
+        );
+      }
+      return sendCertificadosError(res, error);
+    }
+  }
+);
+
+/** Aparta o reincorpora el curso completo. No borra nada. */
+async function cambiarVisibilidadEmision(
+  req: express.Request,
+  res: express.Response,
+  ocultar: boolean
+) {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    await requireAdministrador(authUser);
+
+    const cursoId = parseCursoIdParam(req.params.cursoId);
+    await obtenerCertificadoParaEmision(cursoId);
+
+    await updateFirestoreDoc(`certificados/${cursoId}`, {
+      ocultarEnEmitir: ocultar,
+      actualizadoEn: new Date().toISOString(),
+      actualizadoPor: authUser.uid,
+    });
+
+    return res.status(200).json({
+      ok: true,
+      modulo: "certificados",
+      cursoId,
+      ocultarEnEmitir: ocultar,
+    });
+  } catch (error: any) {
+    return sendCertificadosError(res, error);
+  }
+}
+
+app.put("/api/certificados/admin/emision/:cursoId/ocultar", (req, res) =>
+  cambiarVisibilidadEmision(req, res, true)
+);
+
+app.put("/api/certificados/admin/emision/:cursoId/mostrar", (req, res) =>
+  cambiarVisibilidadEmision(req, res, false)
+);
 
 app.post("/api/chatbot/query", chatbotRateLimit, async (req, res) => {
   try {
