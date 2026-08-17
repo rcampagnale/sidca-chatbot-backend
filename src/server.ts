@@ -671,6 +671,61 @@ async function queryFirestoreCollectionGroup(
   return documentos;
 }
 
+/**
+ * Consulta una subcolección concreta, colgada de UN documento padre.
+ *
+ * Distinta de las otras dos:
+ *   queryFirestoreCollection      → colección raíz
+ *   queryFirestoreCollectionGroup → todas las subcolecciones con ese nombre
+ *   esta                          → sólo la de ESE padre
+ *
+ * Firestore REST lo resuelve poniendo el padre en la URL del runQuery, sin
+ * allDescendants: así la consulta queda acotada al documento indicado y no
+ * necesita índices compuestos.
+ *
+ * Se usa para leer certificados/{cursoId}/emitidos sin mezclar los emitidos
+ * de otros cursos.
+ */
+async function queryFirestoreChildCollection(
+  parentPath: string,
+  collectionId: string,
+  filters: Array<{ field: string; op?: string; value: any }>,
+  limit = 20
+): Promise<FirestoreRecord[]> {
+  const where =
+    filters.length === 0
+      ? undefined
+      : filters.length === 1
+      ? makeFieldFilter(filters[0].field, filters[0].op || "EQUAL", filters[0].value)
+      : {
+          compositeFilter: {
+            op: "AND",
+            filters: filters.map((filter) =>
+              makeFieldFilter(filter.field, filter.op || "EQUAL", filter.value)
+            ),
+          },
+        };
+
+  const result = await firestoreRequest<Array<{ document?: FirestoreDocument }>>(
+    `${firestoreBaseUrl}/${parentPath}:runQuery`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        structuredQuery: {
+          from: [{ collectionId }],
+          ...(where ? { where } : {}),
+          limit,
+        },
+      }),
+    }
+  );
+
+  return (result || [])
+    .map((row) => row.document)
+    .filter((doc): doc is FirestoreDocument => Boolean(doc))
+    .map((doc) => firestoreDocToJs(doc));
+}
+
 async function verifyFirebaseIdToken(authorization?: string): Promise<AuthenticatedUser> {
   const token = authorization?.startsWith("Bearer ")
     ? authorization.slice("Bearer ".length).trim()
@@ -1760,6 +1815,27 @@ app.delete("/api/certificados/admin/configuracion/:cursoId", async (req, res) =>
       );
     }
 
+    // Firestore NO borra subcolecciones en cascada: si se elimina la
+    // configuración con emisiones vivas, certificados/{cursoId}/emitidos/*
+    // quedaría huérfano — documentos inalcanzables desde el módulo, con sus
+    // tokens de validación todavía activos. Se bloquea sin importar el
+    // estado: un anulado o reemplazado también es historial que no se tira.
+    const emitidos = await queryFirestoreChildCollection(
+      `certificados/${cursoId}`,
+      "emitidos",
+      [],
+      1
+    );
+
+    if (emitidos.length > 0) {
+      throw Object.assign(
+        new Error(
+          "No se puede eliminar la configuración porque ya existen certificados emitidos para este curso."
+        ),
+        { statusCode: 409 }
+      );
+    }
+
     await deleteFirestoreDoc(`certificados/${cursoId}`);
 
     console.log(
@@ -2294,6 +2370,266 @@ app.put("/api/certificados/admin/emision/:cursoId/ocultar", (req, res) =>
 app.put("/api/certificados/admin/emision/:cursoId/mostrar", (req, res) =>
   cambiarVisibilidadEmision(req, res, false)
 );
+
+// ============================================================
+// EMISIÓN REAL DE UN CERTIFICADO
+//
+// Crea certificados/{cursoId}/emitidos/{token}.
+//
+// El cliente sólo aporta usuarioDocId: a quién emitir. TODO lo demás se
+// vuelve a verificar y a leer del servidor — que aprobó, que no está
+// excluido, que el usuario existe, qué nombre y qué DNI tiene, qué dice la
+// configuración. Nada del body llega al documento guardado.
+//
+// El documento es un SNAPSHOT: congela participante y configuración tal como
+// estaban al emitir. Si mañana cambia el nombre del usuario o la resolución
+// del curso, el certificado ya emitido sigue diciendo lo que decía. Por eso
+// no guarda referencias, guarda copias.
+// ============================================================
+
+/** Cuerpo del POST de emisión. Reutiliza la regex de IDs del módulo. */
+const emitirCertificadoSchema = z.strictObject({
+  usuarioDocId: z
+    .string()
+    .trim()
+    .regex(CERTIFICADO_ID_REGEX, "El identificador del participante es inválido."),
+});
+
+const EMITIDOS_ESTADO_VIGENTE = "vigente";
+const TOKEN_BYTES = 24;
+const TOKEN_MAX_INTENTOS = 3;
+
+/** Base pública de la URL de validación que llevará el QR. */
+const CERTIFICADOS_VALIDACION_BASE_URL = (
+  process.env.CERTIFICADOS_VALIDACION_BASE_URL ||
+  "https://sidcagremio.com/validar-certificado"
+).replace(/\/+$/, "");
+
+/**
+ * Genera un token único para el certificado.
+ *
+ * crypto.randomBytes: 24 bytes → 48 caracteres hexadecimales en minúscula.
+ * No se deriva de DNI, UID, cursoId ni de la hora: es imposible adivinarlo o
+ * enumerarlo a partir de datos conocidos.
+ *
+ * La colisión es prácticamente imposible (2^192), pero se comprueba igual:
+ * un choque silencioso sobrescribiría un certificado ajeno.
+ */
+async function generarTokenCertificado(cursoId: string): Promise<string> {
+  for (let intento = 0; intento < TOKEN_MAX_INTENTOS; intento += 1) {
+    const token = crypto.randomBytes(TOKEN_BYTES).toString("hex");
+    const existente = await getFirestoreDoc(
+      `certificados/${cursoId}/emitidos/${token}`
+    );
+
+    if (!existente) return token;
+  }
+
+  throw Object.assign(
+    new Error("No se pudo generar un identificador único para el certificado."),
+    { statusCode: 500 }
+  );
+}
+
+app.post("/api/certificados/admin/emision/:cursoId/emitir", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    await requireAdministrador(authUser);
+
+    const cursoId = parseCursoIdParam(req.params.cursoId);
+
+    let usuarioDocId: string;
+    try {
+      ({ usuarioDocId } = emitirCertificadoSchema.parse(req.body));
+    } catch (error: any) {
+      throw Object.assign(
+        new Error(
+          error?.issues?.map((issue: any) => issue.message).join(" | ") ||
+            "El cuerpo del pedido es inválido."
+        ),
+        { statusCode: 400 }
+      );
+    }
+
+    // 1. Configuración del certificado.
+    const certificado = await obtenerCertificadoParaEmision(cursoId);
+
+    // 2. El curso académico debe existir de verdad, no alcanza con el
+    //    cursoTitulo copiado en la configuración.
+    const curso = await getFirestoreDoc(`cursos/${cursoId}`);
+
+    if (!curso) {
+      throw Object.assign(new Error("El curso indicado no existe."), {
+        statusCode: 404,
+      });
+    }
+
+    // 3. Curso apartado de la emisión. Se comprueba acá también para que no
+    //    baste con llamar al endpoint directamente salteando la UI.
+    if (certificado.ocultarEnEmitir === true) {
+      throw Object.assign(
+        new Error("Este curso se encuentra apartado de la emisión de certificados."),
+        { statusCode: 409 }
+      );
+    }
+
+    // 4. Participante excluido por decisión administrativa.
+    if (leerUsuariosExcluidos(certificado).includes(usuarioDocId)) {
+      throw Object.assign(
+        new Error("Este participante fue excluido de la emisión de certificados."),
+        { statusCode: 409 }
+      );
+    }
+
+    // 5. Aprobación real. No se confía en que la UI lo haya mostrado: se
+    //    releen las aprobaciones del curso y se busca la de este usuario.
+    //    Con una válida alcanza; los duplicados del importador no emiten de
+    //    más porque acá sólo se comprueba existencia.
+    const aprobaciones = await queryFirestoreCollectionGroup(
+      "cursos",
+      [{ field: "curso", value: `cursos/${cursoId}` }],
+      APROBADOS_MAX_RESULTADOS
+    );
+
+    const tieneAprobacion = aprobaciones.some(
+      (aprobacion) =>
+        aprobacion.aprobo === true &&
+        extraerUsuarioDocIdDeAprobacion(aprobacion._name) === usuarioDocId
+    );
+
+    if (!tieneAprobacion) {
+      throw Object.assign(
+        new Error("El participante no registra una aprobación válida para este curso."),
+        { statusCode: 409 }
+      );
+    }
+
+    // 6. Documento académico del participante. Es el padre de la aprobación:
+    //    no se busca un reemplazo por DNI, porque sería otra persona.
+    const usuario = await getFirestoreDoc(`usuarios/${usuarioDocId}`);
+
+    if (!usuario) {
+      throw Object.assign(
+        new Error(
+          "No se puede emitir el certificado porque el usuario académico ya no existe."
+        ),
+        { statusCode: 409 }
+      );
+    }
+
+    // 7. Datos mínimos para imprimir. buildNombreAfiliado nunca devuelve
+    //    vacío —cae en un texto por defecto—, así que se comprueban los
+    //    campos de origen y no su resultado.
+    const dni = normalizeDni(usuario.dni);
+    const apellidoNombre = buildNombreAfiliado(usuario);
+    const apellido = String(usuario.apellido || "").trim();
+    const nombre = String(usuario.nombre || "").trim();
+
+    const tieneNombreReal = Boolean(
+      String(usuario.apellidoNombre || usuario.apellido_y_nombre || "").trim() ||
+        apellido ||
+        nombre
+    );
+
+    if (!dni || !tieneNombreReal) {
+      throw Object.assign(
+        new Error(
+          "No se puede emitir el certificado porque los datos del participante están incompletos."
+        ),
+        { statusCode: 409 }
+      );
+    }
+
+    // 8. Doble emisión. Se consulta sólo la subcolección de ESTE curso.
+    const emitidosPrevios = await queryFirestoreChildCollection(
+      `certificados/${cursoId}`,
+      "emitidos",
+      [{ field: "usuarioDocId", value: usuarioDocId }],
+      20
+    );
+
+    const vigente = emitidosPrevios.find(
+      (emitido) => emitido.estado === EMITIDOS_ESTADO_VIGENTE
+    );
+
+    if (vigente) {
+      throw Object.assign(
+        new Error(
+          "Este participante ya tiene un certificado vigente emitido para este curso."
+        ),
+        { statusCode: 409 }
+      );
+    }
+
+    // 9. Token y URL de validación.
+    const token = await generarTokenCertificado(cursoId);
+    const urlValidacion = `${CERTIFICADOS_VALIDACION_BASE_URL}/${cursoId}/${token}`;
+
+    const ahora = new Date();
+
+    // 10. Snapshot. El título del curso sale del curso REAL; el resto, de la
+    //     configuración. Nada viene del body.
+    const participante = {
+      usuarioDocId,
+      dni,
+      apellidoNombre,
+      ...(apellido ? { apellido } : {}),
+      ...(nombre ? { nombre } : {}),
+    };
+
+    const certificadoSnapshot = {
+      cursoTitulo: String(curso.titulo || certificado.cursoTitulo || ""),
+      titulo: String(certificado.titulo || ""),
+      resolucion: String(certificado.resolucion || ""),
+      cargaHoraria: String(certificado.cargaHoraria || ""),
+      dias: String(certificado.dias || ""),
+      fecha: String(certificado.fecha || ""),
+      modalidad: String(certificado.modalidad || ""),
+      firmas: Array.isArray(certificado.firmas) ? certificado.firmas : [],
+    };
+
+    const datos = {
+      version: 1,
+      certificadoId: token,
+      token,
+      cursoId,
+      usuarioDocId,
+      estado: EMITIDOS_ESTADO_VIGENTE,
+      participante,
+      certificado: certificadoSnapshot,
+      urlValidacion,
+      emitidoEn: ahora,
+      emitidoPor: authUser.uid,
+    };
+
+    // createFirestoreDoc y no setFirestoreDoc: si el documento ya existiera,
+    // debe fallar en vez de sobrescribir un certificado ajeno.
+    await createFirestoreDoc(`certificados/${cursoId}/emitidos`, token, datos);
+
+    console.log(
+      `[sidca-chatbot-backend] certificado emitido curso=${cursoId} usuario=${usuarioDocId} token=${token} por=${authUser.uid}`
+    );
+
+    return res.status(201).json({
+      ok: true,
+      modulo: "certificados",
+      creado: true,
+      emision: {
+        certificadoId: token,
+        token,
+        cursoId,
+        usuarioDocId,
+        estado: EMITIDOS_ESTADO_VIGENTE,
+        participante,
+        certificado: certificadoSnapshot,
+        urlValidacion,
+        emitidoEn: ahora.toISOString(),
+      },
+    });
+  } catch (error: any) {
+    return sendCertificadosError(res, error);
+  }
+});
 
 app.post("/api/chatbot/query", chatbotRateLimit, async (req, res) => {
   try {
