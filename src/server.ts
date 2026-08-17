@@ -2047,6 +2047,112 @@ async function resolverEnLotes<T, R>(
   return salida;
 }
 
+/**
+ * Participante aprobado de un curso, con la calidad de sus datos resuelta.
+ *
+ * `estado` describe la calidad del dato ACADÉMICO, no la disponibilidad:
+ *   aprobado          → tiene DNI y nombre, se le puede emitir
+ *   datos_incompletos → falta DNI o nombre
+ *   sin_usuario       → su documento de usuarios ya no existe
+ *
+ * `apartado` es una condición ADMINISTRATIVA independiente: quien fue quitado
+ * de la emisión conserva su estado académico tal cual.
+ */
+type ParticipanteAprobado = {
+  usuarioDocId: string;
+  dni: string;
+  apellidoNombre: string;
+  apellido?: string;
+  nombre?: string;
+  estado: "aprobado" | "datos_incompletos" | "sin_usuario";
+  aprobaciones: number;
+  apartado?: boolean;
+};
+
+/** Proyecta un usuario resuelto a la forma común del participante. */
+function construirParticipanteAprobado(
+  usuarioDocId: string,
+  usuario: FirestoreRecord | null,
+  aprobaciones: number,
+  apartado = false
+): ParticipanteAprobado {
+  const comun = {
+    usuarioDocId,
+    aprobaciones,
+    ...(apartado ? { apartado: true } : {}),
+  };
+
+  if (!usuario) {
+    return {
+      ...comun,
+      dni: "",
+      apellidoNombre: "",
+      estado: "sin_usuario",
+    };
+  }
+
+  const dni = normalizeDni(usuario.dni);
+  const apellidoNombre = buildNombreAfiliado(usuario);
+
+  // buildNombreAfiliado nunca devuelve vacío: si no hay datos cae en su texto
+  // por defecto, así que se comprueban los campos de origen.
+  const tieneNombre = Boolean(
+    String(usuario.apellidoNombre || usuario.apellido_y_nombre || "").trim() ||
+      String(usuario.apellido || "").trim() ||
+      String(usuario.nombre || "").trim()
+  );
+
+  // apellido / nombre sólo si existen de verdad: no se parte artificialmente
+  // un apellidoNombre.
+  const apellido = String(usuario.apellido || "").trim();
+  const nombre = String(usuario.nombre || "").trim();
+
+  return {
+    ...comun,
+    dni,
+    apellidoNombre,
+    ...(apellido ? { apellido } : {}),
+    ...(nombre ? { nombre } : {}),
+    estado: Boolean(dni) && tieneNombre ? "aprobado" : "datos_incompletos",
+  };
+}
+
+/**
+ * Resuelve los documentos de usuario de un conjunto de aprobados y devuelve la
+ * lista ordenada por apellido y nombre.
+ *
+ * Se usa igual para los disponibles y para los apartados: la única diferencia
+ * es la marca `apartado`.
+ */
+async function resolverParticipantesAprobados(
+  porUsuario: Map<string, number>,
+  apartado = false
+): Promise<ParticipanteAprobado[]> {
+  const resueltos = await resolverEnLotes(
+    [...porUsuario.keys()],
+    USUARIOS_LOTE_CONCURRENTE,
+    async (usuarioDocId) => {
+      const usuario = await getFirestoreDoc(`usuarios/${usuarioDocId}`);
+      return { usuarioDocId, usuario };
+    }
+  );
+
+  return resueltos
+    .map(({ usuarioDocId, usuario }) =>
+      construirParticipanteAprobado(
+        usuarioDocId,
+        usuario,
+        porUsuario.get(usuarioDocId) || 1,
+        apartado
+      )
+    )
+    .sort((a, b) =>
+      a.apellidoNombre.localeCompare(b.apellidoNombre, "es", {
+        sensitivity: "base",
+      })
+    );
+}
+
 app.get("/api/certificados/admin/aprobados/:cursoId", async (req, res) => {
   try {
     const authUser = await verifyFirebaseIdToken(req.headers.authorization);
@@ -2089,11 +2195,14 @@ app.get("/api/certificados/admin/aprobados/:cursoId", async (req, res) => {
     let rutasInesperadas = 0;
     let noAprobados = 0;
     let duplicados = 0;
-    let excluidos = 0;
 
     // usuarioDocId -> cantidad de documentos de aprobación de ese usuario.
+    // Dos mapas: quienes siguen disponibles para emitir y quienes fueron
+    // apartados. Los apartados también se resuelven, para poder mostrarlos y
+    // recuperarlos: contarlos no alcanzaba, porque sin nombre ni DNI la UI no
+    // tenía nada que ofrecer.
     const porUsuario = new Map<string, number>();
-    const excluidosVistos = new Set<string>();
+    const porUsuarioExcluido = new Map<string, number>();
 
     for (const aprobacion of aprobaciones) {
       const usuarioDocId = extraerUsuarioDocIdDeAprobacion(aprobacion._name);
@@ -2108,97 +2217,45 @@ app.get("/api/certificados/admin/aprobados/:cursoId", async (req, res) => {
         continue;
       }
 
-      // Apartado de la emisión por decisión administrativa: no entra al mapa
-      // de participantes. Se cuenta una sola vez por usuario, aunque tenga
-      // aprobaciones duplicadas.
-      if (usuariosExcluidos.has(usuarioDocId)) {
-        if (!excluidosVistos.has(usuarioDocId)) {
-          excluidosVistos.add(usuarioDocId);
-          excluidos += 1;
-        }
-        continue;
-      }
+      const apartado = usuariosExcluidos.has(usuarioDocId);
+      const mapa = apartado ? porUsuarioExcluido : porUsuario;
 
-      const previos = porUsuario.get(usuarioDocId);
+      const previos = mapa.get(usuarioDocId);
 
       if (previos === undefined) {
-        porUsuario.set(usuarioDocId, 1);
+        mapa.set(usuarioDocId, 1);
       } else {
-        porUsuario.set(usuarioDocId, previos + 1);
+        // Los duplicados del importador se cuentan en ambos grupos: son
+        // documentos de aprobación repetidos, no una cuestión de
+        // disponibilidad.
+        mapa.set(usuarioDocId, previos + 1);
         duplicados += 1;
       }
     }
 
-    const usuarioDocIds = [...porUsuario.keys()];
+    const [participantes, participantesExcluidos] = await Promise.all([
+      resolverParticipantesAprobados(porUsuario),
+      resolverParticipantesAprobados(porUsuarioExcluido, true),
+    ]);
 
-    const resueltos = await resolverEnLotes(
-      usuarioDocIds,
-      USUARIOS_LOTE_CONCURRENTE,
-      async (usuarioDocId) => {
-        const usuario = await getFirestoreDoc(`usuarios/${usuarioDocId}`);
-        return { usuarioDocId, usuario };
-      }
-    );
+    // Los contadores de calidad de datos se refieren a los DISPONIBLES, que es
+    // lo que muestran los indicadores de la pantalla. Así se mantienen las dos
+    // invariantes:
+    //   identificados + datosIncompletos + sinUsuario = participantes.length
+    //   participantes.length + participantesExcluidos.length = aprobados
+    const contarEstado = (
+      lista: ParticipanteAprobado[],
+      estado: ParticipanteAprobado["estado"]
+    ) => lista.filter((participante) => participante.estado === estado).length;
 
-    let sinUsuario = 0;
-    let datosIncompletos = 0;
+    const identificados = contarEstado(participantes, "aprobado");
+    const datosIncompletos = contarEstado(participantes, "datos_incompletos");
+    const sinUsuario = contarEstado(participantes, "sin_usuario");
 
-    const participantes = resueltos.map(({ usuarioDocId, usuario }) => {
-      const aprobacionesDelUsuario = porUsuario.get(usuarioDocId) || 1;
-
-      if (!usuario) {
-        sinUsuario += 1;
-        return {
-          usuarioDocId,
-          dni: "",
-          apellidoNombre: "",
-          estado: "sin_usuario" as const,
-          aprobaciones: aprobacionesDelUsuario,
-        };
-      }
-
-      const dni = normalizeDni(usuario.dni);
-      const apellidoNombre = buildNombreAfiliado(usuario);
-
-      // buildNombreAfiliado nunca devuelve vacío: si no hay datos cae en su
-      // texto por defecto, así que se comprueban los campos de origen.
-      const tieneNombre = Boolean(
-        String(usuario.apellidoNombre || usuario.apellido_y_nombre || "").trim() ||
-          String(usuario.apellido || "").trim() ||
-          String(usuario.nombre || "").trim()
-      );
-
-      const completo = Boolean(dni) && tieneNombre;
-      if (!completo) datosIncompletos += 1;
-
-      // apellido / nombre sólo si existen de verdad en el documento: no se
-      // parte artificialmente un apellidoNombre.
-      const apellido = String(usuario.apellido || "").trim();
-      const nombre = String(usuario.nombre || "").trim();
-
-      return {
-        usuarioDocId,
-        dni,
-        apellidoNombre,
-        ...(apellido ? { apellido } : {}),
-        ...(nombre ? { nombre } : {}),
-        estado: completo ? ("aprobado" as const) : ("datos_incompletos" as const),
-        aprobaciones: aprobacionesDelUsuario,
-      };
-    });
-
-    participantes.sort((a, b) =>
-      a.apellidoNombre.localeCompare(b.apellidoNombre, "es", {
-        sensitivity: "base",
-      })
-    );
-
-    const identificados = participantes.filter(
-      (participante) => participante.estado === "aprobado"
-    ).length;
+    const excluidos = participantesExcluidos.length;
 
     console.log(
-      `[sidca-chatbot-backend] aprobados curso=${cursoId} documentos=${documentosAprobacion} unicos=${participantes.length} duplicados=${duplicados}`
+      `[sidca-chatbot-backend] aprobados curso=${cursoId} documentos=${documentosAprobacion} disponibles=${participantes.length} apartados=${excluidos} duplicados=${duplicados}`
     );
 
     return res.status(200).json({
@@ -2213,9 +2270,8 @@ app.get("/api/certificados/admin/aprobados/:cursoId", async (req, res) => {
       resumen: {
         documentosAprobacion,
         // Total de personas aprobadas del curso, INCLUYENDO las apartadas de
-        // la emisión. Es el dato académico y no baja al excluir a alguien:
-        // excluir no borra ninguna aprobación.
-        //   aprobados = identificados + datosIncompletos + sinUsuario + excluidos
+        // la emisión. Es el dato académico y no baja al apartar a alguien:
+        // apartar no borra ninguna aprobación.
         aprobados: participantes.length + excluidos,
         // Personas que siguen disponibles para emitir.
         disponibles: participantes.length,
@@ -2230,6 +2286,9 @@ app.get("/api/certificados/admin/aprobados/:cursoId", async (req, res) => {
       },
       ocultarEnEmitir: certificado?.ocultarEnEmitir === true,
       participantes,
+      // Apartados de la emisión. Conservan su aprobación intacta y pueden
+      // recuperarse con PUT .../reincluir-usuario.
+      participantesExcluidos,
     });
   } catch (error: any) {
     return sendCertificadosError(res, error);
