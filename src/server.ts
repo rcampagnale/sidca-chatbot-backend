@@ -2154,6 +2154,7 @@ type ParticipanteAprobado = {
   nombre?: string;
   estado: "aprobado" | "datos_incompletos" | "sin_usuario";
   aprobaciones: number;
+  certificadoEmitido: boolean;
   apartado?: boolean;
 };
 
@@ -2162,11 +2163,13 @@ function construirParticipanteAprobado(
   usuarioDocId: string,
   usuario: FirestoreRecord | null,
   aprobaciones: number,
-  apartado = false
+  apartado = false,
+  certificadoEmitido = false
 ): ParticipanteAprobado {
   const comun = {
     usuarioDocId,
     aprobaciones,
+    certificadoEmitido,
     ...(apartado ? { apartado: true } : {}),
   };
 
@@ -2214,7 +2217,8 @@ function construirParticipanteAprobado(
  */
 async function resolverParticipantesAprobados(
   porUsuario: Map<string, number>,
-  apartado = false
+  apartado = false,
+  usuariosConCertificadoVigente = new Set<string>()
 ): Promise<ParticipanteAprobado[]> {
   const resueltos = await resolverEnLotes(
     [...porUsuario.keys()],
@@ -2231,7 +2235,8 @@ async function resolverParticipantesAprobados(
         usuarioDocId,
         usuario,
         porUsuario.get(usuarioDocId) || 1,
-        apartado
+        apartado,
+        usuariosConCertificadoVigente.has(usuarioDocId)
       )
     )
     .sort((a, b) =>
@@ -2266,6 +2271,18 @@ app.get("/api/certificados/admin/aprobados/:cursoId", async (req, res) => {
         : []
       ).map((valor: any) => String(valor || "").trim())
     );
+
+    const emitidosVigentes = await queryFirestoreChildCollection(
+      `certificados/${cursoId}`,
+      "emitidos",
+      [{ field: "estado", value: EMITIDOS_ESTADO_VIGENTE }],
+      APROBADOS_MAX_RESULTADOS
+    );
+    const usuariosConCertificadoVigente = new Set<string>();
+    emitidosVigentes.forEach((emitido) => {
+      const usuarioDocId = String(emitido.usuarioDocId || "").trim();
+      if (usuarioDocId) usuariosConCertificadoVigente.add(usuarioDocId);
+    });
 
     // Un solo filtro de igualdad: lo resuelve el índice de campo único que
     // Firestore mantiene automáticamente. "aprobo" se evalúa en memoria para
@@ -2322,8 +2339,8 @@ app.get("/api/certificados/admin/aprobados/:cursoId", async (req, res) => {
     }
 
     const [participantes, participantesExcluidos] = await Promise.all([
-      resolverParticipantesAprobados(porUsuario),
-      resolverParticipantesAprobados(porUsuarioExcluido, true),
+      resolverParticipantesAprobados(porUsuario, false, usuariosConCertificadoVigente),
+      resolverParticipantesAprobados(porUsuarioExcluido, true, usuariosConCertificadoVigente),
     ]);
 
     // Los contadores de calidad de datos se refieren a los DISPONIBLES, que es
