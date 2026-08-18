@@ -1666,15 +1666,21 @@ function normalizarInstitucionCertificado(
  * Autoridad que firma el certificado, en TEXTO.
  *
  * Reemplaza al modelo anterior de firmas con imagen (Cloudinary): ahora el
- * certificado sólo imprime nombre y cargo.
+ * certificado sólo imprime texto, hasta cuatro renglones por autoridad.
  *
  * nombre y cargo admiten vacío a propósito: la configuración se guarda como
  * borrador y puede quedar incompleta. La obligatoriedad real se comprueba al
  * EMITIR, que es cuando el dato se vuelve irreversible.
+ *
+ * organismo y referencia son opcionales incluso al emitir: no toda autoridad
+ * necesita las cuatro líneas. Al faltar llegan como "" y el certificado
+ * simplemente no dibuja ese renglón.
  */
 const autoridadCertificadoSchema = z.strictObject({
   nombre: z.string().trim().max(160),
   cargo: z.string().trim().max(200),
+  organismo: z.string().trim().max(300).optional().default(""),
+  referencia: z.string().trim().max(300).optional().default(""),
   orden: z.number().int().min(1).max(2),
 });
 
@@ -1710,6 +1716,11 @@ const ESTADOS_CONFIGURACION_CERTIFICADO = new Set(["borrador", "lista"]);
  *                           cargo de las dos primeras y se ignoran
  *                           imagenUrl, imagenPublicId y proveedor.
  *
+ * Las autoridades guardadas antes de existir organismo/referencia no tienen
+ * esos campos: se resuelven a "" acá mismo, así que no hace falta migrar
+ * ningún documento. Tampoco se intenta deducirlos partiendo el cargo: si el
+ * administrador quiere las cuatro líneas, las carga.
+ *
  * No escribe nada en Firestore: el documento legacy queda tal cual hasta que
  * el administrador lo guarde de nuevo.
  */
@@ -1724,6 +1735,8 @@ function obtenerAutoridadesConfiguracion(
     return autoridades.slice(0, 2).map((autoridad: any, indice: number) => ({
       nombre: String(autoridad?.nombre || "").trim(),
       cargo: String(autoridad?.cargo || "").trim(),
+      organismo: String(autoridad?.organismo || "").trim(),
+      referencia: String(autoridad?.referencia || "").trim(),
       orden: indice + 1,
     }));
   }
@@ -1733,6 +1746,8 @@ function obtenerAutoridadesConfiguracion(
   return firmas.slice(0, 2).map((firma: any, indice: number) => ({
     nombre: String(firma?.nombre || "").trim(),
     cargo: String(firma?.cargo || "").trim(),
+    organismo: "",
+    referencia: "",
     orden: indice + 1,
   }));
 }
@@ -1770,7 +1785,7 @@ function mapConfiguracionCertificado(
 /**
  * Ordena las autoridades y reasigna orden 1 y 2.
  *
- * Guarda sólo nombre, cargo y orden: ningún rastro del modelo de imágenes.
+ * Guarda los cuatro textos y el orden: ningún rastro del modelo de imágenes.
  */
 function normalizarAutoridadesCertificado(
   autoridades: z.infer<typeof autoridadCertificadoSchema>[]
@@ -1781,6 +1796,8 @@ function normalizarAutoridadesCertificado(
     .map((autoridad, indice) => ({
       nombre: autoridad.nombre,
       cargo: autoridad.cargo,
+      organismo: autoridad.organismo || "",
+      referencia: autoridad.referencia || "",
       orden: indice + 1,
     }));
 }
@@ -2862,6 +2879,8 @@ app.post("/api/certificados/admin/emision/:cursoId/emitir", async (req, res) => 
     //    certificado emitido es irreversible: tiene que salir con las dos
     //    autoridades completas. Se leen con el helper, que además resuelve las
     //    configuraciones legacy que todavía tienen "firmas".
+    //    "Completa" significa nombre + cargo: organismo y referencia son
+    //    renglones opcionales y no pueden bloquear una emisión.
     const autoridadesCertificado = obtenerAutoridadesConfiguracion(certificado);
 
     const autoridadesCompletas =
