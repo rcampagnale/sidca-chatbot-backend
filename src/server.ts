@@ -1639,19 +1639,43 @@ function parseCertificadoTokenParam(valor: unknown): string {
 }
 
 /**
- * Firma que se imprime en el certificado.
+ * Institución que emite el certificado.
  *
- * Las imágenes se alojan en Cloudinary (el proyecto migró desde Firebase
- * Storage por límite de cuota), por eso se guarda imagenPublicId y no
- * storagePath. Durante el borrador la imagen puede faltar todavía.
+ * Determina qué plantilla usa el frontend. Firestore guarda SÓLO el valor
+ * semántico —"sidca" o "itm"—, nunca el nombre del archivo PNG: el asset es
+ * un detalle del frontend y puede cambiar sin tocar los datos.
  */
-const firmaCertificadoSchema = z.strictObject({
-  nombre: z.string().trim().min(1, "El nombre de la firma es obligatorio.").max(160),
-  cargo: z.string().trim().min(1, "El cargo de la firma es obligatorio.").max(200),
-  imagenUrl: z.string().trim().max(1000).optional().default(""),
-  imagenPublicId: z.string().trim().max(300).optional().default(""),
-  proveedor: z.string().trim().max(40).optional().default("cloudinary"),
-  orden: z.number().int().positive().max(50),
+const INSTITUCIONES_CERTIFICADO = ["sidca", "itm"] as const;
+
+type InstitucionCertificado = (typeof INSTITUCIONES_CERTIFICADO)[number];
+
+/**
+ * Resuelve la institución de una configuración o de un emitido.
+ *
+ * Las configuraciones anteriores a este campo no lo tienen: se interpretan
+ * como "sidca", que era la única plantilla que existía. No se migra nada —
+ * el campo queda persistido recién cuando el administrador vuelve a guardar.
+ */
+function normalizarInstitucionCertificado(
+  record: FirestoreRecord | null | undefined
+): InstitucionCertificado {
+  return record?.institucionCertificado === "itm" ? "itm" : "sidca";
+}
+
+/**
+ * Autoridad que firma el certificado, en TEXTO.
+ *
+ * Reemplaza al modelo anterior de firmas con imagen (Cloudinary): ahora el
+ * certificado sólo imprime nombre y cargo.
+ *
+ * nombre y cargo admiten vacío a propósito: la configuración se guarda como
+ * borrador y puede quedar incompleta. La obligatoriedad real se comprueba al
+ * EMITIR, que es cuando el dato se vuelve irreversible.
+ */
+const autoridadCertificadoSchema = z.strictObject({
+  nombre: z.string().trim().max(160),
+  cargo: z.string().trim().max(200),
+  orden: z.number().int().min(1).max(2),
 });
 
 /**
@@ -1660,6 +1684,8 @@ const firmaCertificadoSchema = z.strictObject({
  * Es estricto a propósito: el cliente no puede inyectar campos arbitrarios.
  * cursoId, cursoTitulo, estadoConfiguracion y la auditoría NO se aceptan
  * desde el body; los resuelve el backend.
+ *
+ * "firmas" ya no se acepta: strictObject lo rechaza si alguien lo enviara.
  */
 const configuracionCertificadoSchema = z.strictObject({
   titulo: z.string().trim().min(1, "El título del certificado es obligatorio.").max(300),
@@ -1668,10 +1694,48 @@ const configuracionCertificadoSchema = z.strictObject({
   dias: z.string().trim().min(1, "Las fechas de realización son obligatorias.").max(300),
   fecha: z.string().trim().min(1, "La fecha del certificado es obligatoria.").max(200),
   modalidad: z.string().trim().min(1, "La modalidad es obligatoria.").max(120),
-  firmas: z.array(firmaCertificadoSchema).max(10).optional().default([]),
+  institucionCertificado: z.enum(INSTITUCIONES_CERTIFICADO),
+  autoridades: z.array(autoridadCertificadoSchema).max(2).optional().default([]),
 });
 
 const ESTADOS_CONFIGURACION_CERTIFICADO = new Set(["borrador", "lista"]);
+
+/**
+ * Autoridades de una configuración, con compatibilidad de LECTURA hacia el
+ * modelo anterior.
+ *
+ * Prioridad:
+ *   1. record.autoridades — modelo actual.
+ *   2. record.firmas      — configuraciones anteriores: se toman nombre y
+ *                           cargo de las dos primeras y se ignoran
+ *                           imagenUrl, imagenPublicId y proveedor.
+ *
+ * No escribe nada en Firestore: el documento legacy queda tal cual hasta que
+ * el administrador lo guarde de nuevo.
+ */
+function obtenerAutoridadesConfiguracion(
+  record: FirestoreRecord | null | undefined
+): Record<string, any>[] {
+  const autoridades = Array.isArray(record?.autoridades)
+    ? record!.autoridades
+    : null;
+
+  if (autoridades) {
+    return autoridades.slice(0, 2).map((autoridad: any, indice: number) => ({
+      nombre: String(autoridad?.nombre || "").trim(),
+      cargo: String(autoridad?.cargo || "").trim(),
+      orden: indice + 1,
+    }));
+  }
+
+  const firmas = Array.isArray(record?.firmas) ? record!.firmas : [];
+
+  return firmas.slice(0, 2).map((firma: any, indice: number) => ({
+    nombre: String(firma?.nombre || "").trim(),
+    cargo: String(firma?.cargo || "").trim(),
+    orden: indice + 1,
+  }));
+}
 
 /**
  * Proyecta el documento de Firestore a la respuesta pública del módulo.
@@ -1693,7 +1757,8 @@ function mapConfiguracionCertificado(
     dias: record.dias || "",
     fecha: record.fecha || "",
     modalidad: record.modalidad || "",
-    firmas: Array.isArray(record.firmas) ? record.firmas : [],
+    institucionCertificado: normalizarInstitucionCertificado(record),
+    autoridades: obtenerAutoridadesConfiguracion(record),
     estadoConfiguracion: record.estadoConfiguracion || "borrador",
     creadoEn: record.creadoEn || null,
     actualizadoEn: record.actualizadoEn || null,
@@ -1703,21 +1768,19 @@ function mapConfiguracionCertificado(
 }
 
 /**
- * Ordena las firmas y reasigna orden 1..n.
- * Así el orden guardado es siempre consistente aunque el cliente envíe
- * valores repetidos o con huecos.
+ * Ordena las autoridades y reasigna orden 1 y 2.
+ *
+ * Guarda sólo nombre, cargo y orden: ningún rastro del modelo de imágenes.
  */
-function normalizarFirmasCertificado(
-  firmas: z.infer<typeof firmaCertificadoSchema>[]
+function normalizarAutoridadesCertificado(
+  autoridades: z.infer<typeof autoridadCertificadoSchema>[]
 ): Record<string, any>[] {
-  return [...firmas]
+  return [...autoridades]
     .sort((a, b) => a.orden - b.orden)
-    .map((firma, indice) => ({
-      nombre: firma.nombre,
-      cargo: firma.cargo,
-      imagenUrl: firma.imagenUrl || "",
-      imagenPublicId: firma.imagenPublicId || "",
-      proveedor: firma.proveedor || "cloudinary",
+    .slice(0, 2)
+    .map((autoridad, indice) => ({
+      nombre: autoridad.nombre,
+      cargo: autoridad.cargo,
       orden: indice + 1,
     }));
 }
@@ -1806,7 +1869,15 @@ app.put("/api/certificados/admin/configuracion/:cursoId", async (req, res) => {
       fecha: datosValidados.fecha,
       modalidad: datosValidados.modalidad,
 
-      firmas: normalizarFirmasCertificado(datosValidados.firmas || []),
+      institucionCertificado: datosValidados.institucionCertificado,
+
+      // Sustituye a "firmas". El campo legacy puede seguir existiendo
+      // físicamente en documentos anteriores: updateFirestoreDoc usa
+      // updateMask, así que no se toca lo que no se nombra. No se borra
+      // automáticamente — es historial, y quitarlo no aporta nada.
+      autoridades: normalizarAutoridadesCertificado(
+        datosValidados.autoridades || []
+      ),
 
       estadoConfiguracion,
 
@@ -2787,7 +2858,35 @@ app.post("/api/certificados/admin/emision/:cursoId/emitir", async (req, res) => 
       );
     }
 
-    // 9. Token y URL de validación.
+    // 9. Autoridades. El PUT permite guardar borradores incompletos, pero un
+    //    certificado emitido es irreversible: tiene que salir con las dos
+    //    autoridades completas. Se leen con el helper, que además resuelve las
+    //    configuraciones legacy que todavía tienen "firmas".
+    const autoridadesCertificado = obtenerAutoridadesConfiguracion(certificado);
+
+    const autoridadesCompletas =
+      autoridadesCertificado.length === 2 &&
+      autoridadesCertificado.every(
+        (autoridad) =>
+          String(autoridad.nombre || "").trim() !== "" &&
+          String(autoridad.cargo || "").trim() !== ""
+      );
+
+    if (!autoridadesCompletas) {
+      throw Object.assign(
+        new Error(
+          "No se puede emitir el certificado porque faltan completar las dos autoridades."
+        ),
+        { statusCode: 409 }
+      );
+    }
+
+    // 10. Institución. Las configuraciones anteriores al campo se emiten como
+    //     "sidca", que era la única plantilla existente.
+    const institucionCertificado =
+      normalizarInstitucionCertificado(certificado);
+
+    // 11. Token y URL de validación.
     const token = await generarTokenCertificado(cursoId);
     const urlValidacion = `${CERTIFICADOS_VALIDACION_BASE_URL}/${cursoId}/${token}`;
 
@@ -2803,7 +2902,11 @@ app.post("/api/certificados/admin/emision/:cursoId/emitir", async (req, res) => 
       ...(nombre ? { nombre } : {}),
     };
 
+    // La institución y las autoridades forman parte del SNAPSHOT: si mañana
+    // se cambia la institución del curso o el cargo de una autoridad, el
+    // certificado ya emitido sigue diciendo lo que decía cuando se emitió.
     const certificadoSnapshot = {
+      institucionCertificado: institucionCertificado,
       cursoTitulo: String(curso.titulo || certificado.cursoTitulo || ""),
       titulo: String(certificado.titulo || ""),
       resolucion: String(certificado.resolucion || ""),
@@ -2811,7 +2914,7 @@ app.post("/api/certificados/admin/emision/:cursoId/emitir", async (req, res) => 
       dias: String(certificado.dias || ""),
       fecha: String(certificado.fecha || ""),
       modalidad: String(certificado.modalidad || ""),
-      firmas: Array.isArray(certificado.firmas) ? certificado.firmas : [],
+      autoridades: autoridadesCertificado,
     };
 
     const datos = {
