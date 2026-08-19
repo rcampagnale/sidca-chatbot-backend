@@ -7,6 +7,10 @@ import OpenAI, { toFile } from "openai";
 import { z } from "zod";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import { runChatbotWorkflow } from "./openaiWorkflow.js";
+// El SDK de Storage ya no se usa acá: la descarga va por la API JSON con el
+// mismo helper de credenciales que el resto del backend. El Cloud Run Job sí
+// lo sigue usando, en su propio proceso.
+import { Readable } from "node:stream";
 
 const app = express();
 const PORT = Number(process.env.PORT || 8080);
@@ -442,7 +446,14 @@ async function firestoreRequest<T>(
 
   if (!response.ok) {
     const detail = data?.error?.message || data?.message || response.statusText;
-    throw new Error(`Firestore ${response.status}: ${detail}`);
+    // El mensaje se mantiene igual para no cambiar lo que ya loguean o
+    // muestran los llamadores. Se adjunta además el estado estructurado, que
+    // hace falta para distinguir una precondición incumplida de un error real
+    // sin tener que leer el texto.
+    throw Object.assign(new Error(`Firestore ${response.status}: ${detail}`), {
+      firestoreStatus: String(data?.error?.status || ""),
+      firestoreHttpStatus: response.status,
+    });
   }
 
   return data as T;
@@ -2246,13 +2257,16 @@ async function resolverParticipantesAprobados(
     );
 }
 
-app.get("/api/certificados/admin/aprobados/:cursoId", async (req, res) => {
-  try {
-    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
-    await requireAdministrador(authUser);
-
-    const cursoId = parseCursoIdParam(req.params.cursoId);
-
+/**
+ * Resuelve el padrón completo de aprobados de un curso.
+ *
+ * Es el cuerpo del GET /aprobados extraído tal cual, sin req ni res, para que
+ * la emisión masiva pueda reconstruir la misma lista desde el backend en vez
+ * de confiar en la que tiene abierta el navegador. Una sola implementación:
+ * si mañana cambia el criterio de "aprobado", cambia para las dos.
+ */
+async function resolverAprobadosCurso(cursoId: string) {
+  {
     const curso = await getFirestoreDoc(`cursos/${cursoId}`);
 
     if (!curso) {
@@ -2363,9 +2377,7 @@ app.get("/api/certificados/admin/aprobados/:cursoId", async (req, res) => {
       `[sidca-chatbot-backend] aprobados curso=${cursoId} documentos=${documentosAprobacion} disponibles=${participantes.length} apartados=${excluidos} duplicados=${duplicados}`
     );
 
-    return res.status(200).json({
-      ok: true,
-      modulo: "certificados",
+    return {
       curso: {
         id: cursoId,
         titulo: curso.titulo || "",
@@ -2394,6 +2406,22 @@ app.get("/api/certificados/admin/aprobados/:cursoId", async (req, res) => {
       // Apartados de la emisión. Conservan su aprobación intacta y pueden
       // recuperarse con PUT .../reincluir-usuario.
       participantesExcluidos,
+    };
+  }
+}
+
+app.get("/api/certificados/admin/aprobados/:cursoId", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    await requireAdministrador(authUser);
+
+    const cursoId = parseCursoIdParam(req.params.cursoId);
+    const datos = await resolverAprobadosCurso(cursoId);
+
+    return res.status(200).json({
+      ok: true,
+      modulo: "certificados",
+      ...datos,
     });
   } catch (error: any) {
     return sendCertificadosError(res, error);
@@ -2762,48 +2790,239 @@ app.get(
   }
 );
 
-app.post("/api/certificados/admin/emision/:cursoId/emitir", async (req, res) => {
+app.get("/api/certificados/admin/emision/:cursoId/emitidos", async (req, res) => {
   try {
     const authUser = await verifyFirebaseIdToken(req.headers.authorization);
     await requireAdministrador(authUser);
-
     const cursoId = parseCursoIdParam(req.params.cursoId);
+    const emitidos = await queryFirestoreChildCollection(
+      `certificados/${cursoId}`,
+      "emitidos",
+      [{ field: "estado", value: EMITIDOS_ESTADO_VIGENTE }],
+      APROBADOS_MAX_RESULTADOS
+    );
+    return res.status(200).json({
+      ok: true,
+      modulo: "certificados",
+      cursoId,
+      total: emitidos.length,
+      emisiones: emitidos.map(mapEmisionCertificado),
+    });
+  } catch (error: any) {
+    return sendCertificadosError(res, error);
+  }
+});
 
-    let usuarioDocId: string;
-    try {
-      ({ usuarioDocId } = emitirCertificadoSchema.parse(req.body));
-    } catch (error: any) {
+/**
+ * Índice de unicidad por participante.
+ *
+ * El documento emitido vive en emitidos/{token} y el token es aleatorio, así
+ * que dos administradores que emitan a la vez a la misma persona generarían
+ * dos identificadores distintos y ninguna de las dos escrituras chocaría con
+ * la otra: la comprobación previa de "¿ya tiene certificado vigente?" es una
+ * lectura, y entre esa lectura y la escritura hay una ventana.
+ *
+ * Este índice cierra la ventana. Su identificador NO es aleatorio: es el
+ * propio usuarioDocId, así que sólo puede existir una vez por curso, y
+ * Firestore lo hace cumplir en el servidor.
+ */
+const EMISION_INDICE_COLECCION = "emisionUsuarios";
+
+/** Ruta absoluta de un documento, como la exige documents:commit. */
+const rutaDocumentoFirestore = (path: string) =>
+  `projects/${firebaseProjectId}/databases/(default)/documents/${path}`;
+
+/**
+ * ¿El commit falló porque el documento ya existía?
+ *
+ * Firestore no es del todo consistente con qué devuelve al incumplirse una
+ * precondición `exists: false` —según el caso, ALREADY_EXISTS o
+ * FAILED_PRECONDITION—, así que se aceptan las dos y, como red, el texto.
+ */
+function esPrecondicionIncumplida(error: any): boolean {
+  const estado = String(error?.firestoreStatus || "");
+
+  if (estado === "ALREADY_EXISTS" || estado === "FAILED_PRECONDITION") {
+    return true;
+  }
+
+  return /already exists|precondition/i.test(String(error?.message || ""));
+}
+
+/**
+ * Escribe el certificado emitido y su índice de unicidad en UNA sola
+ * transacción.
+ *
+ * Las dos escrituras viajan en el mismo `documents:commit`, cada una con
+ * precondición `exists: false`. Firestore aplica el commit entero o ninguna
+ * parte: no puede quedar un certificado sin índice ni un índice sin
+ * certificado.
+ *
+ * Si el índice ya existía, el commit completo se rechaza y se traduce a un
+ * 409 con `codigo: "ya_emitido"`, que es exactamente lo que ya devolvía la
+ * comprobación previa. Para quien llama, ganar o perder la carrera se ve
+ * igual.
+ *
+ * No se escribe nada sensible en el índice: usuarioDocId, token, estado y
+ * fecha. El día que existan anulaciones, ese `estado` es el que habrá que
+ * actualizar o el documento el que habrá que borrar para liberar al
+ * participante; esta tarea no toca esa lógica.
+ */
+async function crearEmisionCertificadoAtomica({
+  cursoId,
+  usuarioDocId,
+  token,
+  emision,
+  creadoEn,
+}: {
+  cursoId: string;
+  usuarioDocId: string;
+  token: string;
+  emision: Record<string, any>;
+  creadoEn: Date;
+}): Promise<void> {
+  const indice = {
+    usuarioDocId,
+    token,
+    estado: EMITIDOS_ESTADO_VIGENTE,
+    creadoEn,
+  };
+
+  const cuerpo = {
+    writes: [
+      {
+        update: {
+          name: rutaDocumentoFirestore(
+            `certificados/${cursoId}/${EMISION_INDICE_COLECCION}/${usuarioDocId}`
+          ),
+          fields: jsToFirestoreFields(indice),
+        },
+        currentDocument: { exists: false },
+      },
+      {
+        update: {
+          name: rutaDocumentoFirestore(
+            `certificados/${cursoId}/emitidos/${token}`
+          ),
+          fields: jsToFirestoreFields(emision),
+        },
+        currentDocument: { exists: false },
+      },
+    ],
+  };
+
+  try {
+    await firestoreRequest(`${firestoreBaseUrl}:commit`, {
+      method: "POST",
+      body: JSON.stringify(cuerpo),
+    });
+  } catch (error: any) {
+    if (esPrecondicionIncumplida(error)) {
       throw Object.assign(
         new Error(
-          error?.issues?.map((issue: any) => issue.message).join(" | ") ||
-            "El cuerpo del pedido es inválido."
+          "Este participante ya tiene un certificado vigente emitido para este curso."
         ),
-        { statusCode: 400 }
+        { statusCode: 409, codigo: "ya_emitido" }
       );
     }
 
-    // 1. Configuración del certificado.
-    const certificado = await obtenerCertificadoParaEmision(cursoId);
+    throw error;
+  }
+}
 
-    // 2. El curso académico debe existir de verdad, no alcanza con el
-    //    cursoTitulo copiado en la configuración.
-    const curso = await getFirestoreDoc(`cursos/${cursoId}`);
+/**
+ * Datos del curso que NO dependen del participante.
+ *
+ * Se resuelven una sola vez por pedido: en la emisión masiva, releer la
+ * configuración y todo el grupo de aprobaciones por cada persona convertiría
+ * cien emisiones en cientos de consultas idénticas.
+ */
+type ContextoEmision = {
+  certificado: FirestoreRecord;
+  curso: FirestoreRecord;
+  usuariosAprobados: Set<string>;
+};
 
-    if (!curso) {
-      throw Object.assign(new Error("El curso indicado no existe."), {
-        statusCode: 404,
-      });
-    }
+/**
+ * Prepara el contexto y aplica las validaciones de CURSO.
+ *
+ * Son los pasos 1 a 3 de la emisión, que no miran a ningún participante en
+ * particular: la configuración tiene que existir, el curso académico tiene que
+ * existir y el curso no puede estar apartado de la emisión.
+ */
+async function prepararContextoEmision(cursoId: string): Promise<ContextoEmision> {
+  // 1. Configuración del certificado.
+  const certificado = await obtenerCertificadoParaEmision(cursoId);
 
-    // 3. Curso apartado de la emisión. Se comprueba acá también para que no
-    //    baste con llamar al endpoint directamente salteando la UI.
-    if (certificado.ocultarEnEmitir === true) {
-      throw Object.assign(
-        new Error("Este curso se encuentra apartado de la emisión de certificados."),
-        { statusCode: 409 }
-      );
-    }
+  // 2. El curso académico debe existir de verdad, no alcanza con el
+  //    cursoTitulo copiado en la configuración.
+  const curso = await getFirestoreDoc(`cursos/${cursoId}`);
 
+  if (!curso) {
+    throw Object.assign(new Error("El curso indicado no existe."), {
+      statusCode: 404,
+    });
+  }
+
+  // 3. Curso apartado de la emisión. Se comprueba acá también para que no
+  //    baste con llamar al endpoint directamente salteando la UI.
+  if (certificado.ocultarEnEmitir === true) {
+    throw Object.assign(
+      new Error("Este curso se encuentra apartado de la emisión de certificados."),
+      { statusCode: 409 }
+    );
+  }
+
+  // Aprobaciones reales del curso, resueltas una sola vez. Se guarda el
+  // conjunto de usuarios con al menos una aprobación válida: los duplicados
+  // del importador no emiten de más porque acá sólo importa la existencia.
+  const aprobaciones = await queryFirestoreCollectionGroup(
+    "cursos",
+    [{ field: "curso", value: `cursos/${cursoId}` }],
+    APROBADOS_MAX_RESULTADOS
+  );
+
+  const usuariosAprobados = new Set<string>();
+
+  for (const aprobacion of aprobaciones) {
+    if (aprobacion.aprobo !== true) continue;
+    const usuarioDocId = extraerUsuarioDocIdDeAprobacion(aprobacion._name);
+    if (usuarioDocId) usuariosAprobados.add(usuarioDocId);
+  }
+
+  return { certificado, curso, usuariosAprobados };
+}
+
+/**
+ * Emite UN certificado. Es la única implementación: la usan tanto el endpoint
+ * individual como el masivo.
+ *
+ * El orden de las comprobaciones es deliberado y no debe alterarse: define qué
+ * error ve el administrador cuando un participante incumple más de una
+ * condición a la vez.
+ *
+ * `contexto` es opcional: sin él la función se autoabastece, con él se evita
+ * releer lo mismo N veces. En ambos casos las validaciones son idénticas.
+ *
+ * Lanza con `statusCode` y, cuando el motivo es una emisión vigente previa,
+ * también con `codigo: "ya_emitido"`, para que la masiva pueda clasificar ese
+ * caso sin comparar textos.
+ */
+async function emitirCertificadoParaUsuario({
+  cursoId,
+  usuarioDocId,
+  authUser,
+  contexto,
+}: {
+  cursoId: string;
+  usuarioDocId: string;
+  authUser: AuthenticatedUser;
+  contexto?: ContextoEmision;
+}) {
+  const { certificado, curso, usuariosAprobados } =
+    contexto || (await prepararContextoEmision(cursoId));
+
+  {
     // 4. Participante excluido por decisión administrativa.
     if (leerUsuariosExcluidos(certificado).includes(usuarioDocId)) {
       throw Object.assign(
@@ -2812,23 +3031,9 @@ app.post("/api/certificados/admin/emision/:cursoId/emitir", async (req, res) => 
       );
     }
 
-    // 5. Aprobación real. No se confía en que la UI lo haya mostrado: se
-    //    releen las aprobaciones del curso y se busca la de este usuario.
-    //    Con una válida alcanza; los duplicados del importador no emiten de
-    //    más porque acá sólo se comprueba existencia.
-    const aprobaciones = await queryFirestoreCollectionGroup(
-      "cursos",
-      [{ field: "curso", value: `cursos/${cursoId}` }],
-      APROBADOS_MAX_RESULTADOS
-    );
-
-    const tieneAprobacion = aprobaciones.some(
-      (aprobacion) =>
-        aprobacion.aprobo === true &&
-        extraerUsuarioDocIdDeAprobacion(aprobacion._name) === usuarioDocId
-    );
-
-    if (!tieneAprobacion) {
+    // 5. Aprobación real. No se confía en que la UI lo haya mostrado: la lista
+    //    sale de las aprobaciones releídas del curso.
+    if (!usuariosAprobados.has(usuarioDocId)) {
       throw Object.assign(
         new Error("El participante no registra una aprobación válida para este curso."),
         { statusCode: 409 }
@@ -2888,7 +3093,10 @@ app.post("/api/certificados/admin/emision/:cursoId/emitir", async (req, res) => 
         new Error(
           "Este participante ya tiene un certificado vigente emitido para este curso."
         ),
-        { statusCode: 409 }
+        // El código permite a la emisión masiva contarlo como "ya emitido" en
+        // vez de como error. Es la carrera real: mientras corre la masiva,
+        // otro administrador puede emitirle a esta misma persona.
+        { statusCode: 409, codigo: "ya_emitido" }
       );
     }
 
@@ -2967,29 +3175,188 @@ app.post("/api/certificados/admin/emision/:cursoId/emitir", async (req, res) => 
       emitidoPor: authUser.uid,
     };
 
-    // createFirestoreDoc y no setFirestoreDoc: si el documento ya existiera,
-    // debe fallar en vez de sobrescribir un certificado ajeno.
-    await createFirestoreDoc(`certificados/${cursoId}/emitidos`, token, datos);
+    // Un único commit con las dos escrituras y sus precondiciones. La
+    // comprobación del paso 8 sigue siendo la primera línea de defensa —y la
+    // que cubre los certificados históricos, anteriores a este índice—, pero
+    // es una lectura: quien de verdad impide la doble emisión simultánea es
+    // esta transacción.
+    await crearEmisionCertificadoAtomica({
+      cursoId,
+      usuarioDocId,
+      token,
+      emision: datos,
+      creadoEn: ahora,
+    });
 
     console.log(
       `[sidca-chatbot-backend] certificado emitido curso=${cursoId} usuario=${usuarioDocId} token=${token} por=${authUser.uid}`
     );
 
+    return {
+      certificadoId: token,
+      token,
+      cursoId,
+      usuarioDocId,
+      estado: EMITIDOS_ESTADO_VIGENTE,
+      participante,
+      certificado: certificadoSnapshot,
+      urlValidacion,
+      emitidoEn: ahora.toISOString(),
+    };
+  }
+}
+
+app.post("/api/certificados/admin/emision/:cursoId/emitir", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    await requireAdministrador(authUser);
+
+    const cursoId = parseCursoIdParam(req.params.cursoId);
+
+    let usuarioDocId: string;
+    try {
+      ({ usuarioDocId } = emitirCertificadoSchema.parse(req.body));
+    } catch (error: any) {
+      throw Object.assign(
+        new Error(
+          error?.issues?.map((issue: any) => issue.message).join(" | ") ||
+            "El cuerpo del pedido es inválido."
+        ),
+        { statusCode: 400 }
+      );
+    }
+
+    const emision = await emitirCertificadoParaUsuario({
+      cursoId,
+      usuarioDocId,
+      authUser,
+    });
+
+    // Misma forma de respuesta que antes del refactor: la pantalla de emisión
+    // individual no se entera de que la lógica se movió.
     return res.status(201).json({
       ok: true,
       modulo: "certificados",
       creado: true,
-      emision: {
-        certificadoId: token,
-        token,
-        cursoId,
-        usuarioDocId,
-        estado: EMITIDOS_ESTADO_VIGENTE,
-        participante,
-        certificado: certificadoSnapshot,
-        urlValidacion,
-        emitidoEn: ahora.toISOString(),
+      emision,
+    });
+  } catch (error: any) {
+    return sendCertificadosError(res, error);
+  }
+});
+
+// ============================================================
+// EMISIÓN MASIVA
+//
+// Emite de una sola vez a todos los aprobados elegibles que todavía no tienen
+// certificado vigente. NO genera PDF: eso es la descarga masiva, que sólo lee
+// lo ya emitido. Son dos responsabilidades separadas a propósito.
+//
+// El cuerpo del pedido se ignora por completo. El navegador manda un cursoId
+// en la URL y nada más: quién corresponde emitir lo decide el backend
+// releyendo el padrón, nunca la lista que el administrador tiene en pantalla.
+// ============================================================
+
+/** Emisiones simultáneas. Con lotes de 10 mil personas no abren mil conexiones. */
+const EMISION_MASIVA_LOTE = 10;
+
+app.post("/api/certificados/admin/emision/:cursoId/emitir-masivo", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    await requireAdministrador(authUser);
+
+    const cursoId = parseCursoIdParam(req.params.cursoId);
+
+    // El padrón se reconstruye acá: mismo helper que alimenta la pantalla, así
+    // que "aprobado", "apartado" y "datos incompletos" significan lo mismo en
+    // los dos lados.
+    const padron = await resolverAprobadosCurso(cursoId);
+
+    // Valida configuración, curso y curso apartado antes de tocar a nadie, y
+    // deja resueltas las aprobaciones para todo el lote.
+    const contexto = await prepararContextoEmision(cursoId);
+
+    // Elegibles: aprobados de ESTE curso, con usuario, con nombre y DNI (eso
+    // es lo que significa estado "aprobado"), no apartados —los apartados
+    // viven en otra lista— y sin certificado vigente.
+    const candidatos = padron.participantes.filter(
+      (participante) =>
+        participante.estado === "aprobado" &&
+        participante.apartado !== true &&
+        participante.certificadoEmitido !== true &&
+        Boolean(participante.usuarioDocId)
+    );
+
+    let emitidos = 0;
+    // Arranca en los que ya venían emitidos y suma los que resulten emitidos
+    // por otro administrador mientras esto corre.
+    let yaEmitidos = padron.participantes.filter(
+      (participante) => participante.certificadoEmitido === true
+    ).length;
+
+    const errores: { usuarioDocId: string; apellidoNombre: string; mensaje: string }[] = [];
+
+    for (let i = 0; i < candidatos.length; i += EMISION_MASIVA_LOTE) {
+      const lote = candidatos.slice(i, i + EMISION_MASIVA_LOTE);
+
+      // allSettled y no all: que una persona falle no puede abortar el lote ni
+      // deshacer los certificados ya escritos. Cada emisión es independiente.
+      const resultados = await Promise.allSettled(
+        lote.map((participante) =>
+          emitirCertificadoParaUsuario({
+            cursoId,
+            usuarioDocId: participante.usuarioDocId,
+            authUser,
+            contexto,
+          })
+        )
+      );
+
+      resultados.forEach((resultado, indice) => {
+        const participante = lote[indice];
+
+        if (resultado.status === "fulfilled") {
+          emitidos += 1;
+          return;
+        }
+
+        const error: any = resultado.reason;
+
+        if (error?.codigo === "ya_emitido") {
+          yaEmitidos += 1;
+          return;
+        }
+
+        errores.push({
+          usuarioDocId: participante.usuarioDocId,
+          apellidoNombre: participante.apellidoNombre || "",
+          mensaje: String(error?.message || "No se pudo emitir el certificado."),
+        });
+      });
+    }
+
+    console.log(
+      `[sidca-chatbot-backend] emisión masiva curso=${cursoId} candidatos=${candidatos.length} emitidos=${emitidos} yaEmitidos=${yaEmitidos} errores=${errores.length} por=${authUser.uid}`
+    );
+
+    // 200 y no 201 aunque haya creado documentos: es un resultado agregado, y
+    // "no había nadie pendiente" es un desenlace normal, no un error.
+    return res.status(200).json({
+      ok: true,
+      modulo: "certificados",
+      cursoId,
+      totalAprobados: padron.resumen.aprobados,
+      candidatos: candidatos.length,
+      emitidos,
+      yaEmitidos,
+      omitidos: {
+        apartados: padron.resumen.excluidos,
+        datosIncompletos: padron.resumen.datosIncompletos,
+        sinUsuario: padron.resumen.sinUsuario,
       },
+      // Sin tokens ni URLs: son datos sensibles y no hacen falta para el
+      // resumen. Quien necesite uno lo pide por el endpoint individual.
+      errores,
     });
   } catch (error: any) {
     return sendCertificadosError(res, error);
@@ -3730,6 +4097,480 @@ app.post(
     }
   }
 );
+
+// ============================================================
+// DESCARGA MASIVA EN PDF
+//
+// El navegador sólo orquesta: pide iniciar, consulta el estado y descarga.
+// La generación corre en un Cloud Run Job aparte, porque un PDF de mil
+// páginas no entra en el tiempo ni en la memoria de un request HTTP.
+//
+// Esto NO emite certificados: sólo lee los que ya están emitidos y vigentes.
+// ============================================================
+
+/** Estados del trabajo. Los comparte con el Job y con la pantalla. */
+const PDF_ESTADO_PENDIENTE = "pendiente";
+const PDF_ESTADO_PROCESANDO = "procesando";
+const PDF_ESTADO_COMPLETADO = "completado";
+const PDF_ESTADO_ERROR = "error";
+
+/**
+ * Estados que significan "todavía trabajando".
+ *
+ * Incluye el vocabulario anterior —preparando, generando, finalizando, listo—
+ * para que un trabajo que quedó en vuelo con la versión previa se siga
+ * interpretando bien en lugar de aparecer como colgado.
+ */
+const PDF_ESTADOS_EN_CURSO = new Set([
+  PDF_ESTADO_PENDIENTE,
+  PDF_ESTADO_PROCESANDO,
+  "preparando",
+  "generando",
+  "finalizando",
+]);
+
+const pdfTrabajoCompletado = (trabajo: FirestoreRecord | null) =>
+  trabajo?.estado === PDF_ESTADO_COMPLETADO || trabajo?.estado === "listo";
+
+/** Nombre del objeto en Storage. Determinístico y sin datos personales. */
+const pdfObjectName = (cursoId: string, jobId: string) =>
+  `certificados-pdf/${cursoId}/${jobId}.pdf`;
+
+/**
+ * Identificador del trabajo tal como llega en la URL.
+ *
+ * Se valida con el mismo formato que el resto de los identificadores del
+ * módulo: termina interpolado en rutas de Firestore y de Storage, así que no
+ * puede llevar barras ni puntos suspensivos.
+ */
+function parseTrabajoPdfIdParam(valor: unknown): string {
+  const jobId = String(valor ?? "").trim();
+
+  if (!CERTIFICADO_ID_REGEX.test(jobId)) {
+    throw Object.assign(new Error("El identificador del trabajo es inválido."), {
+      statusCode: 400,
+    });
+  }
+
+  return jobId;
+}
+
+/** Quita del nombre de archivo lo que Windows y los navegadores no aceptan. */
+const sanitizarNombreArchivo = (valor: string) =>
+  String(valor || "")
+    .replace(/[\\/:*?"<>|\r\n]/g, "-")
+    .trim()
+    .slice(0, 120) || "certificados";
+
+app.post("/api/certificados/admin/pdf-masivo/:cursoId/iniciar", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    await requireAdministrador(authUser);
+
+    // parseCursoIdParam y no un String() suelto: el cursoId se interpola en
+    // rutas de Firestore y de Storage.
+    const cursoId = parseCursoIdParam(req.params.cursoId);
+
+    const certificado = await getFirestoreDoc(`certificados/${cursoId}`);
+
+    if (!certificado) {
+      throw Object.assign(
+        new Error("No existe la configuración de certificado de este curso."),
+        { statusCode: 404 }
+      );
+    }
+
+    // Un solo trabajo activo por curso: dos clics seguidos no generan dos
+    // PDFs iguales, se devuelve el que ya está corriendo.
+    const jobActual = String(certificado.pdfMasivoJobActual || "").trim();
+
+    if (jobActual) {
+      const enCurso = await getFirestoreDoc(
+        `certificados/${cursoId}/trabajosPdf/${jobActual}`
+      );
+
+      if (enCurso && PDF_ESTADOS_EN_CURSO.has(String(enCurso.estado))) {
+        return res.status(200).json({ ok: true, trabajo: enCurso, reutilizado: true });
+      }
+    }
+
+    // Aislamiento por curso: sólo la subcolección de ESTE curso, sólo
+    // vigentes. Nunca un collectionGroup.
+    const emitidos = await queryFirestoreChildCollection(
+      `certificados/${cursoId}`,
+      "emitidos",
+      [{ field: "estado", value: EMITIDOS_ESTADO_VIGENTE }],
+      APROBADOS_MAX_RESULTADOS
+    );
+
+    if (!emitidos.length) {
+      throw Object.assign(
+        new Error("No hay certificados vigentes emitidos para generar el PDF."),
+        { statusCode: 409 }
+      );
+    }
+
+    // El título real sale del curso académico. Si no está, se cae al de la
+    // configuración; el cursoId es el último recurso.
+    const curso = await getFirestoreDoc(`cursos/${cursoId}`);
+    const tituloCurso = String(
+      curso?.titulo || certificado.cursoTitulo || cursoId
+    );
+
+    const jobId = crypto.randomUUID();
+    const ahora = new Date();
+
+    const trabajo = {
+      jobId,
+      cursoId,
+      estado: PDF_ESTADO_PENDIENTE,
+      total: emitidos.length,
+      procesados: 0,
+      porcentaje: 0,
+      creadoEn: ahora,
+      iniciadoEn: null,
+      actualizadoEn: ahora,
+      finalizadoEn: null,
+      transcurridoMs: 0,
+      restanteEstimadoMs: null,
+      finalizacionEstimada: null,
+      objectName: pdfObjectName(cursoId, jobId),
+      storagePath: pdfObjectName(cursoId, jobId),
+      tamanioBytes: 0,
+      creadoPor: authUser.uid,
+      error: null,
+      nombreArchivo: `Certificados - ${sanitizarNombreArchivo(tituloCurso)}.pdf`,
+    };
+
+    await createFirestoreDoc(`certificados/${cursoId}/trabajosPdf`, jobId, trabajo);
+    await updateFirestoreDoc(`certificados/${cursoId}`, { pdfMasivoJobActual: jobId });
+
+    const proyecto =
+      process.env.GCLOUD_PROJECT || process.env.FIREBASE_PROJECT_ID || "";
+    const region = process.env.CERTIFICADOS_PDF_JOB_REGION || "us-central1";
+    const nombreJob = process.env.CERTIFICADOS_PDF_JOB_NAME;
+    const bucket = process.env.CERTIFICADOS_PDF_BUCKET;
+
+    try {
+      if (!nombreJob) throw new Error("Falta configurar CERTIFICADOS_PDF_JOB_NAME.");
+      if (!bucket) throw new Error("Falta configurar CERTIFICADOS_PDF_BUCKET.");
+
+      // Overrides de ESTA ejecución solamente: el Job queda igual para la
+      // siguiente. Nunca se reconfigura el recurso por cada pedido.
+      //
+      // La forma importa: `overrides` en la raíz, `containerOverrides` como
+      // arreglo dentro suyo y `taskCount` hermano de containerOverrides. Si
+      // algo de eso se anida mal, Cloud Run acepta el pedido igual —los
+      // campos desconocidos se descartan— y la ejecución arranca SIN las
+      // variables, que es exactamente el síntoma a diagnosticar.
+      const cuerpoRun = {
+        overrides: {
+          containerOverrides: [
+            {
+              env: [
+                { name: "CERTIFICADOS_PDF_CURSO_ID", value: cursoId },
+                { name: "CERTIFICADOS_PDF_TRABAJO_ID", value: jobId },
+                // Se mantiene el nombre anterior por si la imagen desplegada
+                // todavía no estuviera actualizada.
+                { name: "CERTIFICADOS_PDF_JOB_ID", value: jobId },
+                { name: "CERTIFICADOS_PDF_BUCKET", value: bucket },
+              ],
+            },
+          ],
+          taskCount: 1,
+        },
+      };
+
+      const urlRun = `https://run.googleapis.com/v2/projects/${proyecto}/locations/${region}/jobs/${nombreJob}:run`;
+
+      // Log de diagnóstico. Deliberadamente NO incluye el header Authorization
+      // ni el access token: sólo el JSON que realmente sale.
+      console.log("[certificados-pdf] Ejecutando Cloud Run Job", {
+        cursoId,
+        jobId,
+        bucket,
+        jobName: nombreJob,
+        region,
+        url: urlRun,
+        body: JSON.stringify(cuerpoRun),
+      });
+
+      const respuesta = await fetch(urlRun, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${await getGoogleAccessToken()}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(cuerpoRun),
+      });
+
+      // Se lee como texto antes de interpretar: si Cloud Run devuelve un error
+      // en HTML o vacío, un .json() directo enmascararía la causa real.
+      const textoRespuesta = await respuesta.text();
+
+      if (!respuesta.ok) {
+        throw new Error(
+          `Cloud Run respondió ${respuesta.status}: ${textoRespuesta.slice(0, 300)}`
+        );
+      }
+
+      // :run devuelve una Operation de larga duración, no la Execution. El
+      // nombre de la ejecución, cuando viene, está en metadata.name.
+      let operacion: any = null;
+      try {
+        operacion = JSON.parse(textoRespuesta);
+      } catch {
+        operacion = null;
+      }
+
+      const operationName = String(operacion?.name || "");
+      const executionName = String(operacion?.metadata?.name || "");
+
+      console.log("[certificados-pdf] Cloud Run aceptó la ejecución", {
+        operationName,
+        executionName,
+      });
+
+      // Se guarda para poder correlacionar el trabajo con la ejecución al
+      // depurar. Campo nuevo: no rompe nada de lo que ya lee la pantalla.
+      if (operationName || executionName) {
+        await updateFirestoreDoc(
+          `certificados/${cursoId}/trabajosPdf/${jobId}`,
+          {
+            cloudRunOperationName: operationName,
+            cloudRunExecutionName: executionName,
+            actualizadoEn: new Date(),
+          }
+        ).catch(() => undefined);
+      }
+    } catch (fallo: any) {
+      // El documento ya existe y el curso ya lo apunta como actual: si no se
+      // marca el error, el curso queda con un trabajo "pendiente" eterno que
+      // bloquea todos los intentos siguientes.
+      await updateFirestoreDoc(`certificados/${cursoId}/trabajosPdf/${jobId}`, {
+        estado: PDF_ESTADO_ERROR,
+        error: "No se pudo iniciar la generación del PDF.",
+        finalizadoEn: new Date(),
+        actualizadoEn: new Date(),
+      }).catch(() => undefined);
+
+      console.error("[sidca-chatbot-backend] no se pudo lanzar el Job PDF", fallo);
+
+      throw Object.assign(
+        new Error("No se pudo iniciar la generación del PDF masivo."),
+        { statusCode: 502 }
+      );
+    }
+
+    console.log(
+      `[sidca-chatbot-backend] pdf masivo iniciado curso=${cursoId} job=${jobId} certificados=${emitidos.length} por=${authUser.uid}`
+    );
+
+    return res.status(202).json({ ok: true, trabajo });
+  } catch (error: any) {
+    return sendCertificadosError(res, error);
+  }
+});
+
+/**
+ * Trabajo vigente del curso. Es lo que permite retomar el progreso después de
+ * un F5, de cerrar el navegador o de perder la conexión: la generación vive en
+ * Firestore, no en la pestaña.
+ */
+app.get("/api/certificados/admin/pdf-masivo/:cursoId/actual", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    await requireAdministrador(authUser);
+
+    const cursoId = parseCursoIdParam(req.params.cursoId);
+    const certificado = await getFirestoreDoc(`certificados/${cursoId}`);
+    const jobId = String(certificado?.pdfMasivoJobActual || "").trim();
+
+    const trabajo = jobId
+      ? await getFirestoreDoc(`certificados/${cursoId}/trabajosPdf/${jobId}`)
+      : null;
+
+    return res.status(200).json({
+      ok: true,
+      trabajo: trabajo
+        ? { ...trabajo, listoParaDescargar: pdfTrabajoCompletado(trabajo) }
+        : null,
+    });
+  } catch (error: any) {
+    return sendCertificadosError(res, error);
+  }
+});
+
+app.get("/api/certificados/admin/pdf-masivo/:cursoId/:jobId", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    await requireAdministrador(authUser);
+
+    const cursoId = parseCursoIdParam(req.params.cursoId);
+    const jobId = parseTrabajoPdfIdParam(req.params.jobId);
+
+    const trabajo = await getFirestoreDoc(
+      `certificados/${cursoId}/trabajosPdf/${jobId}`
+    );
+
+    if (!trabajo) {
+      throw Object.assign(new Error("El trabajo indicado no existe."), {
+        statusCode: 404,
+      });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      // La ruta del objeto no viaja: el navegador no la necesita y el endpoint
+      // de descarga la lee del documento, no del pedido.
+      trabajo: {
+        ...trabajo,
+        objectName: undefined,
+        storagePath: undefined,
+        listoParaDescargar: pdfTrabajoCompletado(trabajo),
+      },
+    });
+  } catch (error: any) {
+    return sendCertificadosError(res, error);
+  }
+});
+
+app.get("/api/certificados/admin/pdf-masivo/:cursoId/:jobId/descargar", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    await requireAdministrador(authUser);
+
+    const cursoId = parseCursoIdParam(req.params.cursoId);
+    const jobId = parseTrabajoPdfIdParam(req.params.jobId);
+
+    const trabajo = await getFirestoreDoc(
+      `certificados/${cursoId}/trabajosPdf/${jobId}`
+    );
+
+    if (!trabajo) {
+      throw Object.assign(new Error("El trabajo indicado no existe."), {
+        statusCode: 404,
+      });
+    }
+
+    if (!pdfTrabajoCompletado(trabajo)) {
+      throw Object.assign(new Error("El PDF todavía no está listo."), {
+        statusCode: 409,
+      });
+    }
+
+    // El objeto NUNCA se toma del pedido. Se lee del documento del trabajo y,
+    // además, se exige que coincida con la ruta determinística de ESTE curso y
+    // ESTE trabajo: aunque alguien lograra escribir el documento, no podría
+    // hacer que el endpoint sirva un archivo arbitrario del bucket.
+    const objectName = String(trabajo.objectName || trabajo.storagePath || "");
+    const esperado = pdfObjectName(cursoId, jobId);
+
+    if (objectName !== esperado) {
+      console.error(
+        `[sidca-chatbot-backend] objectName inesperado curso=${cursoId} job=${jobId}`
+      );
+      throw Object.assign(new Error("El archivo del trabajo no es válido."), {
+        statusCode: 409,
+      });
+    }
+
+    const bucket = process.env.CERTIFICADOS_PDF_BUCKET;
+
+    if (!bucket) {
+      throw Object.assign(new Error("La descarga no está configurada."), {
+        statusCode: 500,
+      });
+    }
+
+    console.log("[certificados-pdf] Descarga", {
+      cursoId,
+      jobId,
+      estado: trabajo.estado,
+      objectName: trabajo.objectName,
+      tamanioBytes: trabajo.tamanioBytes,
+      esperado,
+    });
+
+    // Se lee por la API JSON de Storage y NO con `new Storage()`.
+    //
+    // El SDK resuelve credenciales por ADC, que en Cloud Run funciona pero en
+    // una máquina de desarrollo exige `gcloud auth application-default login`:
+    // sin eso falla con "Could not load the default credentials" antes de
+    // emitir un solo pedido. getGoogleAccessToken() es el helper que ya usa
+    // todo el backend y cubre los dos casos —GOOGLE_OAUTH_ACCESS_TOKEN en
+    // local, Metadata Server en producción—, así que la descarga se comporta
+    // igual en ambos entornos y con la misma identidad de siempre.
+    const urlObjeto = `https://storage.googleapis.com/storage/v1/b/${encodeURIComponent(
+      bucket
+    )}/o/${encodeURIComponent(objectName)}?alt=media`;
+
+    console.log("[certificados-pdf] Storage descarga", { bucket, objectName });
+
+    const objeto = await fetch(urlObjeto, {
+      headers: { Authorization: `Bearer ${await getGoogleAccessToken()}` },
+    });
+
+    if (!objeto.ok || !objeto.body) {
+      const detalle = await objeto.text().catch(() => "");
+
+      console.error(
+        `[sidca-chatbot-backend] Storage ${objeto.status} al leer ${objectName}: ${detalle.slice(0, 300)}`
+      );
+
+      // Cada causa con su código: un problema de permisos no puede volver a
+      // disfrazarse de "todavía no está listo".
+      if (objeto.status === 404) {
+        throw Object.assign(
+          new Error("El archivo del PDF no está disponible en el almacenamiento."),
+          { statusCode: 409 }
+        );
+      }
+
+      if (objeto.status === 401 || objeto.status === 403) {
+        throw Object.assign(
+          new Error("El servidor no tiene permiso para leer el PDF generado."),
+          { statusCode: 500 }
+        );
+      }
+
+      throw Object.assign(new Error("No se pudo leer el PDF generado."), {
+        statusCode: 502,
+      });
+    }
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${sanitizarNombreArchivo(
+        String(trabajo.nombreArchivo || "certificados.pdf")
+      )}"`
+    );
+
+    // El tamaño lo informa Storage, no el documento del trabajo: si por lo que
+    // fuera no coincidieran, mentirle al navegador cortaría la descarga.
+    const largo = objeto.headers.get("content-length");
+    if (largo) res.setHeader("Content-Length", largo);
+
+    // Streaming: el PDF no pasa por la memoria del backend. Nada de download()
+    // ni de Buffer. El bucket sigue privado; esta es la única puerta y está
+    // detrás del ID Token administrativo.
+    Readable.fromWeb(objeto.body as any)
+      .on("error", (fallo) => {
+        console.error("[sidca-chatbot-backend] error al transmitir el PDF", fallo);
+        // Con el cuerpo ya empezado no se puede cambiar el código de estado:
+        // sólo queda cortar.
+        if (!res.headersSent) {
+          res.status(502).json({ ok: false, error: "No se pudo leer el PDF generado." });
+          return;
+        }
+        res.end();
+      })
+      .pipe(res);
+  } catch (error: any) {
+    return sendCertificadosError(res, error);
+  }
+});
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`[sidca-chatbot-backend] running on http://0.0.0.0:${PORT}`);
