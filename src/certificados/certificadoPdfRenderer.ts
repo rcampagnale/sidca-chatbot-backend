@@ -43,6 +43,31 @@ const pct = (page: number, value: number) => page * value / 100;
 const cqw = (doc: PDFKit.PDFDocument, valor: number) => (doc.page.width * valor) / 100;
 
 /**
+ * Banda reservada para el TÍTULO del curso.
+ *
+ * Medida sobre las dos plantillas: la leyenda "Participó y aprobó el curso
+ * denominado" termina en 42,57% del alto (SIDCA) / 41,80% (ITM) y la línea
+ * "Modalidad…" empieza en 49,08% / 48,94%. La intersección que sirve para
+ * ambas va de 42,6% a 48,9%; descontando un resguardo quedan 84 px de 1414,
+ * centrados en 45,76%.
+ *
+ * El bloque crece simétrico desde ese centro, así que una, dos o tres líneas
+ * quedan siempre equilibradas dentro de la banda y nunca tocan las leyendas.
+ *
+ * Estas constantes son las MISMAS que usa la vista previa del frontend: si se
+ * cambian acá, hay que cambiarlas allá o el PDF dejará de reproducir lo que se
+ * ve en pantalla.
+ */
+const TITULO = {
+  cuerpoMax: 2.3, // cqw
+  cuerpoMin: 0.9, // cqw
+  interlinea: 1.1,
+  lineasMax: 2,
+  altoMax: 6.0, // cqw — banda física del título
+  centroY: 45.6, // % del alto de la página
+};
+
+/**
  * Cuerpo más grande que hace entrar el texto en el ancho de su caja.
  *
  * widthOfString() mide con la fuente y el cuerpo ACTIVOS del documento: no
@@ -154,7 +179,6 @@ export async function renderCertificadoPdfPage(
   // y tienen que leerse con la misma altura de letra, sin importar que uno
   // tenga siete caracteres y otro veinticuatro.
   const FS_DATO = cqw(doc, 2.2);
-  const FS_TITULO = cqw(doc, 2.6);
   const FS_SECUNDARIO = cqw(doc, 2.1);
   // Los días llevan cuerpo propio, más chico que el resto de los datos: un
   // rango completo son veinticuatro caracteres y a 2.2cqw ocupaba el 100% de
@@ -164,10 +188,72 @@ export async function renderCertificadoPdfPage(
 
   const [nx, ny, nw] = LAYOUT.nombre; dibujarUnaLinea(nombre, pct(doc.page.width, nx), pct(doc.page.height, ny) - 8, pct(doc.page.width, nw), FS_DATO, { bold: true, compresionMinima: 0.55 });
   const [dx, dy, dw] = LAYOUT.dni; dibujarUnaLinea(formatDni(dni), pct(doc.page.width, dx), pct(doc.page.height, dy) - 7, pct(doc.page.width, dw), FS_DATO, { bold: true, compresionMinima: 0.7 });
-  // El título es el único que puede pasar a dos líneas, así que sigue
-  // resolviéndose bajando el cuerpo: comprimirlo horizontalmente a lo ancho
-  // de su caja del 66% lo dejaría deformado.
-  const [tx, ty, tw] = LAYOUT.titulo; draw(certificado.titulo, pct(doc.page.width, tx), pct(doc.page.height, ty) - 9, pct(doc.page.width, tw), FS_TITULO, { bold: true, minimo: cqw(doc, 1.5) });
+  // El título es el único campo que puede envolver, así que no se comprime
+  // horizontalmente —a lo ancho de su caja del 66% quedaría deformado— sino
+  // que se busca el cuerpo más grande que entre en la banda disponible.
+  //
+  // La medición es real: heightOfString devuelve el alto que PDFKit va a
+  // ocupar de verdad con ese ancho y ese interlineado, contando el
+  // envolvimiento por palabras. Contar caracteres no serviría: una "M" y una
+  // "i" no miden lo mismo.
+  const [tx, , tw] = LAYOUT.titulo;
+  const tituloTexto = text(certificado.titulo);
+
+  if (tituloTexto) {
+    const anchoTitulo = pct(doc.page.width, tw);
+    const altoMaximo = cqw(doc, TITULO.altoMax);
+    const cuerpoMinimo = cqw(doc, TITULO.cuerpoMin);
+
+    doc.font("Helvetica-Bold");
+
+    // Interlineado compacto. PDFKit no expone line-height: se compensa con
+    // lineGap. El alto natural del renglón se MIDE —midiendo una sola letra
+    // con lineGap 0— en vez de deducirlo de currentLineHeight(), que devuelve
+    // un valor distinto del que heightOfString termina aplicando: por eso el
+    // renglón salía a 1,365 × cuerpo y dos líneas no entraban nunca.
+    const medir = (cuerpo: number) => {
+      doc.fontSize(cuerpo);
+      const alturaNatural = doc.heightOfString("M", {
+        width: anchoTitulo,
+        lineGap: 0,
+      });
+      const lineGap = cuerpo * TITULO.interlinea - alturaNatural;
+      const alto = doc.heightOfString(tituloTexto, {
+        width: anchoTitulo,
+        align: "center",
+        lineGap,
+      });
+      return {
+        lineGap,
+        alto,
+        lineas: Math.max(1, Math.round(alto / (cuerpo * TITULO.interlinea))),
+      };
+    };
+
+    let cuerpo = cqw(doc, TITULO.cuerpoMax);
+    let medida = medir(cuerpo);
+
+    // Se baja de a poco hasta que entra en alto Y no pasa de tres líneas. El
+    // piso evita que un título disparatado quede ilegible: llegado ahí se
+    // dibuja igual, nunca se recorta ni se abrevia.
+    while (
+      cuerpo > cuerpoMinimo &&
+      (medida.alto > altoMaximo || medida.lineas > TITULO.lineasMax)
+    ) {
+      cuerpo = Math.max(cuerpoMinimo, cuerpo - 0.25);
+      medida = medir(cuerpo);
+    }
+
+    // Centrado vertical del BLOQUE completo dentro de la banda: con una, dos
+    // o tres líneas el conjunto queda siempre equilibrado.
+    doc.fontSize(cuerpo).fillColor("#111827");
+    doc.text(
+      tituloTexto,
+      pct(doc.page.width, tx),
+      pct(doc.page.height, TITULO.centroY) - medida.alto / 2,
+      { width: anchoTitulo, align: "center", lineGap: medida.lineGap }
+    );
+  }
   const [mx, my, mw] = LAYOUT.modalidad; dibujarUnaLinea(text(certificado.modalidad).toUpperCase(), pct(doc.page.width, mx), pct(doc.page.height, my) - 6, pct(doc.page.width, mw), FS_SECUNDARIO, { bold: true, compresionMinima: 0.8 });
   const [daysX, daysY, daysW] = LAYOUT.dias; dibujarUnaLinea(text(certificado.dias).toUpperCase(), pct(doc.page.width, daysX), pct(doc.page.height, daysY) - 6, pct(doc.page.width, daysW), FS_DIAS, { bold: true, compresionMinima: 0.85 });
   const [cx, cy, cw] = LAYOUT.carga; dibujarUnaLinea(text(certificado.cargaHoraria).toUpperCase(), pct(doc.page.width, cx), pct(doc.page.height, cy) - 6, pct(doc.page.width, cw), FS_SECUNDARIO, { bold: true, compresionMinima: 0.8 });
