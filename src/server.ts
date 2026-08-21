@@ -41,6 +41,90 @@ const upload = multer({
   },
 });
 
+const registroInscriptosUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { files: 10, fileSize: 15 * 1024 * 1024 },
+});
+const registroExcelMimeTypes = new Set([
+  "application/vnd.ms-excel",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "application/octet-stream",
+]);
+
+function nombreArchivoRegistroSeguro(nombre: string): string {
+  const base = String(nombre || "archivo.xlsx").replace(/[\\/\0-\x1f]/g, "_").replace(/[^a-zA-Z0-9._-]+/g, "_");
+  return base.slice(0, 180) || "archivo.xlsx";
+}
+
+function validarArchivoRegistro(file: Express.Multer.File): void {
+  const extension = String(file.originalname || "").toLowerCase().split(".").pop();
+  if (!["xls", "xlsx"].includes(extension || "")) {
+    throw Object.assign(new Error("Sólo se permiten archivos Excel .xls o .xlsx."), { statusCode: 400 });
+  }
+  if (!registroExcelMimeTypes.has(String(file.mimetype || "").toLowerCase())) {
+    throw Object.assign(new Error("El archivo no tiene un tipo Excel válido."), { statusCode: 400 });
+  }
+  if (!file.buffer?.length || file.size > 15 * 1024 * 1024) {
+    throw Object.assign(new Error("Cada planilla debe pesar como máximo 15 MB."), { statusCode: 400 });
+  }
+}
+
+function normalizarBucket(valor: unknown): string {
+  return String(valor || "").trim().replace(/^gs:\/\//i, "").replace(/\/+$/, "");
+}
+
+function bucketRegistroInscriptos() {
+  const bucketNombre = normalizarBucket(
+    process.env.FIREBASE_STORAGE_BUCKET ||
+      process.env.STORAGE_BUCKET ||
+      process.env.GCS_BUCKET ||
+      process.env.CERTIFICADOS_PDF_BUCKET
+  );
+  if (!bucketNombre) throw Object.assign(new Error("La descarga de planillas no está configurada."), { statusCode: 500 });
+  return bucketNombre;
+}
+
+async function storageRegistroRequest(
+  method: "GET" | "POST" | "DELETE",
+  bucket: string,
+  objectName: string,
+  options: { mimeType?: string; body?: Buffer; media?: boolean } = {}
+): Promise<Response> {
+  const url = method === "POST"
+    ? `https://storage.googleapis.com/upload/storage/v1/b/${encodeURIComponent(bucket)}/o?uploadType=media&name=${encodeURIComponent(objectName)}`
+    : `https://storage.googleapis.com/storage/v1/b/${encodeURIComponent(bucket)}/o/${encodeURIComponent(objectName)}${method === "GET" ? "?alt=media" : ""}`;
+  return fetch(url, {
+    method,
+    headers: {
+      Authorization: `Bearer ${await getGoogleAccessToken()}`,
+      ...(options.mimeType ? { "Content-Type": options.mimeType } : {}),
+      ...(options.body ? { "Content-Length": String(options.body.length) } : {}),
+    },
+    ...(options.body ? { body: options.body as any } : {}),
+  });
+}
+
+async function storageRegistroError(response: Response): Promise<never> {
+  const detail = (await response.text().catch(() => "")).replace(/\s+/g, " ").slice(0, 240);
+  throw Object.assign(new Error(`Google Storage ${response.status}${detail ? `: ${detail}` : ""}`), { storageHttpStatus: response.status, statusCode: response.status >= 500 ? 502 : response.status });
+}
+
+async function uploadGoogleStorageObject(bucket: string, objectName: string, body: Buffer, mimeType: string): Promise<void> {
+  const response = await storageRegistroRequest("POST", bucket, objectName, { body, mimeType, media: true });
+  if (!response.ok) await storageRegistroError(response);
+}
+
+async function deleteGoogleStorageObject(bucket: string, objectName: string): Promise<void> {
+  const response = await storageRegistroRequest("DELETE", bucket, objectName);
+  if (!response.ok && response.status !== 404) await storageRegistroError(response);
+}
+
+async function downloadGoogleStorageObject(bucket: string, objectName: string): Promise<Buffer> {
+  const response = await storageRegistroRequest("GET", bucket, objectName);
+  if (!response.ok) await storageRegistroError(response);
+  return Buffer.from(await response.arrayBuffer());
+}
+
 const bodySchema = z.object({
   pregunta: z.string().trim().min(2, "La pregunta es obligatoria"),
   dominio: z
@@ -479,6 +563,24 @@ async function setFirestoreDoc(
   return firestoreDocToJs(doc);
 }
 
+/**
+ * Firestore REST responses expose document paths as full resource names
+ * (projects/.../documents/collection/id), while the REST helpers above expect
+ * the relative path after /documents/.
+ */
+function getFirestoreRelativePath(value: FirestoreRecord | string): string {
+  const raw = typeof value === "string"
+    ? value
+    : String(value?.path || value?._name || "");
+  const normalized = raw.trim();
+  if (!normalized) throw new Error("Ruta Firestore vacía.");
+  const marker = "/documents/";
+  const markerIndex = normalized.indexOf(marker);
+  return markerIndex >= 0
+    ? normalized.slice(markerIndex + marker.length)
+    : normalized.replace(/^\/+/, "");
+}
+
 async function updateFirestoreDoc(
   path: string,
   data: Record<string, any>
@@ -737,6 +839,74 @@ async function queryFirestoreChildCollection(
     .map((doc) => firestoreDocToJs(doc));
 }
 
+function cursoIdDesdeRegistroInscriptos(archivo: FirestoreRecord): string {
+  const cursoId = String(archivo?.cursoId || "").trim();
+  if (cursoId) return cursoId;
+
+  const relativePath = getFirestoreRelativePath(archivo);
+  const match = relativePath.match(/^certificados\/([^/]+)\/registroInscriptos\/[^/]+$/);
+  return String(match?.[1] || "").trim();
+}
+
+function fechaRegistroInscriptos(archivo: FirestoreRecord): number {
+  const timestamp = Date.parse(String(archivo?.subidoEn || ""));
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+async function listarRegistroInscriptosActivos(): Promise<any[]> {
+  let archivos: FirestoreRecord[];
+  try {
+    archivos = await queryFirestoreCollectionGroup(
+      "registroInscriptos",
+      [],
+      10_000
+    );
+  } catch (error) {
+    console.error("[sidca-chatbot-backend] Error consultando collection group registroInscriptos:", error);
+    throw error;
+  }
+
+  const activos = archivos.filter((archivo) => archivo.activo === true);
+  const porCurso = new Map<string, { cursoId: string; titulo?: string; archivos: any[] }>();
+  for (const archivo of activos) {
+    const cursoId = cursoIdDesdeRegistroInscriptos(archivo);
+    if (!cursoId) {
+      console.warn("[sidca-chatbot-backend] Planilla activa sin cursoId ni ruta válida:", archivo.path || archivo.id);
+      continue;
+    }
+    const tituloCurso = String(archivo.tituloCurso || "").trim();
+    const curso = porCurso.get(cursoId) || { cursoId, titulo: tituloCurso, archivos: [] };
+    if (!curso.titulo && tituloCurso) curso.titulo = tituloCurso;
+    curso.archivos.push({
+      archivoId: String(archivo.archivoId || archivo.id || ""),
+      nombreOriginal: String(archivo.nombreOriginal || "planilla.xlsx"),
+      size: archivo.size,
+      mimeType: archivo.mimeType,
+      subidoEn: archivo.subidoEn,
+    });
+    porCurso.set(cursoId, curso);
+  }
+
+  const cursos = await Promise.all([...porCurso.values()].map(async (curso) => {
+    if (!curso.titulo) {
+      const documentoCurso = await getFirestoreDoc(`cursos/${curso.cursoId}`);
+      curso.titulo = String(documentoCurso?.titulo || "").trim();
+    }
+    curso.titulo = curso.titulo || "Capacitación sin título";
+    curso.archivos.sort((a, b) => fechaRegistroInscriptos(b) - fechaRegistroInscriptos(a));
+    return {
+      cursoId: curso.cursoId,
+      titulo: curso.titulo,
+      cantidadArchivos: curso.archivos.length,
+      archivos: curso.archivos,
+    };
+  }));
+
+  const cursosOrdenados = cursos.sort((a, b) => String(a.titulo).localeCompare(String(b.titulo), "es", { sensitivity: "base" }));
+  console.info(`[registro-inscriptos] documentos collection-group=${archivos.length} activos=${activos.length} cursos=${cursosOrdenados.length}`);
+  return cursosOrdenados;
+}
+
 async function verifyFirebaseIdToken(authorization?: string): Promise<AuthenticatedUser> {
   const token = authorization?.startsWith("Bearer ")
     ? authorization.slice("Bearer ".length).trim()
@@ -771,24 +941,55 @@ async function verifyFirebaseIdToken(authorization?: string): Promise<Authentica
  * busca el UID en los campos históricos más habituales.
  */
 async function findUsuarioByAuthUid(uid: string): Promise<FirestoreRecord | null> {
-  const direct = await getFirestoreDoc(`usuarios/${uid}`);
-  if (direct) return direct;
+  for (const collection of ["usuarios", "nuevoAfiliado"]) {
+    const direct = await getFirestoreDoc(`${collection}/${uid}`);
+    if (direct) return direct;
+  }
 
   const uidFields = ["uid", "usuarioId", "userId", "authUid"];
 
   for (const field of uidFields) {
-    const matches = await queryFirestoreCollection(
-      "usuarios",
-      [{ field, value: uid }],
-      2
-    );
-
-    if (matches.length > 0) {
-      return matches[0];
+    for (const collection of ["usuarios", "nuevoAfiliado"]) {
+      const matches = await queryFirestoreCollection(collection, [{ field, value: uid }], 2);
+      if (matches.length > 0) return matches[0];
     }
   }
 
   return null;
+}
+
+async function findRegistrosValidadorByAuth(authUser: AuthenticatedUser): Promise<FirestoreRecord[]> {
+  const encontrados = new Map<string, FirestoreRecord>();
+  const agregar = (docs: FirestoreRecord[]) => docs.forEach((doc) => {
+    const key = String(doc.path || doc.name || `${doc.dni}:${doc.email || doc.correo || ""}`);
+    encontrados.set(key, doc);
+  });
+  const colecciones = ["usuarios", "nuevoAfiliado"] as const;
+  for (const coleccion of colecciones) {
+    const directo = await getFirestoreDoc(`${coleccion}/${authUser.uid}`);
+    if (directo) agregar([directo]);
+  }
+  for (const campo of ["uid", "usuarioId", "userId", "authUid"]) {
+    for (const coleccion of colecciones) {
+      agregar(await queryFirestoreCollection(coleccion, [{ field: campo, value: authUser.uid }], 50));
+    }
+  }
+  if (encontrados.size === 0 && authUser.email) {
+    const email = authUser.email.trim().toLowerCase();
+    for (const campo of ["email", "correo", "mail"]) {
+      for (const coleccion of colecciones) {
+        const candidatos = await queryFirestoreCollection(coleccion, [{ field: campo, value: authUser.email }], 100);
+        agregar(candidatos.filter((doc) => String(doc[campo] || "").trim().toLowerCase() === email));
+      }
+    }
+    if (encontrados.size === 0) {
+      for (const coleccion of colecciones) {
+        const todos = await queryFirestoreCollection(coleccion, [], 10000);
+        agregar(todos.filter((doc) => [doc.email, doc.correo, doc.mail].some((valor) => String(valor || "").trim().toLowerCase() === email)));
+      }
+    }
+  }
+  return [...encontrados.values()];
 }
 
 /**
@@ -802,23 +1003,29 @@ async function findUsuarioByAuthUid(uid: string): Promise<FirestoreRecord | null
 async function requireValidadorCertificados(
   authUser: AuthenticatedUser
 ): Promise<FirestoreRecord> {
-  const usuario = await findUsuarioByAuthUid(authUser.uid);
-
-  if (!usuario) {
+  const registros = await findRegistrosValidadorByAuth(authUser);
+  if (registros.length === 0) {
     throw Object.assign(
       new Error("El usuario autenticado no está registrado en SIDCA."),
       { statusCode: 403 }
     );
   }
 
-  if (usuario.validarCertificados !== true) {
+  const dnis = new Set(registros.map((doc) => normalizeDni(doc.dni)).filter(Boolean));
+  if (dnis.size > 1) {
+    console.warn(`[sidca-chatbot-backend] validador email ambiguo uid=${authUser.uid}`);
+    throw Object.assign(new Error("No tenés autorización para validar certificados SIDCA."), { statusCode: 403 });
+  }
+  const autorizado = registros.find((doc) => doc.validarCertificados === true);
+  console.info(`[sidca-chatbot-backend] validador resuelto uid=${authUser.uid} origen=${registros.map((d) => String(d.path || "").split("/")[0]).filter(Boolean).join("+")} dni=${[...dnis][0] || "-"} permiso=${Boolean(autorizado)}`);
+  if (!autorizado) {
     throw Object.assign(
       new Error("No tenés autorización para validar certificados SIDCA."),
       { statusCode: 403 }
     );
   }
 
-  return usuario;
+  return autorizado;
 }
 
 /**
@@ -1492,7 +1699,7 @@ const JOSE_UNAUTHORIZED_CODES = new Set([
  * Códigos HTTP que el módulo de certificados propaga tal cual cuando el
  * error los declara explícitamente.
  */
-const CERTIFICADOS_STATUS_CODES = new Set([400, 401, 403, 404, 409]);
+const CERTIFICADOS_STATUS_CODES = new Set([400, 401, 403, 404, 409, 503]);
 
 /**
  * Traduce un error del módulo de certificados a una respuesta HTTP segura.
@@ -1510,6 +1717,9 @@ function sendCertificadosError(
   const explicitStatus = Number(error?.statusCode ?? error?.status);
 
   if (CERTIFICADOS_STATUS_CODES.has(explicitStatus)) {
+    const mensajeSeguro = explicitStatus === 503
+      ? "La cuenta de servicio no tiene permisos para administrar Firebase Authentication."
+      : String(error?.message || "No se pudo completar la operación.");
     return res.status(explicitStatus).json({
       ok: false,
       modulo: "certificados",
@@ -1812,6 +2022,318 @@ function normalizarAutoridadesCertificado(
       orden: indice + 1,
     }));
 }
+
+const mapValidadorAdmin = (doc: FirestoreRecord) => ({
+  usuarioDocId: String(doc.path || "").split("/").pop() || "",
+  dni: doc.dni ?? "",
+  apellidoNombre: doc.apellidoNombre || buildNombreAfiliado(doc) || "",
+  email: doc.email || doc.correo || doc.mail || "",
+  validarCertificados: doc.validarCertificados === true,
+});
+
+const parseUsuarioDocId = (value: string) => {
+  const id = String(value || "").trim();
+  if (!id || /[\\/]/.test(id) || id.includes("..")) {
+    throw Object.assign(new Error("Identificador de usuario invÃ¡lido."), { statusCode: 400 });
+  }
+  return id;
+};
+
+async function identityToolkitAdminRequest(path: string, body: Record<string, any>) {
+  const token = await getGoogleAccessToken();
+  const quotaProject = String(process.env.GOOGLE_CLOUD_QUOTA_PROJECT || firebaseProjectId).trim() || firebaseProjectId;
+  const response = await fetch(`https://identitytoolkit.googleapis.com/v1/projects/${encodeURIComponent(firebaseProjectId)}${path}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+      "x-goog-user-project": quotaProject,
+    },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  });
+  const data = await response.json().catch(() => null);
+  if (!response.ok) {
+    const code = String(data?.error?.message || data?.error?.status || "");
+    const statusCode = code === "EMAIL_EXISTS" ? 409 : code === "WEAK_PASSWORD" ? 400 : response.status === 403 ? 503 : response.status;
+    throw Object.assign(new Error(code), { statusCode, identityCode: code });
+  }
+  return data || {};
+}
+
+async function buscarFirebaseAuthPorEmail(email: string) {
+  let data;
+  try { data = await identityToolkitAdminRequest("/accounts:lookup", { email: [email] }); }
+  catch (error: any) { if (["EMAIL_NOT_FOUND", "USER_NOT_FOUND"].includes(error.identityCode)) return { existe: false }; throw error; }
+  const user = Array.isArray(data.users) ? data.users[0] : null;
+  return user ? { existe: true, uid: user.localId, email: String(user.email || email).trim().toLowerCase(), disabled: user.disabled === true, displayName: user.displayName || "" } : { existe: false };
+}
+
+async function buscarFirebaseAuthPorUid(uid: string) {
+  let data;
+  try { data = await identityToolkitAdminRequest("/accounts:lookup", { localId: [uid] }); }
+  catch (error: any) { if (["EMAIL_NOT_FOUND", "USER_NOT_FOUND"].includes(error.identityCode)) return { existe: false }; throw error; }
+  const user = Array.isArray(data.users) ? data.users[0] : null;
+  return user ? { existe: true, uid: user.localId, email: String(user.email || "").trim().toLowerCase(), disabled: user.disabled === true, displayName: user.displayName || "" } : { existe: false };
+}
+
+async function crearFirebaseAuthValidador(email: string, password: string, displayName: string) {
+  const apiKey = String(process.env.FIREBASE_WEB_API_KEY || "").trim();
+  if (!apiKey) throw Object.assign(new Error("Falta configurar FIREBASE_WEB_API_KEY para crear accesos de validadores."), { statusCode: 500 });
+  return identityToolkitAdminRequest(`/accounts?key=${encodeURIComponent(apiKey)}`, { email, password, displayName, disabled: false });
+}
+
+async function actualizarFirebaseAuthValidador(uid: string, disableUser: boolean) {
+  return identityToolkitAdminRequest("/accounts:update", { localId: uid, disableUser });
+}
+
+async function resolverPersonaPorDocId(id: string) {
+  const usuarios = await getFirestoreDoc(`usuarios/${id}`);
+  if (usuarios) return usuarios;
+  return getFirestoreDoc(`nuevoAfiliado/${id}`);
+}
+
+async function registrosPorPersona(dni: string) {
+  const normalizado = normalizeDni(dni);
+  if (!normalizado) return [];
+  return (await Promise.all([findDocsByDni("usuarios", normalizado), findDocsByDni("nuevoAfiliado", normalizado)])).flat();
+}
+
+app.get("/api/certificados/admin/validadores", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    await requireAdministrador(authUser);
+    const [usuarios, nuevos] = await Promise.all([
+      queryFirestoreCollection("usuarios", [{ field: "validarCertificados", value: true }], 500),
+      queryFirestoreCollection("nuevoAfiliado", [{ field: "validarCertificados", value: true }], 500),
+    ]);
+    const unicos = new Map<string, FirestoreRecord>();
+    [...usuarios, ...nuevos].forEach((doc) => unicos.set(normalizeDni(doc.dni) || String(doc.path), doc));
+    const validadores = [...unicos.values()].map(mapValidadorAdmin).sort((a, b) => a.apellidoNombre.localeCompare(b.apellidoNombre, "es"));
+    return res.json({ ok: true, validadores });
+  } catch (error: any) { return sendCertificadosError(res, error); }
+});
+
+app.get("/api/certificados/admin/validadores/buscar", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    await requireAdministrador(authUser);
+    const consulta = String(req.query.q || "").trim();
+    if (!consulta) return res.json({ ok: true, usuarios: [] });
+    const consultaDni = consulta.replace(/\D/g, "");
+    const esBusquedaDni = Boolean(consultaDni) && /^[\d.\s]+$/.test(consulta);
+    const claveDocumento = (doc: FirestoreRecord) => {
+      const dni = normalizeDni(doc.dni);
+      return dni ? `dni:${dni}` : `registro:${String(doc.path || doc.name || "")}`;
+    };
+    const fusionar = (anterior: FirestoreRecord | undefined, actual: FirestoreRecord) => {
+      if (!anterior) return actual;
+      return {
+        ...anterior,
+        ...Object.fromEntries(Object.entries(actual).filter(([, valor]) => valor !== undefined && valor !== null && valor !== "")),
+      };
+    };
+    const unicos = new Map<string, FirestoreRecord>();
+    if (esBusquedaDni) {
+      const [porUsuarios, porNuevos] = await Promise.all([
+        findDocsByDni("usuarios", consultaDni),
+        findDocsByDni("nuevoAfiliado", consultaDni),
+      ]);
+      [...porUsuarios, ...porNuevos].forEach((doc) => {
+        if (claveDocumento(doc)) unicos.set(claveDocumento(doc), fusionar(unicos.get(claveDocumento(doc)), doc));
+      });
+      return res.json({ ok: true, usuarios: [...unicos.values()].map(mapValidadorAdmin) });
+    }
+    const [documentosUsuarios, documentosNuevos] = await Promise.all([
+      queryFirestoreCollection("usuarios", [], 10000),
+      queryFirestoreCollection("nuevoAfiliado", [], 10000),
+    ]);
+    const todos = [...documentosUsuarios, ...documentosNuevos];
+    const normal = (v: any) => String(v || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/\s+/g, " ").trim().toLowerCase();
+    const consultaNormalizada = normal(consulta);
+    todos.filter((doc) => [doc.dni, doc.apellido, doc.nombre, doc.apellidoNombre, doc.apellido_y_nombre, doc.apellidoYNombre, doc.email, doc.correo, doc.mail].some((v) => normal(v).includes(consultaNormalizada))).forEach((doc) => {
+      if (claveDocumento(doc)) unicos.set(claveDocumento(doc), fusionar(unicos.get(claveDocumento(doc)), doc));
+    });
+    const usuariosCoincidentes = [...unicos.values()].sort((a, b) => mapValidadorAdmin(a).apellidoNombre.localeCompare(mapValidadorAdmin(b).apellidoNombre, "es", { sensitivity: "base" })).slice(0, 25).map(mapValidadorAdmin);
+    return res.json({ ok: true, usuarios: usuariosCoincidentes });
+  } catch (error: any) { return sendCertificadosError(res, error); }
+});
+
+app.put("/api/certificados/admin/validadores/:usuarioDocId", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization); await requireAdministrador(authUser);
+    const id = parseUsuarioDocId(req.params.usuarioDocId);
+    const actual = await resolverPersonaPorDocId(id);
+    if (!actual) throw Object.assign(new Error("Usuario no encontrado."), { statusCode: 404 });
+    const dni = normalizeDni(actual.dni);
+    const documentos = dni ? await registrosPorPersona(dni) : [actual];
+    const emails = [...new Set(documentos.flatMap((doc) => [doc.email, doc.correo, doc.mail]).map((value) => String(value || "").trim().toLowerCase()).filter((value) => value.includes("@")))];
+    const emailSolicitado = String(req.body?.email || "").trim().toLowerCase();
+    if (emailSolicitado && emails.length && !emails.includes(emailSolicitado)) throw Object.assign(new Error("El correo no coincide con los datos de la persona seleccionada."), { statusCode: 409 });
+    const email = emails[0];
+    if (!email) throw Object.assign(new Error("La persona no tiene un correo registrado."), { statusCode: 409 });
+    const nombreCompleto = buildNombreAfiliado(actual);
+    let cuenta = actual.authUid ? await buscarFirebaseAuthPorUid(String(actual.authUid)) : { existe: false };
+    if (!cuenta.existe) cuenta = await buscarFirebaseAuthPorEmail(email);
+    const password = String(req.body?.passwordInicial || "");
+    let authGestionada = actual.authCertificadosGestionado === true;
+    if (!cuenta.existe) {
+      if (password.length < 8 || password.length > 128) throw Object.assign(new Error("La contraseña inicial debe tener entre 8 y 128 caracteres."), { statusCode: 400 });
+      const creada = await crearFirebaseAuthValidador(email, password, nombreCompleto);
+      cuenta = { existe: true, uid: creada.localId, email, disabled: false, displayName: nombreCompleto };
+      authGestionada = true;
+    } else if (cuenta.email && cuenta.email !== email) {
+      throw Object.assign(new Error("El correo ya está asociado a otra cuenta de acceso."), { statusCode: 409 });
+    } else if (cuenta.disabled) {
+      if (!authGestionada) throw Object.assign(new Error("La cuenta Firebase existente está deshabilitada y no fue gestionada por este módulo."), { statusCode: 409 });
+      await actualizarFirebaseAuthValidador(cuenta.uid, false);
+      cuenta = { ...cuenta, disabled: false };
+    }
+    const cambios = { validarCertificados: true, authUid: cuenta.uid, authEmail: email, authCertificadosGestionado: authGestionada, ...(authGestionada ? { authCertificadosCreadoEn: actual.authCertificadosCreadoEn || new Date().toISOString(), authCertificadosCreadoPor: actual.authCertificadosCreadoPor || authUser.uid } : {}), validarCertificadosActualizadoEn: new Date().toISOString(), validarCertificadosActualizadoPor: authUser.uid };
+    const actualizados = await Promise.all(documentos.map((doc) => updateFirestoreDoc(getFirestoreRelativePath(doc), cambios)));
+    return res.json({ ok: true, usuario: mapValidadorAdmin(actualizados[0] || { ...actual, ...cambios }), acceso: { existe: true, habilitada: !cuenta.disabled, gestionadaPorModulo: authGestionada, email, tieneUidVinculado: true } });
+  } catch (error: any) { return sendCertificadosError(res, error); }
+});
+
+app.get("/api/certificados/admin/validadores/:usuarioDocId/acceso", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization); await requireAdministrador(authUser);
+    const id = parseUsuarioDocId(req.params.usuarioDocId);
+    const persona = await resolverPersonaPorDocId(id);
+    if (!persona) throw Object.assign(new Error("Usuario no encontrado."), { statusCode: 404 });
+    const documentos = await registrosPorPersona(normalizeDni(persona.dni));
+    const gestionada = documentos.some((doc) => doc.authCertificadosGestionado === true);
+    const uid = documentos.map((doc) => String(doc.authUid || "").trim()).find(Boolean);
+    const emails = [...new Set(documentos.flatMap((doc) => [doc.email, doc.correo, doc.mail]).map((value) => String(value || "").trim().toLowerCase()).filter((value) => value.includes("@")))];
+    const cuenta = uid ? await buscarFirebaseAuthPorUid(uid) : emails[0] ? await buscarFirebaseAuthPorEmail(emails[0]) : { existe: false };
+    return res.json({ ok: true, acceso: { existe: cuenta.existe === true, habilitada: cuenta.existe === true && cuenta.disabled !== true, gestionadaPorModulo: gestionada, email: cuenta.email || emails[0] || "", tieneUidVinculado: Boolean(uid && cuenta.existe) } });
+  } catch (error: any) { return sendCertificadosError(res, error); }
+});
+
+app.delete("/api/certificados/admin/validadores/:usuarioDocId", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization); await requireAdministrador(authUser);
+    const id = parseUsuarioDocId(req.params.usuarioDocId); const actual = await resolverPersonaPorDocId(id);
+    if (!actual) throw Object.assign(new Error("Usuario no encontrado."), { statusCode: 404 });
+    const dni = normalizeDni(actual.dni);
+    const documentos = dni ? await registrosPorPersona(dni) : [actual];
+    const cambios = { validarCertificados: false, validarCertificadosActualizadoEn: new Date().toISOString(), validarCertificadosActualizadoPor: authUser.uid };
+    await Promise.all(documentos.map((doc) => updateFirestoreDoc(getFirestoreRelativePath(doc), cambios)));
+    const gestionada = documentos.some((doc) => doc.authCertificadosGestionado === true);
+    const uid = documentos.map((doc) => String(doc.authUid || "").trim()).find(Boolean);
+    let accesoFirebaseActualizado = false;
+    let advertencia = "";
+    if (gestionada && uid) {
+      try {
+        await actualizarFirebaseAuthValidador(uid, true);
+        accesoFirebaseActualizado = true;
+      } catch (error: any) {
+        advertencia = "El permiso fue retirado, pero no se pudo actualizar la cuenta de acceso.";
+        console.error(`[sidca-chatbot-backend] quitar validador: fallo secundario Auth dni=${dni || "-"} codigo=${error?.identityCode || error?.statusCode || "desconocido"}`);
+      }
+    }
+    console.info(`[sidca-chatbot-backend] quitar validador dni=${dni || "-"} registrosUsuarios=${documentos.filter((doc) => String(doc.path || "").startsWith("usuarios/")).length} registrosNuevoAfiliado=${documentos.filter((doc) => String(doc.path || "").startsWith("nuevoAfiliado/")).length} gestionadoAuth=${gestionada} authEncontrado=${Boolean(uid)}`);
+    return res.json({ ok: true, usuarioDocId: id, validarCertificados: false, accesoFirebaseActualizado, ...(advertencia ? { advertencia } : {}) });
+  } catch (error: any) { return sendCertificadosError(res, error); }
+});
+
+// Planillas documentales de inscriptos. Se guarda el archivo privado en
+// Storage y únicamente sus metadatos en Firestore; nunca se publican URLs.
+app.get("/api/certificados/admin/registro-inscriptos/:cursoId", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    await requireAdministrador(authUser);
+    const cursoId = parseCursoIdParam(req.params.cursoId);
+    const archivos = await queryFirestoreChildCollection(`certificados/${cursoId}`, "registroInscriptos", [{ field: "activo", value: true }], 100);
+    return res.json({ ok: true, archivos: archivos.map((archivo) => ({ ...archivo, storagePath: undefined })) });
+  } catch (error: any) { return sendCertificadosError(res, error); }
+});
+
+app.post("/api/certificados/admin/registro-inscriptos/:cursoId", registroInscriptosUpload.array("archivos", 10), async (req, res) => {
+  const subidos: string[] = [];
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    await requireAdministrador(authUser);
+    const cursoId = parseCursoIdParam(req.params.cursoId);
+    const curso = await getFirestoreDoc(`cursos/${cursoId}`);
+    if (!curso) throw Object.assign(new Error("La capacitación no existe."), { statusCode: 404 });
+    const archivos = (req.files as Express.Multer.File[]) || [];
+    if (!archivos.length || archivos.length > 10) throw Object.assign(new Error("Seleccioná entre 1 y 10 planillas."), { statusCode: 400 });
+    archivos.forEach(validarArchivoRegistro);
+    const bucket = bucketRegistroInscriptos();
+    const creados = [];
+    for (const archivo of archivos) {
+      const archivoId = crypto.randomUUID();
+      const storagePath = `certificados/registro-inscriptos/${cursoId}/${archivoId}-${nombreArchivoRegistroSeguro(archivo.originalname)}`;
+      await uploadGoogleStorageObject(bucket, storagePath, archivo.buffer, archivo.mimetype);
+      subidos.push(storagePath);
+      try {
+        const metadata = await createFirestoreDoc(`certificados/${cursoId}/registroInscriptos`, archivoId, {
+          archivoId, cursoId, tituloCurso: String(curso.titulo || "").trim(), nombreOriginal: String(archivo.originalname || "archivo.xlsx"), storagePath,
+          mimeType: archivo.mimetype, size: archivo.size, activo: true,
+          subidoEn: new Date(), subidoPorUid: authUser.uid, subidoPorEmail: authUser.email || "",
+        });
+        creados.push({ ...metadata, storagePath: undefined });
+      } catch (error) {
+        await deleteGoogleStorageObject(bucket, storagePath).catch(() => undefined);
+        throw error;
+      }
+    }
+    return res.status(201).json({ ok: true, archivos: creados });
+  } catch (error: any) {
+    if (subidos.length) {
+      const bucket = (() => { try { return bucketRegistroInscriptos(); } catch { return null; } })();
+      if (bucket) await Promise.all(subidos.map((path) => deleteGoogleStorageObject(bucket, path).catch(() => undefined)));
+    }
+    return sendCertificadosError(res, error);
+  }
+});
+
+app.delete("/api/certificados/admin/registro-inscriptos/:cursoId/:archivoId", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    await requireAdministrador(authUser);
+    const cursoId = parseCursoIdParam(req.params.cursoId);
+    const archivoId = parseTrabajoPdfIdParam(req.params.archivoId);
+    const path = `certificados/${cursoId}/registroInscriptos/${archivoId}`;
+    const archivo = await getFirestoreDoc(path);
+    if (!archivo || archivo.activo !== true) throw Object.assign(new Error("La planilla no existe."), { statusCode: 404 });
+    await updateFirestoreDoc(path, { activo: false, eliminadoEn: new Date(), eliminadoPor: authUser.uid });
+    if (archivo.storagePath) await deleteGoogleStorageObject(bucketRegistroInscriptos(), String(archivo.storagePath));
+    return res.json({ ok: true, eliminado: true });
+  } catch (error: any) { return sendCertificadosError(res, error); }
+});
+
+app.get("/api/certificados/registro-inscriptos", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    await requireAdministradorOValidadorCertificados(authUser);
+    const cursos = await listarRegistroInscriptosActivos();
+    return res.json({ ok: true, cursos });
+  } catch (error: any) { return sendCertificadosError(res, error); }
+});
+
+app.get("/api/certificados/registro-inscriptos/:cursoId/:archivoId/descargar", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    const permiso = await requireAdministradorOValidadorCertificados(authUser);
+    const cursoId = parseCursoIdParam(req.params.cursoId);
+    const archivoId = parseTrabajoPdfIdParam(req.params.archivoId);
+    const archivo = await getFirestoreDoc(`certificados/${cursoId}/registroInscriptos/${archivoId}`);
+    if (!archivo || archivo.activo !== true || String(archivo.cursoId) !== cursoId || !archivo.storagePath) throw Object.assign(new Error("La planilla no está disponible."), { statusCode: 404 });
+    const bucket = bucketRegistroInscriptos();
+    const bytes = await downloadGoogleStorageObject(bucket, String(archivo.storagePath));
+    const existe = bytes.length > 0;
+    if (!existe) throw Object.assign(new Error("La planilla no está disponible."), { statusCode: 404 });
+    await addFirestoreDoc(`certificados/${cursoId}/registroInscriptos/${archivoId}/descargas`, {
+      descargadoEn: new Date(), descargadoPorUid: authUser.uid, descargadoPorEmail: authUser.email || "", tipoValidador: permiso.tipo,
+    });
+    res.setHeader("Content-Type", String(archivo.mimeType || "application/octet-stream"));
+    res.setHeader("Content-Disposition", `attachment; filename="${nombreArchivoRegistroSeguro(String(archivo.nombreOriginal || "planilla.xlsx"))}"`);
+    res.setHeader("Cache-Control", "private, no-store");
+    return res.send(bytes);
+  } catch (error: any) { return sendCertificadosError(res, error); }
+});
 
 app.get("/api/certificados/admin/configuracion/:cursoId", async (req, res) => {
   try {
@@ -3427,6 +3949,21 @@ app.get("/api/certificados/validar/:cursoId/:token", async (req, res) => {
       `[sidca-chatbot-backend] certificado validado curso=${cursoId} estado=${estado} por=${permiso.tipo}`
     );
 
+    const verificado = await addFirestoreDoc(
+      `certificados/${cursoId}/emitidos/${token}/verificaciones`,
+      {
+        cursoId,
+        token,
+        estadoCertificado: estado,
+        valido,
+        validadorUid: authUser.uid,
+        validadorEmail: authUser.email || "",
+        validadorNombre: permiso.tipo === "validador" ? buildNombreAfiliado(permiso.usuario) : "Administrador SIDCA",
+        tipoValidador: permiso.tipo,
+        validadoEn: new Date().toISOString(),
+      }
+    );
+
     return res.status(200).json({
       ok: true,
       modulo: "certificados",
@@ -3438,8 +3975,51 @@ app.get("/api/certificados/validar/:cursoId/:token", async (req, res) => {
         participante: emision.participante || null,
         certificado: emision.certificado || null,
         emitidoEn: emision.emitidoEn || null,
+        registroCurso: emision.registroCurso || null,
+      },
+      verificacion: {
+        validadoEn: verificado.validadoEn,
+        validador: {
+          nombre: verificado.validadorNombre,
+          email: verificado.validadorEmail || null,
+          tipo: verificado.tipoValidador,
+        },
       },
     });
+  } catch (error: any) {
+    return sendCertificadosError(res, error);
+  }
+});
+
+/** Registra una sola vez que un certificado fue presentado y validado. */
+app.post("/api/certificados/validar/:cursoId/:token/registrar", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    const permiso = await requireAdministradorOValidadorCertificados(authUser);
+    const cursoId = parseCursoIdParam(req.params.cursoId);
+    const token = parseCertificadoTokenParam(req.params.token);
+    const path = `certificados/${cursoId}/emitidos/${token}`;
+    const emision = await getFirestoreDoc(path);
+    if (!emision || String(emision.estado || "") !== EMITIDOS_ESTADO_VIGENTE) {
+      throw Object.assign(new Error("El certificado no está vigente y no puede registrarse."), { statusCode: 409 });
+    }
+    if (String(emision.cursoId || cursoId) !== cursoId || (emision.token && String(emision.token) !== token)) {
+      throw Object.assign(new Error("El certificado no coincide con el código escaneado."), { statusCode: 404 });
+    }
+    if (emision.registroCurso) {
+      return res.status(200).json({ ok: true, yaRegistrado: true, registro: emision.registroCurso });
+    }
+    const registradoEn = new Date().toISOString();
+    const registro = {
+      registrado: true,
+      registradoEn,
+      registradoPorUid: authUser.uid,
+      registradoPorEmail: authUser.email || "",
+      registradoPorNombre: permiso.tipo === "validador" ? buildNombreAfiliado(permiso.usuario) : "Administrador SIDCA",
+      tipoValidador: permiso.tipo,
+    };
+    await updateFirestoreDoc(path, { registroCurso: registro });
+    return res.status(200).json({ ok: true, registro });
   } catch (error: any) {
     return sendCertificadosError(res, error);
   }
