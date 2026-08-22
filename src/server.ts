@@ -1855,6 +1855,14 @@ function parseCursoIdParam(valor: unknown): string {
  */
 const CERTIFICADO_TOKEN_REGEX = /^[a-f0-9]{48}$/;
 
+/** Una emisiÃ³n vigente sÃ³lo estÃ¡ disponible si puede resolver su QR. */
+function emisionTieneQrValido(emision: FirestoreRecord): boolean {
+  const token = String(emision.token || emision.id || "").trim();
+  const urlValidacion = String(emision.urlValidacion || "").trim();
+
+  return CERTIFICADO_TOKEN_REGEX.test(token) && Boolean(urlValidacion);
+}
+
 /**
  * Valida el token del certificado antes de usarlo en un path de Firestore.
  * Rechaza barras, espacios, mayúsculas y cualquier longitud distinta de 48.
@@ -2701,6 +2709,7 @@ type ParticipanteAprobado = {
   estado: "aprobado" | "datos_incompletos" | "sin_usuario";
   aprobaciones: number;
   certificadoEmitido: boolean;
+  certificadoQrValido: boolean;
   apartado?: boolean;
   /** Condición sindical. La resuelve resolverPadronPorDni; ver afiliacion.ts. */
   afiliacion?: Afiliacion;
@@ -2714,12 +2723,14 @@ function construirParticipanteAprobado(
   usuario: FirestoreRecord | null,
   aprobaciones: number,
   apartado = false,
-  certificadoEmitido = false
+  certificadoEmitido = false,
+  certificadoQrValido = false
 ): ParticipanteAprobado {
   const comun = {
     usuarioDocId,
     aprobaciones,
     certificadoEmitido,
+    certificadoQrValido,
     ...(apartado ? { apartado: true } : {}),
   };
 
@@ -2768,7 +2779,8 @@ function construirParticipanteAprobado(
 async function resolverParticipantesAprobados(
   porUsuario: Map<string, number>,
   apartado = false,
-  usuariosConCertificadoVigente = new Set<string>()
+  usuariosConCertificadoVigente = new Set<string>(),
+  usuariosConCertificadoQrValido = usuariosConCertificadoVigente
 ): Promise<ParticipanteAprobado[]> {
   const resueltos = await resolverEnLotes(
     [...porUsuario.keys()],
@@ -2785,7 +2797,8 @@ async function resolverParticipantesAprobados(
       usuario,
       porUsuario.get(usuarioDocId) || 1,
       apartado,
-      usuariosConCertificadoVigente.has(usuarioDocId)
+      usuariosConCertificadoVigente.has(usuarioDocId),
+      usuariosConCertificadoQrValido.has(usuarioDocId)
     )
   );
 
@@ -2857,9 +2870,14 @@ async function resolverAprobadosCurso(cursoId: string) {
       APROBADOS_MAX_RESULTADOS
     );
     const usuariosConCertificadoVigente = new Set<string>();
+    const usuariosConCertificadoQrValido = new Set<string>();
     emitidosVigentes.forEach((emitido) => {
       const usuarioDocId = String(emitido.usuarioDocId || "").trim();
-      if (usuarioDocId) usuariosConCertificadoVigente.add(usuarioDocId);
+      if (!usuarioDocId) return;
+      usuariosConCertificadoVigente.add(usuarioDocId);
+      if (emisionTieneQrValido(emitido)) {
+        usuariosConCertificadoQrValido.add(usuarioDocId);
+      }
     });
 
     // Un solo filtro de igualdad: lo resuelve el índice de campo único que
@@ -2917,8 +2935,18 @@ async function resolverAprobadosCurso(cursoId: string) {
     }
 
     const [participantes, participantesExcluidos] = await Promise.all([
-      resolverParticipantesAprobados(porUsuario, false, usuariosConCertificadoVigente),
-      resolverParticipantesAprobados(porUsuarioExcluido, true, usuariosConCertificadoVigente),
+      resolverParticipantesAprobados(
+        porUsuario,
+        false,
+        usuariosConCertificadoVigente,
+        usuariosConCertificadoQrValido
+      ),
+      resolverParticipantesAprobados(
+        porUsuarioExcluido,
+        true,
+        usuariosConCertificadoVigente,
+        usuariosConCertificadoQrValido
+      ),
     ]);
 
     // Los contadores de calidad de datos se refieren a los DISPONIBLES, que es
@@ -2986,6 +3014,126 @@ app.get("/api/certificados/admin/aprobados/:cursoId", async (req, res) => {
       ok: true,
       modulo: "certificados",
       ...datos,
+    });
+  } catch (error: any) {
+    return sendCertificadosError(res, error);
+  }
+});
+
+// ============================================================
+// REGISTRO DE APROBADOS PARA EL PORTAL DE VALIDADORES
+//
+// Este listado usa exactamente el mismo resolver que la emisión. No crea
+// una colección paralela ni decide aprobaciones en el cliente: sólo proyecta
+// los participantes que ya fueron aprobados, tienen datos completos, no están
+// apartados y cuentan con afiliación habilitada.
+
+function esAprobadoDisponibleParaRegistro(participante: ParticipanteAprobado) {
+  return (
+    participante.estado === "aprobado" &&
+    participante.apartado !== true &&
+    participante.afiliacion?.habilitadoCertificado === true &&
+    participante.afiliacion.tipo !== "no_verificada" &&
+    participante.certificadoEmitido === true &&
+    participante.certificadoQrValido === true
+  );
+}
+
+function proyectarRegistroAprobado(participante: ParticipanteAprobado) {
+  return {
+    usuarioDocId: participante.usuarioDocId,
+    apellidoNombre: participante.apellidoNombre,
+    dni: participante.dni,
+    departamento: {
+      crudo: participante.departamento?.crudo || "",
+      canonico: participante.departamento?.canonico || "",
+    },
+  };
+}
+
+async function obtenerRegistrosAprobadosCurso(
+  cursoId: string,
+  configuracion?: FirestoreRecord
+) {
+  const datos = await resolverAprobadosCurso(cursoId);
+  const certificado = configuracion || (await getFirestoreDoc(`certificados/${cursoId}`));
+  const aprobados = datos.participantes
+    .filter(esAprobadoDisponibleParaRegistro)
+    .map(proyectarRegistroAprobado)
+    .sort((a, b) =>
+      a.apellidoNombre.localeCompare(b.apellidoNombre, "es", {
+        sensitivity: "base",
+      })
+    );
+
+  return {
+    curso: {
+      ...datos.curso,
+      resolucion: String(certificado?.resolucion || "").trim(),
+    },
+    cantidad: aprobados.length,
+    aprobados,
+  };
+}
+
+app.get("/api/certificados/registro-aprobados", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    await requireAdministradorOValidadorCertificados(authUser);
+
+    const documentos = await queryFirestoreCollection(
+      "certificados",
+      [],
+      CONFIGURACIONES_MAX_RESULTADOS
+    );
+    const configuraciones = documentos
+      .filter((record) => Boolean(String(record.cursoId || "").trim()))
+      .filter((record) => record.ocultarEnEmitir !== true);
+
+    const cursos = await Promise.all(
+      configuraciones.map(async (configuracion) => {
+        const cursoId = String(configuracion.cursoId || "").trim();
+        try {
+          const registro = await obtenerRegistrosAprobadosCurso(cursoId, configuracion);
+          return {
+            cursoId,
+            titulo: registro.curso?.titulo || configuracion.cursoTitulo || configuracion.titulo || "",
+            resolucion: registro.curso?.resolucion || "",
+            cantidadAprobados: registro.cantidad,
+          };
+        } catch (error: any) {
+          if (Number(error?.statusCode) === 404) return null;
+          throw error;
+        }
+      })
+    );
+
+    const disponibles = cursos
+      .filter((curso): curso is NonNullable<typeof curso> => curso !== null)
+      .sort((a, b) => a.titulo.localeCompare(b.titulo, "es", { sensitivity: "base" }));
+
+    return res.status(200).json({
+      ok: true,
+      modulo: "certificados",
+      cursos: disponibles,
+    });
+  } catch (error: any) {
+    return sendCertificadosError(res, error);
+  }
+});
+
+app.get("/api/certificados/registro-aprobados/:cursoId", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    await requireAdministradorOValidadorCertificados(authUser);
+
+    const cursoId = parseCursoIdParam(req.params.cursoId);
+    const registro = await obtenerRegistrosAprobadosCurso(cursoId);
+
+    return res.status(200).json({
+      ok: true,
+      modulo: "certificados",
+      ...registro,
     });
   } catch (error: any) {
     return sendCertificadosError(res, error);
