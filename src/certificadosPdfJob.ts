@@ -19,7 +19,11 @@ import "dotenv/config";
 import PDFDocument from "pdfkit";
 import { Storage } from "@google-cloud/storage";
 import { renderCertificadoPdfPage } from "./certificados/certificadoPdfRenderer.js";
-import { listarEmisionesVigentesCurso } from "./certificados/emisionesCurso.js";
+import {
+  listarEmisionesVigentesCurso,
+  filtrarEmisionesHabilitadas,
+} from "./certificados/emisionesCurso.js";
+import { esSegmentoValido, obtenerSegmento } from "./certificados/segmentos.js";
 
 const proyecto =
   process.env.FIREBASE_PROJECT_ID ||
@@ -143,11 +147,27 @@ const main = async () => {
   ).trim();
   const bucketNombre = String(process.env.CERTIFICADOS_PDF_BUCKET || "").trim();
 
+  // Segmento geográfico. Es OPCIONAL: sin él el Job hace exactamente lo de
+  // siempre —un PDF con todo el curso— y ninguna ejecución anterior cambia de
+  // comportamiento.
+  const segmentoId = String(
+    process.env.CERTIFICADOS_PDF_SEGMENTO_ID || ""
+  ).trim();
+
   if (!cursoId || !jobId || !proyecto || !bucketNombre) {
     throw new Error(
       "Faltan variables del Job: se requieren CERTIFICADOS_PDF_CURSO_ID, CERTIFICADOS_PDF_TRABAJO_ID, CERTIFICADOS_PDF_BUCKET y el proyecto."
     );
   }
+
+  // Se valida contra la lista de segmentos y no sólo contra caracteres: el
+  // valor se interpola en la ruta del objeto de Storage, y un segmento
+  // inventado generaría un archivo que después nadie podría encontrar.
+  if (segmentoId && !esSegmentoValido(segmentoId)) {
+    throw new Error(`CERTIFICADOS_PDF_SEGMENTO_ID inválido: ${segmentoId}`);
+  }
+
+  const segmento = segmentoId ? obtenerSegmento(segmentoId) : null;
 
   const rutaTrabajo = `${firestoreBase}/certificados/${encodeURIComponent(
     cursoId
@@ -169,9 +189,36 @@ const main = async () => {
     // 3. Emisiones del curso. listarEmisionesVigentesCurso lee SÓLO
     //    certificados/{cursoId}/emitidos —nada de collectionGroup— y aborta si
     //    encuentra una emisión con otro cursoId.
-    const emisiones = await listarEmisionesVigentesCurso(
+    const vigentes = await listarEmisionesVigentesCurso(
       cursoId,
       await obtenerAccessToken()
+    );
+
+    // 3 bis. Condición sindical. Un certificado ya emitido no se borra ni se
+    //        anula porque el participante deje de estar habilitado, pero
+    //        tampoco puede salir en el PDF masivo: si no, la descarga masiva
+    //        sería una puerta trasera para obtener lo que la pantalla bloquea.
+    //
+    // 3 ter. Segmento geográfico, cuando lo hay. Se aplica DESPUÉS de la
+    //        afiliación, sobre el departamento vigente del afiliado. El mismo
+    //        llamado resuelve las dos cosas: no hay una segunda pasada por el
+    //        padrón.
+    const {
+      habilitadas: emisiones,
+      omitidosAfiliacion,
+      omitidosSegmento,
+      sinDepartamento,
+    } = await filtrarEmisionesHabilitadas(
+      vigentes,
+      await obtenerAccessToken(),
+      segmentoId || undefined
+    );
+
+    // Un solo log con los contadores del filtrado. Sin tokens, sin documentos.
+    console.log(
+      `[pdf-segmentado] curso=${cursoId} segmento=${segmentoId || "-"} vigentes=${
+        vigentes.length
+      } habilitados=${vigentes.length - omitidosAfiliacion} omitidosAfiliacion=${omitidosAfiliacion} omitidosSegmento=${omitidosSegmento} sinDepartamento=${sinDepartamento} paginas=${emisiones.length}`
     );
 
     // 4. Orden determinístico.
@@ -187,18 +234,28 @@ const main = async () => {
 
     if (!total) {
       throw new Error(
-        "No hay certificados vigentes emitidos para este curso."
+        segmento
+          ? `No hay certificados descargables en el segmento ${segmento.nombre}.`
+          : omitidosAfiliacion > 0
+          ? "Todos los certificados vigentes corresponden a participantes sin afiliación habilitada."
+          : "No hay certificados vigentes emitidos para este curso."
       );
     }
 
     await actualizarTrabajo(rutaTrabajo, {
       total,
+      omitidosAfiliacion,
       actualizadoEn: new Date(),
     });
 
     // 5. Streaming. El PDF nunca existe entero en memoria: se escribe en
     //    Storage a medida que se generan las páginas.
-    const objectName = `certificados-pdf/${cursoId}/${jobId}.pdf`;
+    // La ruta lleva el segmento cuando lo hay. Tiene que coincidir exactamente
+    // con la que arma el backend en pdfSegmentoObjectName(): el endpoint de
+    // descarga rechaza cualquier objeto que no sea el determinístico.
+    const objectName = segmentoId
+      ? `certificados-pdf/${cursoId}/${segmentoId}/${jobId}.pdf`
+      : `certificados-pdf/${cursoId}/${jobId}.pdf`;
     const storage = new Storage();
     const archivo = storage.bucket(bucketNombre).file(objectName);
 
@@ -294,7 +351,9 @@ const main = async () => {
     });
 
     console.log(
-      `[certificados-pdf-job] completado curso=${cursoId} job=${jobId} paginas=${total} bytes=${tamanioBytes}`
+      `[certificados-pdf-job] completado curso=${cursoId} segmento=${
+        segmentoId || "-"
+      } job=${jobId} paginas=${total} bytes=${tamanioBytes}`
     );
   } catch (error: any) {
     // Sin esto el trabajo quedaba para siempre en "procesando" y la pantalla

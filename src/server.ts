@@ -11,6 +11,19 @@ import { runChatbotWorkflow } from "./openaiWorkflow.js";
 // mismo helper de credenciales que el resto del backend. El Cloud Run Job sí
 // lo sigue usando, en su propio proceso.
 import { Readable } from "node:stream";
+import {
+  AFILIACION_NO_VERIFICADA,
+  resolverAfiliacionDeUnDni,
+  resolverPadronPorDni,
+  type Afiliacion,
+  type Departamento,
+} from "./certificados/afiliacion.js";
+import {
+  SEGMENTOS,
+  SEGMENTO_SIN_DEPARTAMENTO,
+  esSegmentoValido,
+  obtenerSegmento,
+} from "./certificados/segmentos.js";
 
 const app = express();
 const PORT = Number(process.env.PORT || 8080);
@@ -2689,6 +2702,10 @@ type ParticipanteAprobado = {
   aprobaciones: number;
   certificadoEmitido: boolean;
   apartado?: boolean;
+  /** Condición sindical. La resuelve resolverPadronPorDni; ver afiliacion.ts. */
+  afiliacion?: Afiliacion;
+  /** Departamento vigente y segmento al que corresponde su descarga. */
+  departamento?: Departamento;
 };
 
 /** Proyecta un usuario resuelto a la forma común del participante. */
@@ -2762,16 +2779,41 @@ async function resolverParticipantesAprobados(
     }
   );
 
-  return resueltos
-    .map(({ usuarioDocId, usuario }) =>
-      construirParticipanteAprobado(
-        usuarioDocId,
-        usuario,
-        porUsuario.get(usuarioDocId) || 1,
-        apartado,
-        usuariosConCertificadoVigente.has(usuarioDocId)
-      )
+  const participantes = resueltos.map(({ usuarioDocId, usuario }) =>
+    construirParticipanteAprobado(
+      usuarioDocId,
+      usuario,
+      porUsuario.get(usuarioDocId) || 1,
+      apartado,
+      usuariosConCertificadoVigente.has(usuarioDocId)
     )
+  );
+
+  // Condición sindical. Se resuelve en UNA sola pasada para todos los DNI de
+  // la lista: cada DNI distinto se consulta una vez, con concurrencia acotada.
+  // No modifica el estado académico ni las exclusiones; sólo agrega el dato
+  // que decide la habilitación para emitir y descargar.
+  const padron = await resolverPadronPorDni(
+    participantes.map((participante) => participante.dni),
+    { proyecto: firebaseProjectId, accessToken: await getGoogleAccessToken() }
+  );
+
+  return participantes
+    .map((participante) => {
+      const resuelto = padron.get(normalizeDni(participante.dni));
+
+      return {
+        ...participante,
+        afiliacion: resuelto?.afiliacion || { ...AFILIACION_NO_VERIFICADA },
+        // Departamento VIGENTE del afiliado, no el del snapshot del
+        // certificado: es el que decide en qué segmento se descarga.
+        departamento: resuelto?.departamento || {
+          crudo: "",
+          canonico: "",
+          segmentoId: SEGMENTO_SIN_DEPARTAMENTO,
+        },
+      };
+    })
     .sort((a, b) =>
       a.apellidoNombre.localeCompare(b.apellidoNombre, "es", {
         sensitivity: "base",
@@ -3598,6 +3640,32 @@ async function emitirCertificadoParaUsuario({
       );
     }
 
+    // 7 bis. Condición sindical.
+    //
+    //   El bloqueo del navegador no alcanza: sin esta comprobación bastaría
+    //   con llamar al endpoint a mano para saltearlo. Va acá, en la función
+    //   compartida, así rige igual para la emisión individual y la masiva sin
+    //   duplicar la regla.
+    //
+    //   Se resuelve DESPUÉS de tener el DNI y ANTES de escribir nada.
+    const afiliacion = await resolverAfiliacionDeUnDni(dni, {
+      proyecto: firebaseProjectId,
+      accessToken: await getGoogleAccessToken(),
+    });
+
+    if (afiliacion.habilitadoCertificado !== true) {
+      throw Object.assign(
+        new Error(
+          afiliacion.tipo === "adherente"
+            ? "No se puede emitir el certificado porque el adherente no se encuentra habilitado."
+            : "No se puede emitir el certificado porque no se pudo verificar la condición de afiliación."
+        ),
+        // El código permite a la emisión masiva contabilizar este caso aparte
+        // en vez de tratarlo como una falla.
+        { statusCode: 409, codigo: "afiliacion_no_habilitada" }
+      );
+    }
+
     // 8. Doble emisión. Se consulta sólo la subcolección de ESTE curso.
     const emitidosPrevios = await queryFirestoreChildCollection(
       `certificados/${cursoId}`,
@@ -3816,6 +3884,10 @@ app.post("/api/certificados/admin/emision/:cursoId/emitir-masivo", async (req, r
       (participante) => participante.certificadoEmitido === true
     ).length;
 
+    // Los adherentes no habilitados no son un error: se cuentan aparte y la
+    // tanda sigue. Un bloqueo administrativo no puede frenar las demás emisiones.
+    let afiliacionNoHabilitada = 0;
+
     const errores: { usuarioDocId: string; apellidoNombre: string; mensaje: string }[] = [];
 
     for (let i = 0; i < candidatos.length; i += EMISION_MASIVA_LOTE) {
@@ -3849,6 +3921,11 @@ app.post("/api/certificados/admin/emision/:cursoId/emitir-masivo", async (req, r
           return;
         }
 
+        if (error?.codigo === "afiliacion_no_habilitada") {
+          afiliacionNoHabilitada += 1;
+          return;
+        }
+
         errores.push({
           usuarioDocId: participante.usuarioDocId,
           apellidoNombre: participante.apellidoNombre || "",
@@ -3858,7 +3935,7 @@ app.post("/api/certificados/admin/emision/:cursoId/emitir-masivo", async (req, r
     }
 
     console.log(
-      `[sidca-chatbot-backend] emisión masiva curso=${cursoId} candidatos=${candidatos.length} emitidos=${emitidos} yaEmitidos=${yaEmitidos} errores=${errores.length} por=${authUser.uid}`
+      `[sidca-chatbot-backend] emisión masiva curso= candidatos= emitidos= yaEmitidos= afiliacion= errores= por=`
     );
 
     // 200 y no 201 aunque haya creado documentos: es un resultado agregado, y
@@ -3875,6 +3952,7 @@ app.post("/api/certificados/admin/emision/:cursoId/emitir-masivo", async (req, r
         apartados: padron.resumen.excluidos,
         datosIncompletos: padron.resumen.datosIncompletos,
         sinUsuario: padron.resumen.sinUsuario,
+        afiliacionNoHabilitada,
       },
       // Sin tokens ni URLs: son datos sensibles y no hacen falta para el
       // resumen. Quien necesite uno lo pide por el endpoint individual.
@@ -4741,6 +4819,635 @@ const sanitizarNombreArchivo = (valor: string) =>
     .replace(/[\\/:*?"<>|\r\n]/g, "-")
     .trim()
     .slice(0, 120) || "certificados";
+
+// ============================================================
+// DESCARGA POR SEGMENTOS GEOGRÁFICOS
+//
+// Un PDF con mil certificados es inmanejable. Estos endpoints permiten
+// generarlo y bajarlo por región, de a un segmento por vez.
+//
+// La clasificación es UNA sola —clasificarSegmentosCurso—, y la comparten el
+// resumen, el Excel y el Job que arma el PDF. Si cada uno tuviera la suya,
+// el resumen podría decir Valle Central y el PDF salir con otra gente.
+// ============================================================
+
+/** Ruta del objeto de un segmento. Incluye el segmento para poder ubicarlo. */
+const pdfSegmentoObjectName = (
+  cursoId: string,
+  segmentoId: string,
+  jobId: string
+) => `certificados-pdf/${cursoId}/${segmentoId}/${jobId}.pdf`;
+
+function parseSegmentoIdParam(valor: unknown): string {
+  const segmentoId = String(valor ?? "").trim();
+
+  // Lista blanca: el frontend no puede pedir un segmento arbitrario, y menos
+  // uno con barras que terminen escapando de la ruta de Storage.
+  if (!esSegmentoValido(segmentoId)) {
+    throw Object.assign(new Error("El segmento indicado no existe."), {
+      statusCode: 400,
+    });
+  }
+
+  return segmentoId;
+}
+
+/**
+ * Clasifica a los participantes del curso por segmento.
+ *
+ * Fuente única para el resumen, el Excel y la selección del PDF. Resuelve el
+ * padrón UNA vez —afiliación y departamento salen del mismo viaje— y después
+ * clasifica en memoria: con dos mil participantes no se dispara una consulta
+ * por fila ni un recorrido remoto por segmento.
+ *
+ * `participantes` cuenta identificados y disponibles; `descargables` cuenta
+ * los que además tienen certificado vigente y afiliación habilitada. Son
+ * conceptos distintos y se llevan por separado a propósito.
+ */
+async function clasificarSegmentosCurso(cursoId: string) {
+  // resolverAprobadosCurso ya trae afiliación, departamento y la marca de
+  // certificado vigente de este curso. Reutilizarlo evita repetir el padrón y
+  // garantiza que el resumen coincida con la tabla de la pantalla.
+  const padron = await resolverAprobadosCurso(cursoId);
+
+  // Los apartados quedan fuera: fueron excluidos de la emisión, así que no
+  // cuentan ni en el PDF ni en la planilla de control.
+  //
+  // Los "sin usuario asociado" tampoco entran en ningún segmento: no hay
+  // afiliado sobre el cual resolver departamento. Eso es un problema distinto
+  // del de "sin departamento cargado" y no se mezcla con él.
+  const identificados = padron.participantes.filter(
+    (participante) => participante.estado !== "sin_usuario"
+  );
+
+  const porSegmento = new Map<string, ParticipanteAprobado[]>(
+    SEGMENTOS.map((segmento) => [segmento.id, []])
+  );
+
+  for (const participante of identificados) {
+    const segmentoId = participante.departamento?.segmentoId || "";
+
+    // Un segmento desconocido cae en revisión en lugar de perderse.
+    const destino =
+      porSegmento.get(segmentoId) ||
+      porSegmento.get(SEGMENTO_SIN_DEPARTAMENTO)!;
+
+    destino.push(participante);
+  }
+
+  const resumen = SEGMENTOS.map((segmento) => {
+    const gente = porSegmento.get(segmento.id) || [];
+
+    return {
+      id: segmento.id,
+      nombre: segmento.nombre,
+      departamentos: segmento.departamentos,
+      // Identificados y disponibles del segmento, con o sin certificado.
+      participantes: gente.length,
+      certificadosEmitidos: gente.filter((p) => p.certificadoEmitido).length,
+      // Lo que realmente va a entrar al PDF: emitido y vigente Y con la
+      // afiliación habilitada HOY.
+      certificadosDescargables: gente.filter(
+        (p) => p.certificadoEmitido && p.afiliacion?.habilitadoCertificado === true
+      ).length,
+      adherentesNoHabilitados: gente.filter(
+        (p) =>
+          p.afiliacion?.tipo === "adherente" &&
+          p.afiliacion?.habilitadoCertificado !== true
+      ).length,
+    };
+  });
+
+  return { padron, porSegmento, resumen };
+}
+
+app.get(
+  "/api/certificados/admin/pdf-segmentado/:cursoId/segmentos",
+  async (req, res) => {
+    try {
+      const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+      await requireAdministrador(authUser);
+
+      const cursoId = parseCursoIdParam(req.params.cursoId);
+      const { resumen } = await clasificarSegmentosCurso(cursoId);
+
+      // Los ocho van siempre, aunque estén en cero: un segmento que
+      // desaparece de la lista se lee como "no existe", no como "vacío".
+      return res.status(200).json({
+        ok: true,
+        modulo: "certificados",
+        cursoId,
+        segmentos: resumen,
+      });
+    } catch (error: any) {
+      return sendCertificadosError(res, error);
+    }
+  }
+);
+
+/**
+ * Datos para la planilla de control de un segmento.
+ *
+ * Incluye a TODOS los identificados del segmento, habilitados o no: el sentido
+ * de la planilla es poder ver por qué alguien no entró al PDF. Por eso el
+ * Excel suele tener más filas que páginas tiene el PDF.
+ *
+ * El backend entrega el modelo ya resuelto; el frontend sólo lo vuelca a
+ * Excel. No se le pide que reinterprete afiliación ni departamento.
+ */
+app.get(
+  "/api/certificados/admin/pdf-segmentado/:cursoId/:segmentoId/excel",
+  async (req, res) => {
+    try {
+      const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+      await requireAdministrador(authUser);
+
+      const cursoId = parseCursoIdParam(req.params.cursoId);
+      const segmentoId = parseSegmentoIdParam(req.params.segmentoId);
+
+      const { porSegmento } = await clasificarSegmentosCurso(cursoId);
+      const segmento = obtenerSegmento(segmentoId)!;
+      const gente = porSegmento.get(segmentoId) || [];
+
+      const filas = gente
+        .map((participante: any) => {
+          const afiliacion = participante.afiliacion || {};
+          const departamento = participante.departamento || {};
+
+          const estadoAfiliado =
+            afiliacion.tipo === "adherente"
+              ? afiliacion.habilitadoCertificado === true
+                ? "Habilitado"
+                : "No habilitado"
+              : afiliacion.tipo === "cotizante"
+              ? "Cotizante"
+              : "No verificado";
+
+          return {
+            apellidoNombre: participante.apellidoNombre || "",
+            // Sólo dígitos. El frontend lo escribe como texto para que Excel
+            // no lo convierta en notación científica.
+            dni: String(participante.dni || "").replace(/\D/g, ""),
+            adherente: afiliacion.tipo === "adherente" ? "Sí" : "No",
+            estadoAfiliado,
+            // Un valor no reconocido se conserva crudo: es lo que permite
+            // localizarlo y corregirlo después.
+            departamento:
+              departamento.canonico || departamento.crudo || "Sin departamento",
+          };
+        })
+        .sort((a: any, b: any) =>
+          a.apellidoNombre.localeCompare(b.apellidoNombre, "es", {
+            sensitivity: "base",
+          })
+        );
+
+      return res.status(200).json({
+        ok: true,
+        modulo: "certificados",
+        cursoId,
+        segmentoId,
+        segmentoNombre: segmento.nombre,
+        filas,
+      });
+    } catch (error: any) {
+      return sendCertificadosError(res, error);
+    }
+  }
+);
+
+/**
+ * Último trabajo de un segmento.
+ *
+ * Los trabajos segmentados viven en la MISMA subcolección que los masivos y se
+ * distinguen por el campo `segmentoId`. Así el Job de Cloud Run, el endpoint de
+ * estado y el de descarga siguen leyendo un único lugar, y los trabajos
+ * antiguos —que no tienen el campo— nunca se confunden con los de un segmento.
+ *
+ * El puntero "actual" se resuelve por consulta y no por un campo en el
+ * certificado: guardar un mapa de ocho punteros obligaría a escribir rutas de
+ * campo con guiones en las máscaras de actualización, que es una fuente de
+ * errores silenciosos.
+ */
+async function ultimoTrabajoSegmento(cursoId: string, segmentoId: string) {
+  const trabajos = await queryFirestoreChildCollection(
+    `certificados/${cursoId}`,
+    "trabajosPdf",
+    [{ field: "segmentoId", value: segmentoId }],
+    50
+  );
+
+  if (!trabajos.length) return null;
+
+  // Se ordena en memoria: son unos pocos documentos por segmento y evita
+  // exigir un índice compuesto sólo para esto.
+  return [...trabajos].sort(
+    (a, b) =>
+      Date.parse(String(b.creadoEn || "")) - Date.parse(String(a.creadoEn || ""))
+  )[0];
+}
+
+/** Un trabajo del curso que además pertenece a ESTE segmento. */
+async function obtenerTrabajoSegmento(
+  cursoId: string,
+  segmentoId: string,
+  jobId: string
+) {
+  const trabajo = await getFirestoreDoc(
+    `certificados/${cursoId}/trabajosPdf/${jobId}`
+  );
+
+  // Se comprueba la pertenencia al segmento: sin esto, el jobId de Valle
+  // Central serviría para descargar por la ruta de cualquier otro segmento.
+  if (!trabajo || String(trabajo.segmentoId || "") !== segmentoId) {
+    throw Object.assign(new Error("El trabajo indicado no existe."), {
+      statusCode: 404,
+    });
+  }
+
+  return trabajo;
+}
+
+app.post(
+  "/api/certificados/admin/pdf-segmentado/:cursoId/:segmentoId/iniciar",
+  async (req, res) => {
+    try {
+      const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+      await requireAdministrador(authUser);
+
+      const cursoId = parseCursoIdParam(req.params.cursoId);
+      const segmentoId = parseSegmentoIdParam(req.params.segmentoId);
+      const segmento = obtenerSegmento(segmentoId)!;
+
+      const certificado = await getFirestoreDoc(`certificados/${cursoId}`);
+
+      if (!certificado) {
+        throw Object.assign(
+          new Error("No existe la configuración de certificado de este curso."),
+          { statusCode: 404 }
+        );
+      }
+
+      // Un trabajo activo por segmento. Dos clics seguidos devuelven el mismo,
+      // y un segmento en curso no bloquea a los otros siete.
+      const enCurso = await ultimoTrabajoSegmento(cursoId, segmentoId);
+
+      if (enCurso && PDF_ESTADOS_EN_CURSO.has(String(enCurso.estado))) {
+        return res
+          .status(200)
+          .json({ ok: true, trabajo: enCurso, reutilizado: true });
+      }
+
+      // Cuántos certificados va a contener realmente el PDF. Sale de la misma
+      // clasificación que alimenta el resumen y el Excel, así que la barra de
+      // progreso no puede contradecir a la tarjeta.
+      const { resumen } = await clasificarSegmentosCurso(cursoId);
+      const total =
+        resumen.find((fila) => fila.id === segmentoId)?.certificadosDescargables ||
+        0;
+
+      if (!total) {
+        throw Object.assign(
+          new Error(
+            "No hay certificados descargables en este segmento para generar el PDF."
+          ),
+          { statusCode: 409 }
+        );
+      }
+
+      const curso = await getFirestoreDoc(`cursos/${cursoId}`);
+      const tituloCurso = String(
+        curso?.titulo || certificado.cursoTitulo || cursoId
+      );
+
+      const jobId = crypto.randomUUID();
+      const ahora = new Date();
+      const objectName = pdfSegmentoObjectName(cursoId, segmentoId, jobId);
+
+      const trabajo = {
+        jobId,
+        cursoId,
+        // Campos nuevos. Los existentes se conservan tal cual para que el Job,
+        // la pantalla y la descarga sigan funcionando sin ramificar.
+        segmentoId,
+        segmentoNombre: segmento.nombre,
+        estado: PDF_ESTADO_PENDIENTE,
+        total,
+        procesados: 0,
+        porcentaje: 0,
+        creadoEn: ahora,
+        iniciadoEn: null,
+        actualizadoEn: ahora,
+        finalizadoEn: null,
+        transcurridoMs: 0,
+        restanteEstimadoMs: null,
+        finalizacionEstimada: null,
+        objectName,
+        storagePath: objectName,
+        tamanioBytes: 0,
+        creadoPor: authUser.uid,
+        error: null,
+        nombreArchivo: `Certificados_${sanitizarNombreArchivo(
+          segmento.nombre
+        ).replace(/\s+/g, "_")}.pdf`,
+        cursoTitulo: tituloCurso,
+      };
+
+      await createFirestoreDoc(
+        `certificados/${cursoId}/trabajosPdf`,
+        jobId,
+        trabajo
+      );
+
+      const proyecto =
+        process.env.GCLOUD_PROJECT || process.env.FIREBASE_PROJECT_ID || "";
+      const region = process.env.CERTIFICADOS_PDF_JOB_REGION || "us-central1";
+      const nombreJob = process.env.CERTIFICADOS_PDF_JOB_NAME;
+      const bucket = process.env.CERTIFICADOS_PDF_BUCKET;
+
+      try {
+        if (!nombreJob)
+          throw new Error("Falta configurar CERTIFICADOS_PDF_JOB_NAME.");
+        if (!bucket) throw new Error("Falta configurar CERTIFICADOS_PDF_BUCKET.");
+
+        // Mismo Job de Cloud Run que la descarga masiva. La única diferencia es
+        // CERTIFICADOS_PDF_SEGMENTO_ID: cuando está, el Job filtra por segmento;
+        // cuando no, se comporta como siempre.
+        const cuerpoRun = {
+          overrides: {
+            containerOverrides: [
+              {
+                env: [
+                  { name: "CERTIFICADOS_PDF_CURSO_ID", value: cursoId },
+                  { name: "CERTIFICADOS_PDF_TRABAJO_ID", value: jobId },
+                  { name: "CERTIFICADOS_PDF_JOB_ID", value: jobId },
+                  { name: "CERTIFICADOS_PDF_BUCKET", value: bucket },
+                  { name: "CERTIFICADOS_PDF_SEGMENTO_ID", value: segmentoId },
+                ],
+              },
+            ],
+            taskCount: 1,
+          },
+        };
+
+        const urlRun = `https://run.googleapis.com/v2/projects/${proyecto}/locations/${region}/jobs/${nombreJob}:run`;
+
+        console.log("[pdf-segmentado] Ejecutando Cloud Run Job", {
+          cursoId,
+          segmentoId,
+          jobId,
+          bucket,
+          jobName: nombreJob,
+          region,
+          body: JSON.stringify(cuerpoRun),
+        });
+
+        const respuesta = await fetch(urlRun, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${await getGoogleAccessToken()}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(cuerpoRun),
+        });
+
+        const textoRespuesta = await respuesta.text();
+
+        if (!respuesta.ok) {
+          throw new Error(
+            `Cloud Run respondió ${respuesta.status}: ${textoRespuesta.slice(
+              0,
+              300
+            )}`
+          );
+        }
+
+        let operacion: any = null;
+        try {
+          operacion = JSON.parse(textoRespuesta);
+        } catch {
+          operacion = null;
+        }
+
+        const operationName = String(operacion?.name || "");
+        const executionName = String(operacion?.metadata?.name || "");
+
+        if (operationName || executionName) {
+          await updateFirestoreDoc(
+            `certificados/${cursoId}/trabajosPdf/${jobId}`,
+            {
+              cloudRunOperationName: operationName,
+              cloudRunExecutionName: executionName,
+              actualizadoEn: new Date(),
+            }
+          ).catch(() => undefined);
+        }
+      } catch (fallo: any) {
+        // Sin esto el segmento queda con un trabajo "pendiente" eterno que
+        // bloquea todos los intentos siguientes.
+        await updateFirestoreDoc(
+          `certificados/${cursoId}/trabajosPdf/${jobId}`,
+          {
+            estado: PDF_ESTADO_ERROR,
+            error: "No se pudo iniciar la generación del PDF.",
+            finalizadoEn: new Date(),
+            actualizadoEn: new Date(),
+          }
+        ).catch(() => undefined);
+
+        console.error(
+          "[pdf-segmentado] no se pudo lanzar el Job PDF",
+          fallo
+        );
+
+        throw Object.assign(
+          new Error("No se pudo iniciar la generación del PDF del segmento."),
+          { statusCode: 502 }
+        );
+      }
+
+      console.log(
+        `[pdf-segmentado] iniciado curso=${cursoId} segmento=${segmentoId} job=${jobId} certificados=${total} por=${authUser.uid}`
+      );
+
+      return res.status(202).json({ ok: true, trabajo });
+    } catch (error: any) {
+      return sendCertificadosError(res, error);
+    }
+  }
+);
+
+// `actual` se registra ANTES que `:jobId`: las dos rutas tienen la misma forma
+// y Express resuelve por orden de declaración.
+app.get(
+  "/api/certificados/admin/pdf-segmentado/:cursoId/:segmentoId/actual",
+  async (req, res) => {
+    try {
+      const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+      await requireAdministrador(authUser);
+
+      const cursoId = parseCursoIdParam(req.params.cursoId);
+      const segmentoId = parseSegmentoIdParam(req.params.segmentoId);
+
+      const trabajo = await ultimoTrabajoSegmento(cursoId, segmentoId);
+
+      return res.status(200).json({
+        ok: true,
+        trabajo: trabajo
+          ? {
+              ...trabajo,
+              objectName: undefined,
+              storagePath: undefined,
+              listoParaDescargar: pdfTrabajoCompletado(trabajo),
+            }
+          : null,
+      });
+    } catch (error: any) {
+      return sendCertificadosError(res, error);
+    }
+  }
+);
+
+app.get(
+  "/api/certificados/admin/pdf-segmentado/:cursoId/:segmentoId/:jobId",
+  async (req, res) => {
+    try {
+      const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+      await requireAdministrador(authUser);
+
+      const cursoId = parseCursoIdParam(req.params.cursoId);
+      const segmentoId = parseSegmentoIdParam(req.params.segmentoId);
+      const jobId = parseTrabajoPdfIdParam(req.params.jobId);
+
+      const trabajo = await obtenerTrabajoSegmento(cursoId, segmentoId, jobId);
+
+      return res.status(200).json({
+        ok: true,
+        trabajo: {
+          ...trabajo,
+          objectName: undefined,
+          storagePath: undefined,
+          listoParaDescargar: pdfTrabajoCompletado(trabajo),
+        },
+      });
+    } catch (error: any) {
+      return sendCertificadosError(res, error);
+    }
+  }
+);
+
+app.get(
+  "/api/certificados/admin/pdf-segmentado/:cursoId/:segmentoId/:jobId/descargar",
+  async (req, res) => {
+    try {
+      const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+      await requireAdministrador(authUser);
+
+      const cursoId = parseCursoIdParam(req.params.cursoId);
+      const segmentoId = parseSegmentoIdParam(req.params.segmentoId);
+      const jobId = parseTrabajoPdfIdParam(req.params.jobId);
+
+      const trabajo = await obtenerTrabajoSegmento(cursoId, segmentoId, jobId);
+
+      if (!pdfTrabajoCompletado(trabajo)) {
+        throw Object.assign(new Error("El PDF todavía no está listo."), {
+          statusCode: 409,
+        });
+      }
+
+      // El objeto no se toma del pedido y además tiene que coincidir con la
+      // ruta determinística de ESTE curso, ESTE segmento y ESTE trabajo.
+      const objectName = String(trabajo.objectName || trabajo.storagePath || "");
+      const esperado = pdfSegmentoObjectName(cursoId, segmentoId, jobId);
+
+      if (objectName !== esperado) {
+        console.error(
+          `[pdf-segmentado] objectName inesperado curso=${cursoId} segmento=${segmentoId} job=${jobId}`
+        );
+        throw Object.assign(new Error("El archivo del trabajo no es válido."), {
+          statusCode: 409,
+        });
+      }
+
+      const bucket = process.env.CERTIFICADOS_PDF_BUCKET;
+
+      if (!bucket) {
+        throw Object.assign(new Error("La descarga no está configurada."), {
+          statusCode: 500,
+        });
+      }
+
+      const urlObjeto = `https://storage.googleapis.com/storage/v1/b/${encodeURIComponent(
+        bucket
+      )}/o/${encodeURIComponent(objectName)}?alt=media`;
+
+      const objeto = await fetch(urlObjeto, {
+        headers: { Authorization: `Bearer ${await getGoogleAccessToken()}` },
+      });
+
+      if (!objeto.ok || !objeto.body) {
+        const detalle = await objeto.text().catch(() => "");
+
+        console.error(
+          `[pdf-segmentado] Storage ${objeto.status} al leer ${objectName}: ${detalle.slice(
+            0,
+            300
+          )}`
+        );
+
+        // Cada causa con su código: un problema de permisos no puede volver a
+        // disfrazarse de "todavía no está listo".
+        if (objeto.status === 404) {
+          throw Object.assign(
+            new Error(
+              "El archivo del PDF no está disponible en el almacenamiento."
+            ),
+            { statusCode: 409 }
+          );
+        }
+
+        if (objeto.status === 401 || objeto.status === 403) {
+          throw Object.assign(
+            new Error("El servidor no tiene permiso para leer el PDF generado."),
+            { statusCode: 500 }
+          );
+        }
+
+        throw Object.assign(new Error("No se pudo leer el PDF generado."), {
+          statusCode: 502,
+        });
+      }
+
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="${sanitizarNombreArchivo(
+          String(trabajo.nombreArchivo || "certificados.pdf")
+        )}"`
+      );
+
+      const largo = objeto.headers.get("content-length");
+      if (largo) res.setHeader("Content-Length", largo);
+
+      // Streaming, igual que el masivo: el PDF no pasa por la memoria del
+      // backend y el bucket sigue privado.
+      Readable.fromWeb(objeto.body as any)
+        .on("error", (fallo) => {
+          console.error("[pdf-segmentado] error al transmitir el PDF", fallo);
+          if (!res.headersSent) {
+            res
+              .status(502)
+              .json({ ok: false, error: "No se pudo leer el PDF generado." });
+            return;
+          }
+          res.end();
+        })
+        .pipe(res);
+    } catch (error: any) {
+      return sendCertificadosError(res, error);
+    }
+  }
+);
 
 app.post("/api/certificados/admin/pdf-masivo/:cursoId/iniciar", async (req, res) => {
   try {

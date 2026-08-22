@@ -7,6 +7,9 @@
 // dibuja lo que recibe y no consulta Firestore. Acá se garantiza que siempre
 // reciba una emisión completa.
 
+import { resolverPadronPorDni } from "./afiliacion.js";
+import { SEGMENTO_SIN_DEPARTAMENTO } from "./segmentos.js";
+
 type FirestoreValue = any;
 
 const projectId = () =>
@@ -183,6 +186,88 @@ export async function listarEmisionesVigentesCurso(
   const institucionCurso =
     texto(configuracion.institucionCertificado) === "itm" ? "itm" : "sidca";
 
+  return proyectarEmisiones(vigentes, autoridadesCurso, institucionCurso);
+}
+
+/**
+ * Emisiones que además pueden IMPRIMIRSE hoy, opcionalmente de un solo
+ * segmento geográfico.
+ *
+ * Un certificado emitido no se borra ni se anula porque el participante deje
+ * de estar habilitado, pero tampoco puede salir en el PDF masivo mientras esa
+ * condición no se cumpla: si no, la descarga masiva sería una puerta trasera
+ * para obtener lo que la pantalla bloquea.
+ *
+ * Con `segmentoId` se queda además sólo con quienes pertenecen a ese segmento.
+ * El departamento sale de resolverPadronPorDni, que lo trae en el MISMO viaje
+ * que la afiliación: filtrar por segmento no agrega ni una consulta. Es el
+ * departamento VIGENTE del afiliado y no el que quedó congelado en el
+ * certificado, porque la descarga se organiza por dónde está hoy la gente.
+ *
+ * Sin `segmentoId` se comporta exactamente como antes.
+ *
+ * El orden importa y es el de la especificación: primero se descarta a quien
+ * no está habilitado y recién después se clasifica por segmento. Así
+ * `omitidosAfiliacion` sigue significando lo mismo que hasta ahora.
+ *
+ * Devuelve también cuántos quedaron fuera, para poder informarlo en el
+ * trabajo sin cambiar el formato de lo que ya existía.
+ */
+export async function filtrarEmisionesHabilitadas(
+  emisiones: any[],
+  accessToken: string,
+  segmentoId?: string
+): Promise<{
+  habilitadas: any[];
+  omitidosAfiliacion: number;
+  omitidosSegmento: number;
+  sinDepartamento: number;
+}> {
+  if (!emisiones.length) {
+    return {
+      habilitadas: [],
+      omitidosAfiliacion: 0,
+      omitidosSegmento: 0,
+      sinDepartamento: 0,
+    };
+  }
+
+  const padron = await resolverPadronPorDni(
+    emisiones.map((emision) => emision?.participante?.dni),
+    { proyecto: projectId(), accessToken }
+  );
+
+  const clave = (emision: any) =>
+    String(emision?.participante?.dni ?? "").replace(/\D/g, "");
+
+  const segmentoDe = (emision: any) =>
+    padron.get(clave(emision))?.departamento?.segmentoId ||
+    SEGMENTO_SIN_DEPARTAMENTO;
+
+  const habilitadasPorAfiliacion = emisiones.filter(
+    (emision) =>
+      padron.get(clave(emision))?.afiliacion?.habilitadoCertificado === true
+  );
+
+  const sinDepartamento = habilitadasPorAfiliacion.filter(
+    (emision) => segmentoDe(emision) === SEGMENTO_SIN_DEPARTAMENTO
+  ).length;
+
+  const habilitadas = segmentoId
+    ? habilitadasPorAfiliacion.filter(
+        (emision) => segmentoDe(emision) === segmentoId
+      )
+    : habilitadasPorAfiliacion;
+
+  return {
+    habilitadas,
+    omitidosAfiliacion: emisiones.length - habilitadasPorAfiliacion.length,
+    omitidosSegmento: habilitadasPorAfiliacion.length - habilitadas.length,
+    sinDepartamento,
+  };
+}
+
+function proyectarEmisiones(vigentes: any[], autoridadesCurso: any[], institucionCurso: string) {
   return vigentes.map((emision) => {
     const certificado = emision.certificado || {};
 
