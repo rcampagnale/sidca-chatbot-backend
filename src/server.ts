@@ -2914,6 +2914,7 @@ const aprobadosCursoEnCurso = new Map<
   string,
   Promise<Awaited<ReturnType<typeof resolverAprobadosCursoSinCache>>>
 >();
+const aprobadosCursoVersion = new Map<string, number>();
 
 /**
  * Extrae el ID del documento de usuario desde el name completo de una
@@ -2948,7 +2949,7 @@ function enmascararDni(dni: string): string {
 
 type FirestoreBatchGetResponse = {
   found?: FirestoreDocument;
-  missing?: { name?: string };
+  missing?: string;
 };
 
 /** Lee usuarios académicos con documents:batchGet, sin modificar Firestore. */
@@ -2971,24 +2972,40 @@ async function batchGetUsuarios(
     throw new Error("Firestore batchGet devolvió una respuesta inválida.");
   }
 
+  const solicitados = new Set(usuarioDocIds);
   const encontrados = new Map<string, FirestoreRecord | null>();
 
   for (const elemento of respuesta) {
     if (elemento?.found?.name) {
-      const usuario = firestoreDocToJs(elemento.found);
-      encontrados.set(getDocumentoId(elemento.found.name), usuario);
+      const usuarioDocId = getDocumentoId(elemento.found.name);
+      if (!solicitados.has(usuarioDocId)) {
+        throw new Error("Firestore batchGet devolvió un documento no solicitado.");
+      }
+      if (encontrados.has(usuarioDocId)) {
+        throw new Error("Firestore batchGet devolvió un documento duplicado.");
+      }
+      encontrados.set(usuarioDocId, firestoreDocToJs(elemento.found));
       continue;
     }
 
-    if (elemento?.missing?.name) {
-      encontrados.set(getDocumentoId(elemento.missing.name), null);
+    if (typeof elemento?.missing === "string" && elemento.missing) {
+      const usuarioDocId = getDocumentoId(elemento.missing);
+      if (!solicitados.has(usuarioDocId)) {
+        throw new Error("Firestore batchGet devolvió un missing no solicitado.");
+      }
+      if (encontrados.has(usuarioDocId)) {
+        throw new Error("Firestore batchGet devolvió un documento duplicado.");
+      }
+      encontrados.set(usuarioDocId, null);
+      continue;
     }
+
+    throw new Error("Firestore batchGet devolvió una entrada inválida.");
   }
 
-  // Firestore puede omitir una entrada anómala; se conserva la semántica
-  // anterior: ese usuario queda como inexistente, nunca se descarta.
-  for (const usuarioDocId of usuarioDocIds) {
-    if (!encontrados.has(usuarioDocId)) encontrados.set(usuarioDocId, null);
+  // Sólo una respuesta missing explícita produce null; una respuesta incompleta falla.
+  if (usuarioDocIds.some((usuarioDocId) => !encontrados.has(usuarioDocId))) {
+    throw new Error("Firestore batchGet devolvió una respuesta incompleta.");
   }
 
   return encontrados;
@@ -3524,6 +3541,7 @@ async function resolverAprobadosCursoSinCache(cursoId: string) {
 }
 
 async function resolverAprobadosCurso(cursoId: string) {
+  const version = aprobadosCursoVersion.get(cursoId) || 0;
   const cacheado = aprobadosCursoCache.get(cursoId);
   if (cacheado && cacheado.expiraEn > Date.now()) {
     console.log(`[perf] aprobados-curso curso=${cursoId} cache=hit`);
@@ -3540,10 +3558,12 @@ async function resolverAprobadosCurso(cursoId: string) {
   console.log(`[perf] aprobados-curso curso=${cursoId} cache=miss`);
   const carga = resolverAprobadosCursoSinCache(cursoId)
     .then((datos) => {
-      aprobadosCursoCache.set(cursoId, {
-        datos,
-        expiraEn: Date.now() + APROBADOS_CACHE_TTL_MS,
-      });
+      if ((aprobadosCursoVersion.get(cursoId) || 0) === version) {
+        aprobadosCursoCache.set(cursoId, {
+          datos,
+          expiraEn: Date.now() + APROBADOS_CACHE_TTL_MS,
+        });
+      }
       return datos;
     })
     .finally(() => {
@@ -3558,7 +3578,10 @@ async function resolverAprobadosCurso(cursoId: string) {
 
 function invalidarCacheAprobadosCurso(cursoId: string): void {
   const id = String(cursoId || "").trim();
-  if (id) aprobadosCursoCache.delete(id);
+  if (!id) return;
+  aprobadosCursoVersion.set(id, (aprobadosCursoVersion.get(id) || 0) + 1);
+  aprobadosCursoCache.delete(id);
+  aprobadosCursoEnCurso.delete(id);
 }
 
 app.get("/api/certificados/admin/aprobados/:cursoId", async (req, res) => {
