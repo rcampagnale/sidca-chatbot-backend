@@ -182,6 +182,27 @@ export async function renderCertificadoPdfPage(
     const altoLinea = doc.currentLineHeight(false);
     const ySuperior = y - altoLinea / 2;
 
+    if (opts.escalaXForzada !== undefined) {
+      const anchoVisual = anchoReal * escalaX;
+      const alineacion = opts.alineacion || "center";
+      const xVisual =
+        alineacion === "left"
+          ? x
+          : alineacion === "right"
+            ? x + width - anchoVisual
+            : x + (width - anchoVisual) / 2;
+
+      doc.save();
+      doc.translate(xVisual, 0);
+      doc.scale(escalaX, 1);
+      doc.text(content, 0, ySuperior, {
+        lineBreak: false,
+        lineGap: 0,
+      });
+      doc.restore();
+      return;
+    }
+
     // Se traslada al borde izquierdo de la caja y se comprime desde ahí: el
     // ancho local pasa a ser width/escalaX, así el centrado sigue cayendo en
     // el centro real de la caja y la geometría no se mueve.
