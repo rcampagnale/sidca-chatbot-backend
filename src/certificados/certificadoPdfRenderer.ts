@@ -306,7 +306,8 @@ export async function renderCertificadoPdfPage(
   dibujarUnaLinea(text(certificado.modalidad), pct(doc.page.width, mx), pct(doc.page.height, my), pct(doc.page.width, mw), FS_MODALIDAD, { bold: true, alineacion: "center" });
   const [daysX, daysY, daysW] = LAYOUT.dias;
   const diasLeft = itm ? 51.2 : daysX;
-  dibujarUnaLinea(text(certificado.dias), pct(doc.page.width, diasLeft), pct(doc.page.height, daysY), pct(doc.page.width, daysW), FS_DIAS, { bold: true, alineacion: "center", escalaXForzada: 0.74, mantenerCuerpo: true });
+  const diasTexto = text(certificado.dias).replace(/\s+/g, " ").trim();
+  dibujarUnaLinea(diasTexto, pct(doc.page.width, diasLeft), pct(doc.page.height, daysY), pct(doc.page.width, daysW), FS_DIAS, { bold: true, alineacion: "center", escalaXForzada: 0.74, mantenerCuerpo: true });
   const [cx, cy, cw] = LAYOUT.carga;
   dibujarUnaLinea(text(certificado.cargaHoraria), pct(doc.page.width, cx), pct(doc.page.height, cy), pct(doc.page.width, cw), FS_CARGA, { bold: true, alineacion: "center" });
 
