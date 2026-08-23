@@ -4786,16 +4786,25 @@ const EMITIDOS_ESTADOS_CONOCIDOS = new Set([
 
 app.get("/api/certificados/validar/:cursoId/:token", async (req, res) => {
   try {
+    const inicioValidacion = Date.now();
+
+    const inicioFirebaseAuth = Date.now();
     const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    const firebaseAuth = Date.now() - inicioFirebaseAuth;
+
+    const inicioResolverPermiso = Date.now();
     const permiso = await requireAdministradorOValidadorCertificados(authUser);
+    const resolverPermiso = Date.now() - inicioResolverPermiso;
 
     const cursoId = parseCursoIdParam(req.params.cursoId);
     const token = parseCertificadoTokenParam(req.params.token);
 
     // El token ES el ID del documento: lectura directa, sin query.
+    const inicioLeerCertificado = Date.now();
     const emision = await getFirestoreDoc(
       `certificados/${cursoId}/emitidos/${token}`
     );
+    const leerCertificado = Date.now() - inicioLeerCertificado;
 
     const noEncontrado = () =>
       Object.assign(
@@ -4828,6 +4837,7 @@ app.get("/api/certificados/validar/:cursoId/:token", async (req, res) => {
       `[sidca-chatbot-backend] certificado validado curso=${cursoId} estado=${estado} por=${permiso.tipo}`
     );
 
+    const inicioRegistrarVerificacion = Date.now();
     const verificado = await addFirestoreDoc(
       `certificados/${cursoId}/emitidos/${token}/verificaciones`,
       {
@@ -4841,6 +4851,11 @@ app.get("/api/certificados/validar/:cursoId/:token", async (req, res) => {
         tipoValidador: permiso.tipo,
         validadoEn: new Date().toISOString(),
       }
+    );
+    const registrarVerificacion = Date.now() - inicioRegistrarVerificacion;
+
+    console.log(
+      `[perf] validar-certificado firebaseAuth=${firebaseAuth}ms resolverPermiso=${resolverPermiso}ms leerCertificado=${leerCertificado}ms registrarVerificacion=${registrarVerificacion}ms total=${Date.now() - inicioValidacion}ms estado=${estado || "(vacio)"} tipoValidador=${permiso.tipo}`
     );
 
     return res.status(200).json({
