@@ -2884,7 +2884,36 @@ app.get("/api/certificados/admin/configuraciones", async (req, res) => {
 // ============================================================
 
 const APROBADOS_MAX_RESULTADOS = 10_000;
-const USUARIOS_LOTE_CONCURRENTE = 20;
+const APROBADOS_CACHE_TTL_MS = 45_000;
+const USUARIOS_BATCH_GET_CHUNK_SIZE = 200;
+
+type MetricasUsuariosAprobados = {
+  usuariosCacheHit: number;
+  usuariosCacheMiss: number;
+};
+
+type UsuarioAcademicoCacheEntry = {
+  usuario: FirestoreRecord | null;
+  expiraEn: number;
+};
+
+const usuariosAcademicosCache = new Map<
+  string,
+  UsuarioAcademicoCacheEntry
+>();
+const usuariosAcademicosEnCurso = new Map<
+  string,
+  Promise<FirestoreRecord | null>
+>();
+
+const aprobadosCursoCache = new Map<
+  string,
+  { datos: Awaited<ReturnType<typeof resolverAprobadosCursoSinCache>>; expiraEn: number }
+>();
+const aprobadosCursoEnCurso = new Map<
+  string,
+  Promise<Awaited<ReturnType<typeof resolverAprobadosCursoSinCache>>>
+>();
 
 /**
  * Extrae el ID del documento de usuario desde el name completo de una
@@ -2917,21 +2946,129 @@ function enmascararDni(dni: string): string {
   return `${dni.slice(0, 2)}***${dni.slice(-2)}`;
 }
 
-/** Ejecuta tareas en lotes para no abrir cientos de conexiones a la vez. */
-async function resolverEnLotes<T, R>(
-  items: T[],
-  tamanoLote: number,
-  tarea: (item: T) => Promise<R>
-): Promise<R[]> {
-  const salida: R[] = [];
+type FirestoreBatchGetResponse = {
+  found?: FirestoreDocument;
+  missing?: { name?: string };
+};
 
-  for (let i = 0; i < items.length; i += tamanoLote) {
-    const lote = items.slice(i, i + tamanoLote);
-    const resueltos = await Promise.all(lote.map((item) => tarea(item)));
-    salida.push(...resueltos);
+/** Lee usuarios académicos con documents:batchGet, sin modificar Firestore. */
+async function batchGetUsuarios(
+  usuarioDocIds: string[]
+): Promise<Map<string, FirestoreRecord | null>> {
+  const documentos = usuarioDocIds.map(
+    (usuarioDocId) =>
+      `projects/${firebaseProjectId}/databases/(default)/documents/usuarios/${usuarioDocId}`
+  );
+  const respuesta = await firestoreRequest<FirestoreBatchGetResponse[]>(
+    `${firestoreBaseUrl}:batchGet`,
+    {
+      method: "POST",
+      body: JSON.stringify({ documents: documentos }),
+    }
+  );
+
+  if (!Array.isArray(respuesta)) {
+    throw new Error("Firestore batchGet devolvió una respuesta inválida.");
   }
 
-  return salida;
+  const encontrados = new Map<string, FirestoreRecord | null>();
+
+  for (const elemento of respuesta) {
+    if (elemento?.found?.name) {
+      const usuario = firestoreDocToJs(elemento.found);
+      encontrados.set(getDocumentoId(elemento.found.name), usuario);
+      continue;
+    }
+
+    if (elemento?.missing?.name) {
+      encontrados.set(getDocumentoId(elemento.missing.name), null);
+    }
+  }
+
+  // Firestore puede omitir una entrada anómala; se conserva la semántica
+  // anterior: ese usuario queda como inexistente, nunca se descarta.
+  for (const usuarioDocId of usuarioDocIds) {
+    if (!encontrados.has(usuarioDocId)) encontrados.set(usuarioDocId, null);
+  }
+
+  return encontrados;
+}
+
+/** Resuelve usuarios con caché negativa y single-flight por documento. */
+async function resolverUsuariosPorIds(
+  usuarioDocIds: string[],
+  metricas?: MetricasUsuariosAprobados
+): Promise<Map<string, FirestoreRecord | null>> {
+  const ids = [
+    ...new Set(
+      usuarioDocIds.map((valor) => String(valor || "").trim()).filter(Boolean)
+    ),
+  ];
+  const resultado = new Map<string, FirestoreRecord | null>();
+  const solicitudes = new Map<string, Promise<FirestoreRecord | null>>();
+  const pendientes: string[] = [];
+  const ahora = Date.now();
+
+  for (const usuarioDocId of ids) {
+    const cacheado = usuariosAcademicosCache.get(usuarioDocId);
+    if (cacheado && cacheado.expiraEn > ahora) {
+      resultado.set(usuarioDocId, cacheado.usuario);
+      if (metricas) metricas.usuariosCacheHit += 1;
+      continue;
+    }
+    if (cacheado) usuariosAcademicosCache.delete(usuarioDocId);
+
+    if (metricas) metricas.usuariosCacheMiss += 1;
+    const enCurso = usuariosAcademicosEnCurso.get(usuarioDocId);
+    if (enCurso) {
+      solicitudes.set(usuarioDocId, enCurso);
+    } else {
+      pendientes.push(usuarioDocId);
+    }
+  }
+
+  for (
+    let inicio = 0;
+    inicio < pendientes.length;
+    inicio += USUARIOS_BATCH_GET_CHUNK_SIZE
+  ) {
+    const lote = pendientes.slice(
+      inicio,
+      inicio + USUARIOS_BATCH_GET_CHUNK_SIZE
+    );
+    const batch = batchGetUsuarios(lote);
+
+    for (const usuarioDocId of lote) {
+      const solicitud = batch
+        .then((usuarios) => {
+          const usuario = usuarios.get(usuarioDocId) || null;
+          usuariosAcademicosCache.set(usuarioDocId, {
+            usuario,
+            expiraEn: Date.now() + APROBADOS_CACHE_TTL_MS,
+          });
+          return usuario;
+        })
+        .finally(() => {
+          if (usuariosAcademicosEnCurso.get(usuarioDocId) === solicitud) {
+            usuariosAcademicosEnCurso.delete(usuarioDocId);
+          }
+        });
+
+      usuariosAcademicosEnCurso.set(usuarioDocId, solicitud);
+      solicitudes.set(usuarioDocId, solicitud);
+    }
+  }
+
+  const resueltos = await Promise.all(
+    ids.map(async (usuarioDocId) => {
+      const usuario = resultado.has(usuarioDocId)
+        ? resultado.get(usuarioDocId) || null
+        : await solicitudes.get(usuarioDocId);
+      return [usuarioDocId, usuario || null] as const;
+    })
+  );
+
+  return new Map(resueltos);
 }
 
 /**
@@ -3115,22 +3252,18 @@ async function resolverParticipantesAprobados(
   porUsuario: Map<string, number>,
   apartado = false,
   usuariosConCertificadoVigente = new Set<string>(),
-  usuariosConCertificadoQrValido = usuariosConCertificadoVigente
+  usuariosConCertificadoQrValido = usuariosConCertificadoVigente,
+  metricas?: MetricasUsuariosAprobados & { padron: number; usuarios: number }
 ): Promise<ParticipanteAprobado[]> {
-  const resueltos = await resolverEnLotes(
-    [...porUsuario.keys()],
-    USUARIOS_LOTE_CONCURRENTE,
-    async (usuarioDocId) => {
-      const usuario = await getFirestoreDoc(`usuarios/${usuarioDocId}`);
-      return { usuarioDocId, usuario };
-    }
-  );
+  const inicioUsuarios = Date.now();
+  const usuarios = await resolverUsuariosPorIds([...porUsuario.keys()], metricas);
+  if (metricas) metricas.usuarios += Date.now() - inicioUsuarios;
 
   const participantes = consolidarParticipantesPorDni(
-    resueltos.map(({ usuarioDocId, usuario }) =>
+    [...porUsuario.keys()].map((usuarioDocId) =>
       construirParticipanteAprobado(
         usuarioDocId,
-        usuario,
+        usuarios.get(usuarioDocId) || null,
         porUsuario.get(usuarioDocId) || 1,
         apartado,
         usuariosConCertificadoVigente.has(usuarioDocId),
@@ -3143,10 +3276,12 @@ async function resolverParticipantesAprobados(
   // la lista: cada DNI distinto se consulta una vez, con concurrencia acotada.
   // No modifica el estado académico ni las exclusiones; sólo agrega el dato
   // que decide la habilitación para emitir y descargar.
+  const inicioPadron = Date.now();
   const padron = await resolverPadronPorDni(
     participantes.map((participante) => participante.dni),
     { proyecto: firebaseProjectId, accessToken: await getGoogleAccessToken() }
   );
+  if (metricas) metricas.padron += Date.now() - inicioPadron;
 
   return participantes
     .map((participante) => {
@@ -3179,7 +3314,18 @@ async function resolverParticipantesAprobados(
  * de confiar en la que tiene abierta el navegador. Una sola implementación:
  * si mañana cambia el criterio de "aprobado", cambia para las dos.
  */
-async function resolverAprobadosCurso(cursoId: string) {
+async function resolverAprobadosCursoSinCache(cursoId: string) {
+  const inicioResolver = Date.now();
+  const metricas: MetricasUsuariosAprobados & {
+    padron: number;
+    usuarios: number;
+  } = {
+    usuariosCacheHit: 0,
+    usuariosCacheMiss: 0,
+    padron: 0,
+    usuarios: 0,
+  };
+  const inicioBase = Date.now();
   {
     // Estas cuatro lecturas son independientes entre sí: ninguna necesita el
     // resultado de otra para saber QUÉ pedir, todas conocen cursoId de
@@ -3207,6 +3353,7 @@ async function resolverAprobadosCurso(cursoId: string) {
         APROBADOS_MAX_RESULTADOS
       ),
     ]);
+    const tiempoBase = Date.now() - inicioBase;
 
     if (!curso) {
       throw Object.assign(new Error("El curso indicado no existe."), {
@@ -3285,13 +3432,15 @@ async function resolverAprobadosCurso(cursoId: string) {
         porUsuario,
         false,
         usuariosConCertificadoVigente,
-        usuariosConCertificadoQrValido
+        usuariosConCertificadoQrValido,
+        metricas
       ),
       resolverParticipantesAprobados(
         porUsuarioExcluido,
         true,
         usuariosConCertificadoVigente,
-        usuariosConCertificadoQrValido
+        usuariosConCertificadoQrValido,
+        metricas
       ),
     ]);
 
@@ -3336,6 +3485,9 @@ async function resolverAprobadosCurso(cursoId: string) {
     console.log(
       `[sidca-chatbot-backend] aprobados curso=${cursoId} documentos=${documentosAprobacion} disponibles=${participantes.length} apartados=${excluidos} duplicados=${duplicados}`
     );
+    console.log(
+      `[perf] aprobados-resolver curso=${cursoId} base=${tiempoBase}ms usuarios=${metricas.usuarios}ms usuariosCacheHit=${metricas.usuariosCacheHit} usuariosCacheMiss=${metricas.usuariosCacheMiss} padron=${metricas.padron}ms total=${Date.now() - inicioResolver}ms`
+    );
 
     return {
       curso: {
@@ -3369,6 +3521,44 @@ async function resolverAprobadosCurso(cursoId: string) {
       participantesExcluidos,
     };
   }
+}
+
+async function resolverAprobadosCurso(cursoId: string) {
+  const cacheado = aprobadosCursoCache.get(cursoId);
+  if (cacheado && cacheado.expiraEn > Date.now()) {
+    console.log(`[perf] aprobados-curso curso=${cursoId} cache=hit`);
+    return cacheado.datos;
+  }
+  if (cacheado) aprobadosCursoCache.delete(cursoId);
+
+  const enCurso = aprobadosCursoEnCurso.get(cursoId);
+  if (enCurso) {
+    console.log(`[perf] aprobados-curso curso=${cursoId} cache=shared`);
+    return enCurso;
+  }
+
+  console.log(`[perf] aprobados-curso curso=${cursoId} cache=miss`);
+  const carga = resolverAprobadosCursoSinCache(cursoId)
+    .then((datos) => {
+      aprobadosCursoCache.set(cursoId, {
+        datos,
+        expiraEn: Date.now() + APROBADOS_CACHE_TTL_MS,
+      });
+      return datos;
+    })
+    .finally(() => {
+      if (aprobadosCursoEnCurso.get(cursoId) === carga) {
+        aprobadosCursoEnCurso.delete(cursoId);
+      }
+    });
+
+  aprobadosCursoEnCurso.set(cursoId, carga);
+  return carga;
+}
+
+function invalidarCacheAprobadosCurso(cursoId: string): void {
+  const id = String(cursoId || "").trim();
+  if (id) aprobadosCursoCache.delete(id);
 }
 
 app.get("/api/certificados/admin/aprobados/:cursoId", async (req, res) => {
@@ -3617,6 +3807,7 @@ app.put(
           actualizadoEn: new Date().toISOString(),
           actualizadoPor: authUser.uid,
         });
+        invalidarCacheAprobadosCurso(cursoId);
       }
 
       return res.status(200).json({
@@ -3664,6 +3855,7 @@ app.put(
           actualizadoEn: new Date().toISOString(),
           actualizadoPor: authUser.uid,
         });
+        invalidarCacheAprobadosCurso(cursoId);
       }
 
       return res.status(200).json({
@@ -3707,6 +3899,7 @@ async function cambiarVisibilidadEmision(
       actualizadoEn: new Date().toISOString(),
       actualizadoPor: authUser.uid,
     });
+    invalidarCacheAprobadosCurso(cursoId);
 
     return res.status(200).json({
       ok: true,
@@ -4403,6 +4596,7 @@ app.post("/api/certificados/admin/emision/:cursoId/emitir", async (req, res) => 
       usuarioDocId,
       authUser,
     });
+    invalidarCacheAprobadosCurso(cursoId);
 
     // Misma forma de respuesta que antes del refactor: la pantalla de emisión
     // individual no se entera de que la lógica se movió.
@@ -4515,6 +4709,8 @@ app.post("/api/certificados/admin/emision/:cursoId/emitir-masivo", async (req, r
         });
       });
     }
+
+    if (emitidos > 0) invalidarCacheAprobadosCurso(cursoId);
 
     console.log(
       `[sidca-chatbot-backend] emisión masiva curso= candidatos= emitidos= yaEmitidos= afiliacion= errores= por=`
