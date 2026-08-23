@@ -326,7 +326,8 @@ export async function renderCertificadoPdfPage(
   const [mx, my, mw] = LAYOUT.modalidad;
   dibujarUnaLinea(text(certificado.modalidad), pct(doc.page.width, mx), pct(doc.page.height, my), pct(doc.page.width, mw), FS_MODALIDAD, { bold: true, alineacion: "center" });
   const [daysX, daysY, daysW] = LAYOUT.dias;
-  const diasLeft = itm ? 51.2 : daysX;
+  const DESPLAZAMIENTO_DIAS_PDF = 3.0;
+  const diasLeft = (itm ? 51.2 : daysX) + DESPLAZAMIENTO_DIAS_PDF;
   const diasTexto = text(certificado.dias).replace(/\s+/g, " ").trim();
   dibujarUnaLinea(diasTexto, pct(doc.page.width, diasLeft), pct(doc.page.height, daysY), pct(doc.page.width, daysW), FS_DIAS, { bold: true, alineacion: "center", escalaXForzada: 0.74, mantenerCuerpo: true });
   const [cx, cy, cw] = LAYOUT.carga;
