@@ -4792,19 +4792,31 @@ app.get("/api/certificados/validar/:cursoId/:token", async (req, res) => {
     const authUser = await verifyFirebaseIdToken(req.headers.authorization);
     const firebaseAuth = Date.now() - inicioFirebaseAuth;
 
-    const inicioResolverPermiso = Date.now();
-    const permiso = await requireAdministradorOValidadorCertificados(authUser);
-    const resolverPermiso = Date.now() - inicioResolverPermiso;
-
     const cursoId = parseCursoIdParam(req.params.cursoId);
     const token = parseCertificadoTokenParam(req.params.token);
 
+    // Auth ya terminó: recién ahora se pueden iniciar en paralelo la
+    // autorización y la lectura directa del certificado.
+    let resolverPermiso = 0;
+    const inicioResolverPermiso = Date.now();
+    const permisoPromise = requireAdministradorOValidadorCertificados(authUser)
+      .finally(() => {
+        resolverPermiso = Date.now() - inicioResolverPermiso;
+      });
+
     // El token ES el ID del documento: lectura directa, sin query.
+    let leerCertificado = 0;
     const inicioLeerCertificado = Date.now();
-    const emision = await getFirestoreDoc(
+    const emisionPromise = getFirestoreDoc(
       `certificados/${cursoId}/emitidos/${token}`
-    );
-    const leerCertificado = Date.now() - inicioLeerCertificado;
+    ).finally(() => {
+      leerCertificado = Date.now() - inicioLeerCertificado;
+    });
+
+    const [permiso, emision] = await Promise.all([
+      permisoPromise,
+      emisionPromise,
+    ]);
 
     const noEncontrado = () =>
       Object.assign(
