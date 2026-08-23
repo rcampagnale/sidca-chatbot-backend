@@ -25,7 +25,7 @@ const money = (value: unknown) => text(value);
 const formatDni = (value: unknown) => text(value).replace(/\B(?=(\d{3})+(?!\d))/g, ".");
 const LAYOUT = {
   nombre: [32, 36, 36.5], dni: [78, 35.9, 15], titulo: [17, 44.7, 66],
-  modalidad: [18, 49.7, 12.5], dias: [51.8, 49.9, 22], carga: [52.5, 53, 23.5],
+  modalidad: [18, 53, 16.5], dias: [51.8, 53.2, 22], carga: [52.5, 56.2, 23.5],
   resolucion: [72.6, 65.1, 15], fecha: [69.5, 69.3, 21], qr: [77.2, 71.4, 14.3],
 };
 const pct = (page: number, value: number) => page * value / 100;
@@ -60,10 +60,10 @@ const cqw = (doc: PDFKit.PDFDocument, valor: number) => (doc.page.width * valor)
  */
 const TITULO = {
   cuerpoMax: 2.3, // cqw
-  cuerpoMin: 0.9, // cqw
+  cuerpoMin: 1.05, // cqw: piso legible para títulos largos
   interlinea: 1.1,
-  lineasMax: 2,
-  altoMax: 6.0, // cqw — banda física del título
+  lineasMax: 3,
+  altoMax: 8.2, // % de alto de página reservado dinámicamente
   centroY: 45.6, // % del alto de la página
 };
 
@@ -180,6 +180,8 @@ export async function renderCertificadoPdfPage(
   // tenga siete caracteres y otro veinticuatro.
   const FS_DATO = cqw(doc, 2.2);
   const FS_SECUNDARIO = cqw(doc, 2.1);
+  const FS_MODALIDAD = cqw(doc, 2.35);
+  const FS_CARGA = cqw(doc, 2.35);
   // Los días llevan cuerpo propio, más chico que el resto de los datos: un
   // rango completo son veinticuatro caracteres y a 2.2cqw ocupaba el 100% de
   // su caja, quedando pegado a la leyenda impresa "…durante los días,". Con
@@ -201,7 +203,7 @@ export async function renderCertificadoPdfPage(
 
   if (tituloTexto) {
     const anchoTitulo = pct(doc.page.width, tw);
-    const altoMaximo = cqw(doc, TITULO.altoMax);
+    const altoMaximo = pct(doc.page.height, TITULO.altoMax);
     const cuerpoMinimo = cqw(doc, TITULO.cuerpoMin);
 
     doc.font("Helvetica-Bold");
@@ -253,10 +255,42 @@ export async function renderCertificadoPdfPage(
       pct(doc.page.height, TITULO.centroY) - medida.alto / 2,
       { width: anchoTitulo, align: "center", lineGap: medida.lineGap }
     );
+
+    const [mx, my, mw] = LAYOUT.modalidad;
+    dibujarUnaLinea(
+      text(certificado.modalidad).toUpperCase(),
+      pct(doc.page.width, mx),
+      pct(doc.page.height, my) - 6,
+      pct(doc.page.width, mw),
+      FS_MODALIDAD,
+      { bold: true, compresionMinima: 0.8 }
+    );
+    const [daysX, daysY, daysW] = LAYOUT.dias;
+    dibujarUnaLinea(
+      text(certificado.dias).toUpperCase(),
+      pct(doc.page.width, daysX),
+      pct(doc.page.height, daysY) - 6,
+      pct(doc.page.width, daysW),
+      FS_DIAS,
+      { bold: true, compresionMinima: 0.85 }
+    );
+    const [cx, cy, cw] = LAYOUT.carga;
+    dibujarUnaLinea(
+      text(certificado.cargaHoraria).toUpperCase(),
+      pct(doc.page.width, cx),
+      pct(doc.page.height, cy) - 6,
+      pct(doc.page.width, cw),
+      FS_CARGA,
+      { bold: true, compresionMinima: 0.8 }
+    );
+  } else {
+    const [mx, my, mw] = LAYOUT.modalidad;
+    dibujarUnaLinea(text(certificado.modalidad).toUpperCase(), pct(doc.page.width, mx), pct(doc.page.height, my) - 6, pct(doc.page.width, mw), FS_MODALIDAD, { bold: true, compresionMinima: 0.8 });
+    const [daysX, daysY, daysW] = LAYOUT.dias;
+    dibujarUnaLinea(text(certificado.dias).toUpperCase(), pct(doc.page.width, daysX), pct(doc.page.height, daysY) - 6, pct(doc.page.width, daysW), FS_DIAS, { bold: true, compresionMinima: 0.85 });
+    const [cx, cy, cw] = LAYOUT.carga;
+    dibujarUnaLinea(text(certificado.cargaHoraria).toUpperCase(), pct(doc.page.width, cx), pct(doc.page.height, cy) - 6, pct(doc.page.width, cw), FS_CARGA, { bold: true, compresionMinima: 0.8 });
   }
-  const [mx, my, mw] = LAYOUT.modalidad; dibujarUnaLinea(text(certificado.modalidad).toUpperCase(), pct(doc.page.width, mx), pct(doc.page.height, my) - 6, pct(doc.page.width, mw), FS_SECUNDARIO, { bold: true, compresionMinima: 0.8 });
-  const [daysX, daysY, daysW] = LAYOUT.dias; dibujarUnaLinea(text(certificado.dias).toUpperCase(), pct(doc.page.width, daysX), pct(doc.page.height, daysY) - 6, pct(doc.page.width, daysW), FS_DIAS, { bold: true, compresionMinima: 0.85 });
-  const [cx, cy, cw] = LAYOUT.carga; dibujarUnaLinea(text(certificado.cargaHoraria).toUpperCase(), pct(doc.page.width, cx), pct(doc.page.height, cy) - 6, pct(doc.page.width, cw), FS_SECUNDARIO, { bold: true, compresionMinima: 0.8 });
   // La resolución NO comparte cuerpo con el DNI: su caja es del 15% y a
   // 2.2cqw el texto se partía e invadía la línea de fecha. Acá el orden se
   // invierte respecto de los demás datos —primero se busca el cuerpo que
