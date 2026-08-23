@@ -1025,19 +1025,22 @@ async function findRegistrosValidadorByAuth(authUser: AuthenticatedUser): Promis
   });
   const colecciones = ["usuarios", "nuevoAfiliado"] as const;
 
-  const directos = await Promise.all(
-    colecciones.map((coleccion) => getFirestoreDoc(`${coleccion}/${authUser.uid}`))
-  );
-  directos.forEach((doc) => { if (doc) agregar([doc]); });
-
-  const porCampoUid = await Promise.all(
-    ["uid", "usuarioId", "userId", "authUid"].flatMap((campo) =>
-      colecciones.map((coleccion) =>
-        queryFirestoreCollection(coleccion, [{ field: campo, value: authUser.uid }], 50)
+  const inicioFaseUid = Date.now();
+  const [directos, porCampoUid] = await Promise.all([
+    Promise.all(
+      colecciones.map((coleccion) => getFirestoreDoc(`${coleccion}/${authUser.uid}`))
+    ),
+    Promise.all(
+      ["uid", "usuarioId", "userId", "authUid"].flatMap((campo) =>
+        colecciones.map((coleccion) =>
+          queryFirestoreCollection(coleccion, [{ field: campo, value: authUser.uid }], 50)
+        )
       )
-    )
-  );
+    ),
+  ]);
+  directos.forEach((doc) => { if (doc) agregar([doc]); });
   porCampoUid.forEach((docs) => agregar(docs));
+  console.log(`[perf] buscar-validador faseUid=${Date.now() - inicioFaseUid}ms encontrados=${encontrados.size}`);
 
   if (encontrados.size === 0 && authUser.email) {
     const email = authUser.email.trim().toLowerCase();
