@@ -124,6 +124,71 @@ async function listarColeccion(
   return documentos;
 }
 
+/**
+ * Caché corta de las TRES colecciones completas (adherentes, nuevoAfiliado,
+ * usuarios).
+ *
+ * listarColeccion pagina la colección ENTERA sin filtro — miles de documentos,
+ * varias decenas de páginas — y antes se repetía sin caché en CADA llamada a
+ * resolverPadronPorDni: una vez por curso al listar Registro de Aprobados,
+ * una vez por segmento al generar un PDF, una vez en cada emisión masiva. Con
+ * treinta cursos abiertos en la misma pantalla eso eran treinta repaginados
+ * completos de las mismas tres colecciones.
+ *
+ * TTL corto (45s): si un administrador cambia el `activo` de un afiliado, el
+ * cambio tarda como máximo eso en reflejarse en afiliación y departamento, no
+ * el resto de la sesión. Vive en memoria del proceso, por proyecto+colección;
+ * cada instancia de Cloud Run tiene la suya y se pierde en cada reinicio.
+ */
+type ColeccionCacheEntry = {
+  documentos: Record<string, any>[];
+  expiraEn: number;
+};
+
+const COLECCION_CACHE_TTL_MS = 45_000;
+const coleccionCache = new Map<string, ColeccionCacheEntry>();
+// Evita que varios cache miss simultáneos paginen la misma colección más de
+// una vez: todos esperan la misma Promise y sólo el resultado exitoso entra
+// en la caché de 45 segundos.
+const coleccionEnCurso = new Map<string, Promise<Record<string, any>[]>>();
+
+async function listarColeccionCacheada(
+  proyecto: string,
+  accessToken: string,
+  coleccion: string
+): Promise<Record<string, any>[]> {
+  const clave = `${proyecto}/${coleccion}`;
+  const cacheado = coleccionCache.get(clave);
+
+  if (cacheado && cacheado.expiraEn > Date.now()) {
+    console.log(`[perf] listarColeccionCacheada proyecto=${proyecto} coleccion=${coleccion} cache=hit`);
+    return cacheado.documentos;
+  }
+
+  const cargaExistente = coleccionEnCurso.get(clave);
+  if (cargaExistente) {
+    console.log(`[perf] listarColeccionCacheada proyecto=${proyecto} coleccion=${coleccion} cache=shared`);
+    return cargaExistente;
+  }
+
+  console.log(`[perf] listarColeccionCacheada proyecto=${proyecto} coleccion=${coleccion} cache=miss`);
+  const carga = listarColeccion(proyecto, accessToken, coleccion)
+    .then((documentos) => {
+      coleccionCache.set(clave, {
+        documentos,
+        expiraEn: Date.now() + COLECCION_CACHE_TTL_MS,
+      });
+      return documentos;
+    })
+    .finally(() => {
+      // También se borra si falla: ningún error queda cacheado.
+      coleccionEnCurso.delete(clave);
+    });
+
+  coleccionEnCurso.set(clave, carga);
+  return carga;
+}
+
 const valorFirestore = (campo: any): string => {
   if (typeof campo?.stringValue === "string") return campo.stringValue;
   if (campo?.integerValue !== undefined) return String(campo.integerValue);
@@ -254,13 +319,22 @@ export async function resolverPadronPorDni(
 
   if (!unicos.length) return salida;
 
+  const inicio = Date.now();
+  const clavesCache = [COLECCION_ADHERENTES, COLECCION_NUEVO_AFILIADO, COLECCION_USUARIOS]
+    .map((coleccion) => `${proyecto}/${coleccion}`);
+  const cacheHit = clavesCache.every(
+    (clave) => (coleccionCache.get(clave)?.expiraEn || 0) > Date.now()
+  );
+
   const solicitados = new Set(unicos);
   const [documentosAdherentes, documentosNuevoAfiliado, documentosUsuarios] =
     await Promise.all([
-      listarColeccion(proyecto, accessToken, COLECCION_ADHERENTES),
-      listarColeccion(proyecto, accessToken, COLECCION_NUEVO_AFILIADO),
-      listarColeccion(proyecto, accessToken, COLECCION_USUARIOS),
+      listarColeccionCacheada(proyecto, accessToken, COLECCION_ADHERENTES),
+      listarColeccionCacheada(proyecto, accessToken, COLECCION_NUEVO_AFILIADO),
+      listarColeccionCacheada(proyecto, accessToken, COLECCION_USUARIOS),
     ]);
+
+  console.log(`[perf] resolverPadron dnis=${unicos.length} cache=${cacheHit ? "hit" : "miss"} tiempo=${Date.now() - inicio}ms`);
 
   const adherentesPorDni = indexarPorDni(documentosAdherentes, solicitados);
   const nuevoAfiliadoPorDni = indexarPorDni(

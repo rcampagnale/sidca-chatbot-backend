@@ -11,6 +11,7 @@ import { runChatbotWorkflow } from "./openaiWorkflow.js";
 // mismo helper de credenciales que el resto del backend. El Cloud Run Job sí
 // lo sigue usando, en su propio proceso.
 import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import {
   AFILIACION_NO_VERIFICADA,
   resolverAfiliacionDeUnDni,
@@ -130,12 +131,6 @@ async function uploadGoogleStorageObject(bucket: string, objectName: string, bod
 async function deleteGoogleStorageObject(bucket: string, objectName: string): Promise<void> {
   const response = await storageRegistroRequest("DELETE", bucket, objectName);
   if (!response.ok && response.status !== 404) await storageRegistroError(response);
-}
-
-async function downloadGoogleStorageObject(bucket: string, objectName: string): Promise<Buffer> {
-  const response = await storageRegistroRequest("GET", bucket, objectName);
-  if (!response.ok) await storageRegistroError(response);
-  return Buffer.from(await response.arrayBuffer());
 }
 
 const bodySchema = z.object({
@@ -866,7 +861,40 @@ function fechaRegistroInscriptos(archivo: FirestoreRecord): number {
   return Number.isFinite(timestamp) ? timestamp : 0;
 }
 
-async function listarRegistroInscriptosActivos(): Promise<any[]> {
+/**
+ * Caché corta de la metadata de Registro Inscriptos (nunca de los archivos).
+ *
+ * listarRegistroInscriptosActivos hace una collection-group query sin filtro
+ * sobre TODOS los cursos y, para los que no tienen título en el propio
+ * documento, un getFirestoreDoc adicional. Repetirlo en cada apertura de la
+ * pestaña —y cada vez que el validador vuelve a ella— es exactamente el
+ * patrón de "escanear miles de documentos en cada request" que hay que
+ * evitar.
+ *
+ * Sólo se cachean cursoId, título, archivoId, nombreOriginal, size, mimeType
+ * y subidoEn: nunca el contenido de un archivo. TTL 45s. Se invalida de
+ * inmediato al subir o eliminar una planilla, así que un administrador que
+ * sube un archivo lo ve reflejado sin esperar el vencimiento; el botón
+ * "Actualizar" del validador fuerza una recarga real vía forzar=true.
+ */
+let registroInscriptosCache: { datos: any[]; expiraEn: number } | null = null;
+const REGISTRO_INSCRIPTOS_CACHE_TTL_MS = 45_000;
+
+function invalidarRegistroInscriptosCache() {
+  registroInscriptosCache = null;
+}
+
+async function listarRegistroInscriptosActivos(forzar = false): Promise<any[]> {
+  if (!forzar && registroInscriptosCache && registroInscriptosCache.expiraEn > Date.now()) {
+    return registroInscriptosCache.datos;
+  }
+
+  const datos = await listarRegistroInscriptosActivosSinCache();
+  registroInscriptosCache = { datos, expiraEn: Date.now() + REGISTRO_INSCRIPTOS_CACHE_TTL_MS };
+  return datos;
+}
+
+async function listarRegistroInscriptosActivosSinCache(): Promise<any[]> {
   let archivos: FirestoreRecord[];
   try {
     archivos = await queryFirestoreCollectionGroup(
@@ -971,6 +999,24 @@ async function findUsuarioByAuthUid(uid: string): Promise<FirestoreRecord | null
   return null;
 }
 
+/**
+ * Busca los registros del usuario autenticado en usuarios/nuevoAfiliado, por
+ * uid y, si hace falta, por email.
+ *
+ * Antes cada consulta se esperaba una por una (hasta 16 round-trips
+ * secuenciales en el peor caso, dos de ellos un escaneo COMPLETO sin filtro
+ * de hasta 10.000 documentos). Acá cada nivel dispara sus consultas
+ * INDEPENDIENTES con Promise.all: lo que tarda el nivel es el máximo de sus
+ * consultas, no la suma. El conjunto de documentos que devuelve es
+ * exactamente el mismo — mismas colecciones, mismos campos, mismo orden de
+ * prioridad (uid antes que email, email antes que el escaneo completo) — sólo
+ * cambia que ya no se esperan de a una.
+ *
+ * El escaneo completo sigue siendo el último recurso: caro, pero el resultado
+ * de esta función se cachea con TTL corto en requireValidadorCertificados, así
+ * que un validador cuyo uid no está indexado no vuelve a pagarlo en cada
+ * request, sólo cuando vence la caché.
+ */
 async function findRegistrosValidadorByAuth(authUser: AuthenticatedUser): Promise<FirestoreRecord[]> {
   const encontrados = new Map<string, FirestoreRecord>();
   const agregar = (docs: FirestoreRecord[]) => docs.forEach((doc) => {
@@ -978,42 +1024,52 @@ async function findRegistrosValidadorByAuth(authUser: AuthenticatedUser): Promis
     encontrados.set(key, doc);
   });
   const colecciones = ["usuarios", "nuevoAfiliado"] as const;
-  for (const coleccion of colecciones) {
-    const directo = await getFirestoreDoc(`${coleccion}/${authUser.uid}`);
-    if (directo) agregar([directo]);
-  }
-  for (const campo of ["uid", "usuarioId", "userId", "authUid"]) {
-    for (const coleccion of colecciones) {
-      agregar(await queryFirestoreCollection(coleccion, [{ field: campo, value: authUser.uid }], 50));
-    }
-  }
+
+  const directos = await Promise.all(
+    colecciones.map((coleccion) => getFirestoreDoc(`${coleccion}/${authUser.uid}`))
+  );
+  directos.forEach((doc) => { if (doc) agregar([doc]); });
+
+  const porCampoUid = await Promise.all(
+    ["uid", "usuarioId", "userId", "authUid"].flatMap((campo) =>
+      colecciones.map((coleccion) =>
+        queryFirestoreCollection(coleccion, [{ field: campo, value: authUser.uid }], 50)
+      )
+    )
+  );
+  porCampoUid.forEach((docs) => agregar(docs));
+
   if (encontrados.size === 0 && authUser.email) {
     const email = authUser.email.trim().toLowerCase();
-    for (const campo of ["email", "correo", "mail"]) {
-      for (const coleccion of colecciones) {
-        const candidatos = await queryFirestoreCollection(coleccion, [{ field: campo, value: authUser.email }], 100);
-        agregar(candidatos.filter((doc) => String(doc[campo] || "").trim().toLowerCase() === email));
-      }
-    }
+
+    const porCampoEmail = await Promise.all(
+      ["email", "correo", "mail"].flatMap((campo) =>
+        colecciones.map(async (coleccion) => {
+          const candidatos = await queryFirestoreCollection(coleccion, [{ field: campo, value: authUser.email }], 100);
+          return candidatos.filter((doc) => String(doc[campo] || "").trim().toLowerCase() === email);
+        })
+      )
+    );
+    porCampoEmail.forEach((docs) => agregar(docs));
+
     if (encontrados.size === 0) {
-      for (const coleccion of colecciones) {
-        const todos = await queryFirestoreCollection(coleccion, [], 10000);
+      const escaneos = await Promise.all(
+        colecciones.map((coleccion) => queryFirestoreCollection(coleccion, [], 10000))
+      );
+      escaneos.forEach((todos) => {
         agregar(todos.filter((doc) => [doc.email, doc.correo, doc.mail].some((valor) => String(valor || "").trim().toLowerCase() === email)));
-      }
+      });
     }
   }
   return [...encontrados.values()];
 }
 
 /**
- * Exige que el usuario tenga permiso explícito para validar certificados.
- * El permiso se controla mediante:
- *
- * validarCertificados: true
- *
- * en el documento correspondiente de la colección usuarios.
+ * Resuelve el permiso de validador SIN caché. Es el cuerpo original de
+ * requireValidadorCertificados, extraído tal cual: ninguna regla de
+ * autorización cambia acá, sólo se envuelve en una caché más abajo.
  */
-async function requireValidadorCertificados(
+async function resolverValidadorCertificadosSinCache(
   authUser: AuthenticatedUser
 ): Promise<FirestoreRecord> {
   const registros = await findRegistrosValidadorByAuth(authUser);
@@ -1039,6 +1095,94 @@ async function requireValidadorCertificados(
   }
 
   return autorizado;
+}
+
+/**
+ * Caché corta de permiso de validador: uid -> resultado ya resuelto.
+ *
+ * Resolver un validador puede costar hasta dos escaneos completos sin filtro
+ * (usuarios + nuevoAfiliado, hasta 10.000 documentos cada uno) cuando su uid
+ * no está indexado en ningún campo habitual. Sin caché, ESO se repetía en
+ * cada pedido: cada certificado escaneado, cada apertura de Registro
+ * Inscriptos, cada descarga.
+ *
+ * TTL corto (45s) a propósito: si un administrador le retira el permiso a un
+ * validador, tarda como máximo 45s en reflejarse, no el resto de la sesión.
+ * Nunca se guardan tokens ni contraseñas, sólo el documento ya resuelto (o el
+ * motivo del rechazo) y su vencimiento.
+ *
+ * Vive en memoria del proceso: cada instancia de Cloud Run tiene la suya, se
+ * pierde en cada reinicio/revisión nueva, y no se comparte entre instancias.
+ * Es exactamente el comportamiento buscado para algo de este TTL.
+ */
+type ValidadorPermisoCacheEntry =
+  | { ok: true; registro: FirestoreRecord; expiraEn: number }
+  | { ok: false; mensaje: string; statusCode: number; expiraEn: number };
+
+const VALIDADOR_PERMISO_CACHE_TTL_MS = 45_000;
+const validadorPermisoCache = new Map<string, ValidadorPermisoCacheEntry>();
+// Una misma identidad puede abrir varias acciones a la vez. Mientras se
+// resuelve su permiso, las solicitudes simultáneas comparten una sola carga.
+const validadorPermisoEnCurso = new Map<string, Promise<FirestoreRecord>>();
+
+/**
+ * Exige que el usuario tenga permiso explícito para validar certificados.
+ * El permiso se controla mediante:
+ *
+ * validarCertificados: true
+ *
+ * en el documento correspondiente de la colección usuarios.
+ */
+async function requireValidadorCertificados(
+  authUser: AuthenticatedUser
+): Promise<FirestoreRecord> {
+  const cacheado = validadorPermisoCache.get(authUser.uid);
+
+  if (cacheado && cacheado.expiraEn > Date.now()) {
+    console.log(`[perf] resolverPermiso uid=${authUser.uid} cache=hit resultado=${cacheado.ok ? "autorizado" : "rechazado"}`);
+    if (cacheado.ok) return cacheado.registro;
+    throw Object.assign(new Error(cacheado.mensaje), { statusCode: cacheado.statusCode });
+  }
+
+  const resolucionExistente = validadorPermisoEnCurso.get(authUser.uid);
+  if (resolucionExistente) {
+    console.log(`[perf] resolverPermiso uid=${authUser.uid} cache=shared`);
+    return resolucionExistente;
+  }
+
+  const inicio = Date.now();
+  const resolucion = resolverValidadorCertificadosSinCache(authUser)
+    .then((autorizado) => {
+      validadorPermisoCache.set(authUser.uid, {
+        ok: true,
+        registro: autorizado,
+        expiraEn: Date.now() + VALIDADOR_PERMISO_CACHE_TTL_MS,
+      });
+      console.log(`[perf] resolverPermiso uid=${authUser.uid} tiempo=${Date.now() - inicio}ms cache=miss resultado=autorizado`);
+      return autorizado;
+    })
+    .catch((error: any) => {
+      const statusCode = Number(error?.statusCode);
+
+      // Sólo un rechazo funcional 403 se cachea negativamente. Los fallos de
+      // infraestructura se reintentan de inmediato en el siguiente pedido.
+      if (statusCode === 403) {
+        validadorPermisoCache.set(authUser.uid, {
+          ok: false,
+          mensaje: String(error?.message || "No tenés autorización para validar certificados SIDCA."),
+          statusCode,
+          expiraEn: Date.now() + VALIDADOR_PERMISO_CACHE_TTL_MS,
+        });
+      }
+      console.log(`[perf] resolverPermiso uid=${authUser.uid} tiempo=${Date.now() - inicio}ms cache=miss resultado=rechazado status=${Number.isFinite(statusCode) ? statusCode : "sin_status"}`);
+      throw error;
+    })
+    .finally(() => {
+      validadorPermisoEnCurso.delete(authUser.uid);
+    });
+
+  validadorPermisoEnCurso.set(authUser.uid, resolucion);
+  return resolucion;
 }
 
 /**
@@ -2300,6 +2444,9 @@ app.post("/api/certificados/admin/registro-inscriptos/:cursoId", registroInscrip
         throw error;
       }
     }
+    // La caché de metadata acaba de quedar desactualizada: se invalida ahora,
+    // no en 45s, para que el próximo listado vea la planilla nueva.
+    invalidarRegistroInscriptosCache();
     return res.status(201).json({ ok: true, archivos: creados });
   } catch (error: any) {
     if (subidos.length) {
@@ -2321,38 +2468,136 @@ app.delete("/api/certificados/admin/registro-inscriptos/:cursoId/:archivoId", as
     if (!archivo || archivo.activo !== true) throw Object.assign(new Error("La planilla no existe."), { statusCode: 404 });
     await updateFirestoreDoc(path, { activo: false, eliminadoEn: new Date(), eliminadoPor: authUser.uid });
     if (archivo.storagePath) await deleteGoogleStorageObject(bucketRegistroInscriptos(), String(archivo.storagePath));
+    invalidarRegistroInscriptosCache();
     return res.json({ ok: true, eliminado: true });
   } catch (error: any) { return sendCertificadosError(res, error); }
 });
 
 app.get("/api/certificados/registro-inscriptos", async (req, res) => {
+  const inicio = Date.now();
   try {
+    const marcaAuth = Date.now();
     const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    const tiempoAuth = Date.now() - marcaAuth;
+
+    const marcaPermiso = Date.now();
     await requireAdministradorOValidadorCertificados(authUser);
-    const cursos = await listarRegistroInscriptosActivos();
+    const tiempoPermiso = Date.now() - marcaPermiso;
+
+    // El botón "Actualizar" del validador pide ?forzar=true para saltear la
+    // caché de 45s; cualquier otro valor usa la caché normalmente.
+    const forzar = String(req.query.forzar || "") === "true";
+
+    const marcaFirestore = Date.now();
+    const cursos = await listarRegistroInscriptosActivos(forzar);
+    const tiempoFirestore = Date.now() - marcaFirestore;
+
+    console.log(`[perf] registro-inscriptos firebaseAuth=${tiempoAuth}ms resolverPermiso=${tiempoPermiso}ms firestore=${tiempoFirestore}ms total=${Date.now() - inicio}ms forzar=${forzar}`);
     return res.json({ ok: true, cursos });
   } catch (error: any) { return sendCertificadosError(res, error); }
 });
 
 app.get("/api/certificados/registro-inscriptos/:cursoId/:archivoId/descargar", async (req, res) => {
+  const inicio = Date.now();
   try {
+    const marcaAuth = Date.now();
     const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    const tiempoAuth = Date.now() - marcaAuth;
+
+    const marcaPermiso = Date.now();
     const permiso = await requireAdministradorOValidadorCertificados(authUser);
+    const tiempoPermiso = Date.now() - marcaPermiso;
+
     const cursoId = parseCursoIdParam(req.params.cursoId);
     const archivoId = parseTrabajoPdfIdParam(req.params.archivoId);
+
+    const marcaMetadata = Date.now();
     const archivo = await getFirestoreDoc(`certificados/${cursoId}/registroInscriptos/${archivoId}`);
-    if (!archivo || archivo.activo !== true || String(archivo.cursoId) !== cursoId || !archivo.storagePath) throw Object.assign(new Error("La planilla no está disponible."), { statusCode: 404 });
+    const tiempoMetadata = Date.now() - marcaMetadata;
+
+    // Diagnóstico del 404: cada condición se comprueba y se registra por
+    // separado, en vez de un "no está disponible" genérico que después obliga
+    // a adivinar cuál de las cuatro falló.
+    if (!archivo) {
+      console.warn(`[registro-inscriptos-404] curso=${cursoId} archivo=${archivoId} motivo=documento_no_existe`);
+      throw Object.assign(new Error("La planilla no está disponible."), { statusCode: 404 });
+    }
+    if (archivo.activo !== true) {
+      console.warn(`[registro-inscriptos-404] curso=${cursoId} archivo=${archivoId} motivo=inactivo`);
+      throw Object.assign(new Error("La planilla no está disponible."), { statusCode: 404 });
+    }
+    if (String(archivo.cursoId) !== cursoId) {
+      console.warn(`[registro-inscriptos-404] curso=${cursoId} archivo=${archivoId} motivo=cursoId_no_coincide archivoCursoId=${String(archivo.cursoId)}`);
+      throw Object.assign(new Error("La planilla no está disponible."), { statusCode: 404 });
+    }
+    if (!archivo.storagePath) {
+      console.warn(`[registro-inscriptos-404] curso=${cursoId} archivo=${archivoId} motivo=sin_storagePath`);
+      throw Object.assign(new Error("La planilla no está disponible."), { statusCode: 404 });
+    }
+
     const bucket = bucketRegistroInscriptos();
-    const bytes = await downloadGoogleStorageObject(bucket, String(archivo.storagePath));
-    const existe = bytes.length > 0;
-    if (!existe) throw Object.assign(new Error("La planilla no está disponible."), { statusCode: 404 });
-    await addFirestoreDoc(`certificados/${cursoId}/registroInscriptos/${archivoId}/descargas`, {
+    const storagePath = String(archivo.storagePath);
+
+    // GET directo a la API de Storage: se necesita el Response crudo, con su
+    // body como stream. La versión anterior esperaba el archivo COMPLETO en
+    // un Buffer antes de mandar el primer byte al navegador; con planillas de
+    // varios MB, eso era buena parte del retraso.
+    const marcaStorage = Date.now();
+    const objeto = await storageRegistroRequest("GET", bucket, storagePath);
+    const tiempoStorage = Date.now() - marcaStorage;
+
+    if (!objeto.ok || !objeto.body) {
+      const detalle = await objeto.text().catch(() => "");
+      console.warn(`[registro-inscriptos-404] curso=${cursoId} archivo=${archivoId} motivo=storage_${objeto.status} bucket=${bucket} storagePath=${storagePath} detalle=${detalle.slice(0, 200)}`);
+
+      if (objeto.status === 404) {
+        throw Object.assign(new Error("La planilla no está disponible."), { statusCode: 404 });
+      }
+      if (objeto.status === 401 || objeto.status === 403) {
+        throw Object.assign(new Error("El servidor no tiene permiso para leer la planilla."), { statusCode: 500 });
+      }
+      throw Object.assign(new Error("No se pudo leer la planilla."), { statusCode: 502 });
+    }
+
+    // La auditoría se inicia en paralelo con el stream: no retrasa el primer
+    // byte, pero se espera y registra su resultado antes de cerrar el handler.
+    const auditoriaPromise = addFirestoreDoc(`certificados/${cursoId}/registroInscriptos/${archivoId}/descargas`, {
       descargadoEn: new Date(), descargadoPorUid: authUser.uid, descargadoPorEmail: authUser.email || "", tipoValidador: permiso.tipo,
     });
+
     res.setHeader("Content-Type", String(archivo.mimeType || "application/octet-stream"));
     res.setHeader("Content-Disposition", `attachment; filename="${nombreArchivoRegistroSeguro(String(archivo.nombreOriginal || "planilla.xlsx"))}"`);
     res.setHeader("Cache-Control", "private, no-store");
-    return res.send(bytes);
+    const largo = objeto.headers.get("content-length");
+    if (largo) res.setHeader("Content-Length", largo);
+
+    const preparacion = Date.now() - inicio;
+    console.log(`[perf] descargar-planilla-preparacion curso=${cursoId} archivo=${archivoId} auth=${tiempoAuth}ms permiso=${tiempoPermiso}ms metadata=${tiempoMetadata}ms storageHeaders=${tiempoStorage}ms preparacion=${preparacion}ms`);
+
+    // Las dos tareas arrancan al mismo tiempo: la auditoría no demora el
+    // primer byte y pipeline conserva backpressure y reporta el cierre real.
+    const inicioTransferencia = Date.now();
+    const transferenciaPromise = pipeline(Readable.fromWeb(objeto.body as any), res);
+    const [resultadoAuditoria, resultadoTransferencia] = await Promise.allSettled([
+      auditoriaPromise,
+      transferenciaPromise,
+    ]);
+
+    if (resultadoAuditoria.status === "rejected") {
+      console.error(`[registro-inscriptos] no se pudo registrar la auditoría de descarga curso=${cursoId} archivo=${archivoId}`, resultadoAuditoria.reason);
+    }
+
+    if (resultadoTransferencia.status === "rejected") {
+      console.error("[registro-inscriptos] error al transmitir la planilla", resultadoTransferencia.reason);
+      if (!res.headersSent && !res.destroyed) {
+        res.status(502).json({ ok: false, error: "No se pudo leer la planilla." });
+      } else if (!res.writableEnded && !res.destroyed) {
+        res.destroy(resultadoTransferencia.reason as Error);
+      }
+      return;
+    }
+
+    console.log(`[perf] descargar-planilla-fin curso=${cursoId} archivo=${archivoId} transferencia=${Date.now() - inicioTransferencia}ms totalRequest=${Date.now() - inicio}ms`);
   } catch (error: any) { return sendCertificadosError(res, error); }
 });
 
@@ -2936,7 +3181,32 @@ async function resolverParticipantesAprobados(
  */
 async function resolverAprobadosCurso(cursoId: string) {
   {
-    const curso = await getFirestoreDoc(`cursos/${cursoId}`);
+    // Estas cuatro lecturas son independientes entre sí: ninguna necesita el
+    // resultado de otra para saber QUÉ pedir, todas conocen cursoId de
+    // entrada. Antes se esperaban una por una; en Promise.all lo que tardan es
+    // el máximo de las cuatro, no la suma. Sólo el chequeo de "el curso no
+    // existe" tiene que esperar a que las cuatro terminen, porque hasta
+    // entonces no se sabe si hubo que abortar — en el caso normal (curso
+    // existente) no se pierde nada.
+    const [curso, certificado, emitidosVigentes, aprobaciones] = await Promise.all([
+      getFirestoreDoc(`cursos/${cursoId}`),
+      getFirestoreDoc(`certificados/${cursoId}`),
+      queryFirestoreChildCollection(
+        `certificados/${cursoId}`,
+        "emitidos",
+        [{ field: "estado", value: EMITIDOS_ESTADO_VIGENTE }],
+        APROBADOS_MAX_RESULTADOS
+      ),
+      // Un solo filtro de igualdad: lo resuelve el índice de campo único que
+      // Firestore mantiene automáticamente. "aprobo" se evalúa en memoria para
+      // no exigir un índice compuesto de ámbito COLLECTION_GROUP y, de paso,
+      // poder contar los registros que no están aprobados.
+      queryFirestoreCollectionGroup(
+        "cursos",
+        [{ field: "curso", value: `cursos/${cursoId}` }],
+        APROBADOS_MAX_RESULTADOS
+      ),
+    ]);
 
     if (!curso) {
       throw Object.assign(new Error("El curso indicado no existe."), {
@@ -2947,7 +3217,6 @@ async function resolverAprobadosCurso(cursoId: string) {
     // Exclusiones administrativas de la emisión. Viven en el documento del
     // certificado: la aprobación original en usuarios/{id}/cursos NUNCA se
     // toca, sólo se omite de esta respuesta.
-    const certificado = await getFirestoreDoc(`certificados/${cursoId}`);
     const usuariosExcluidos = new Set(
       (Array.isArray(certificado?.usuariosExcluidos)
         ? certificado.usuariosExcluidos
@@ -2955,12 +3224,6 @@ async function resolverAprobadosCurso(cursoId: string) {
       ).map((valor: any) => String(valor || "").trim())
     );
 
-    const emitidosVigentes = await queryFirestoreChildCollection(
-      `certificados/${cursoId}`,
-      "emitidos",
-      [{ field: "estado", value: EMITIDOS_ESTADO_VIGENTE }],
-      APROBADOS_MAX_RESULTADOS
-    );
     const usuariosConCertificadoVigente = new Set<string>();
     const usuariosConCertificadoQrValido = new Set<string>();
     emitidosVigentes.forEach((emitido) => {
@@ -2971,16 +3234,6 @@ async function resolverAprobadosCurso(cursoId: string) {
         usuariosConCertificadoQrValido.add(usuarioDocId);
       }
     });
-
-    // Un solo filtro de igualdad: lo resuelve el índice de campo único que
-    // Firestore mantiene automáticamente. "aprobo" se evalúa en memoria para
-    // no exigir un índice compuesto de ámbito COLLECTION_GROUP y, de paso,
-    // poder contar los registros que no están aprobados.
-    const aprobaciones = await queryFirestoreCollectionGroup(
-      "cursos",
-      [{ field: "curso", value: `cursos/${cursoId}` }],
-      APROBADOS_MAX_RESULTADOS
-    );
 
     const documentosAprobacion = aprobaciones.length;
     const truncado = documentosAprobacion >= APROBADOS_MAX_RESULTADOS;
@@ -3194,9 +3447,17 @@ async function obtenerRegistrosAprobadosCurso(
 }
 
 app.get("/api/certificados/registro-aprobados", async (req, res) => {
+  const inicio = Date.now();
   try {
+    const marcaAuth = Date.now();
     const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    const tiempoAuth = Date.now() - marcaAuth;
+
+    const marcaPermiso = Date.now();
     await requireAdministradorOValidadorCertificados(authUser);
+    const tiempoPermiso = Date.now() - marcaPermiso;
+
+    const marcaFirestore = Date.now();
 
     const documentos = await queryFirestoreCollection(
       "certificados",
@@ -3207,6 +3468,10 @@ app.get("/api/certificados/registro-aprobados", async (req, res) => {
       .filter((record) => Boolean(String(record.cursoId || "").trim()))
       .filter((record) => record.ocultarEnEmitir !== true);
 
+    // Un curso por vez sería la suma de todos; en paralelo es el máximo. La
+    // caché single-flight de resolverPadronPorDni (afiliacion.ts) hace que los
+    // cursos simultáneos compartan una sola paginación por colección en un
+    // cache miss; durante el TTL reutilizan esos documentos completos.
     const cursos = await Promise.all(
       configuraciones.map(async (configuracion) => {
         const cursoId = String(configuracion.cursoId || "").trim();
@@ -3229,6 +3494,9 @@ app.get("/api/certificados/registro-aprobados", async (req, res) => {
       .filter((curso): curso is NonNullable<typeof curso> => curso !== null)
       .sort((a, b) => a.titulo.localeCompare(b.titulo, "es", { sensitivity: "base" }));
 
+    const tiempoFirestore = Date.now() - marcaFirestore;
+    console.log(`[perf] registro-aprobados firebaseAuth=${tiempoAuth}ms resolverPermiso=${tiempoPermiso}ms firestore=${tiempoFirestore}ms cursos=${disponibles.length} total=${Date.now() - inicio}ms`);
+
     return res.status(200).json({
       ok: true,
       modulo: "certificados",
@@ -3240,12 +3508,23 @@ app.get("/api/certificados/registro-aprobados", async (req, res) => {
 });
 
 app.get("/api/certificados/registro-aprobados/:cursoId", async (req, res) => {
+  const inicio = Date.now();
   try {
+    const marcaAuth = Date.now();
     const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    const tiempoAuth = Date.now() - marcaAuth;
+
+    const marcaPermiso = Date.now();
     await requireAdministradorOValidadorCertificados(authUser);
+    const tiempoPermiso = Date.now() - marcaPermiso;
 
     const cursoId = parseCursoIdParam(req.params.cursoId);
+
+    const marcaFirestore = Date.now();
     const registro = await obtenerRegistrosAprobadosCurso(cursoId);
+    const tiempoFirestore = Date.now() - marcaFirestore;
+
+    console.log(`[perf] registro-aprobados-curso curso=${cursoId} firebaseAuth=${tiempoAuth}ms resolverPermiso=${tiempoPermiso}ms firestore=${tiempoFirestore}ms aprobados=${registro.cantidad} total=${Date.now() - inicio}ms`);
 
     return res.status(200).json({
       ok: true,
