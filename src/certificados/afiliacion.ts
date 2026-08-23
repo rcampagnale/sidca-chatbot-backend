@@ -98,9 +98,14 @@ async function listarColeccion(
   )}`;
   const documentos: Record<string, any>[] = [];
   let pageToken = "";
+  let paginas = 0;
+  const inicio = Date.now();
 
   do {
-    const parametros = new URLSearchParams({ pageSize: "300" });
+    const parametros = new URLSearchParams({ pageSize: "1000" });
+    parametros.append("mask.fieldPaths", "dni");
+    parametros.append("mask.fieldPaths", "activo");
+    parametros.append("mask.fieldPaths", "departamento");
     if (pageToken) parametros.set("pageToken", pageToken);
 
     const respuesta = await fetch(`${baseUrl}?${parametros.toString()}`, {
@@ -112,6 +117,7 @@ async function listarColeccion(
     }
 
     const datos: any = await respuesta.json();
+    paginas += 1;
     for (const documento of Array.isArray(datos?.documents)
       ? datos.documents
       : []) {
@@ -120,6 +126,10 @@ async function listarColeccion(
 
     pageToken = String(datos?.nextPageToken || "");
   } while (pageToken);
+
+  console.log(
+    `[perf] listarColeccion coleccion=${coleccion} paginas=${paginas} documentos=${documentos.length} tiempo=${Date.now() - inicio}ms`
+  );
 
   return documentos;
 }
