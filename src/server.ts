@@ -2702,6 +2702,8 @@ async function resolverEnLotes<T, R>(
  */
 type ParticipanteAprobado = {
   usuarioDocId: string;
+  /** Todos los documentos de usuarios consolidados en esta persona. */
+  usuarioDocIds: string[];
   dni: string;
   apellidoNombre: string;
   apellido?: string;
@@ -2728,6 +2730,7 @@ function construirParticipanteAprobado(
 ): ParticipanteAprobado {
   const comun = {
     usuarioDocId,
+    usuarioDocIds: [usuarioDocId],
     aprobaciones,
     certificadoEmitido,
     certificadoQrValido,
@@ -2770,6 +2773,93 @@ function construirParticipanteAprobado(
 }
 
 /**
+ * El DNI es la identidad de emisión. Dos documentos de `usuarios` con el
+ * mismo DNI representan una sola persona para este curso, aunque sus IDs
+ * sean distintos. Los registros sin DNI conservan como clave su usuarioDocId
+ * para no fusionar personas desconocidas entre sí.
+ */
+function consolidarParticipantesPorDni(
+  participantes: ParticipanteAprobado[]
+): ParticipanteAprobado[] {
+  const grupos = new Map<string, ParticipanteAprobado[]>();
+
+  for (const participante of participantes) {
+    const dni = normalizeDni(participante.dni);
+    const usuarioDocId = String(participante.usuarioDocId || "").trim();
+    const clave = dni ? `dni:${dni}` : `usuario:${usuarioDocId}`;
+    const grupo = grupos.get(clave) || [];
+    grupo.push(participante);
+    grupos.set(clave, grupo);
+  }
+
+  return [...grupos.values()].map((grupo) => {
+    // La selección es estable: primero certificado/QR, luego cantidad de
+    // datos reales y finalmente el orden original de Firestore.
+    const canonical = [...grupo].sort((a, b) => {
+      const score = (valor: ParticipanteAprobado) =>
+        (valor.certificadoEmitido ? 1_000_000 : 0) +
+        (valor.certificadoQrValido ? 100_000 : 0) +
+        (valor.afiliacion && valor.afiliacion.tipo !== "no_verificada"
+          ? 1_000
+          : 0) +
+        (valor.departamento?.canonico ? 10 : 0) +
+        (valor.dni ? 10 : 0) +
+        (valor.apellido ? 100 : 0) +
+        (valor.nombre ? 100 : 0) +
+        (valor.apellidoNombre ? String(valor.apellidoNombre).length : 0);
+      return score(b) - score(a);
+    })[0];
+
+    const textoMasCompleto = (...valores: unknown[]) =>
+      valores
+        .map((valor) => String(valor || "").trim())
+        .filter(Boolean)
+        .sort((a, b) => b.length - a.length)[0] || "";
+
+    const usuarioDocIds = [
+      ...new Set(
+        grupo.flatMap((valor) =>
+          Array.isArray(valor.usuarioDocIds) && valor.usuarioDocIds.length
+            ? valor.usuarioDocIds
+            : [valor.usuarioDocId]
+        )
+      ),
+    ];
+
+    const fusionado: ParticipanteAprobado = {
+      ...canonical,
+      usuarioDocId: canonical.usuarioDocId,
+      usuarioDocIds,
+      dni: normalizeDni(textoMasCompleto(...grupo.map((valor) => valor.dni))),
+      apellidoNombre: textoMasCompleto(
+        ...grupo.map((valor) => valor.apellidoNombre)
+      ),
+      ...(textoMasCompleto(...grupo.map((valor) => valor.apellido))
+        ? { apellido: textoMasCompleto(...grupo.map((valor) => valor.apellido)) }
+        : {}),
+      ...(textoMasCompleto(...grupo.map((valor) => valor.nombre))
+        ? { nombre: textoMasCompleto(...grupo.map((valor) => valor.nombre)) }
+        : {}),
+      estado: grupo.some((valor) => valor.estado === "aprobado")
+        ? "aprobado"
+        : grupo.some((valor) => valor.estado === "datos_incompletos")
+        ? "datos_incompletos"
+        : "sin_usuario",
+      // Una persona tiene una aprobación académica para este curso, aunque
+      // haya más de un documento de usuario asociado al mismo DNI.
+      aprobaciones: 1,
+      certificadoEmitido: grupo.some((valor) => valor.certificadoEmitido),
+      certificadoQrValido: grupo.some((valor) => valor.certificadoQrValido),
+      ...(grupo.some((valor) => valor.apartado)
+        ? { apartado: true }
+        : {}),
+    };
+
+    return fusionado;
+  });
+}
+
+/**
  * Resuelve los documentos de usuario de un conjunto de aprobados y devuelve la
  * lista ordenada por apellido y nombre.
  *
@@ -2791,14 +2881,16 @@ async function resolverParticipantesAprobados(
     }
   );
 
-  const participantes = resueltos.map(({ usuarioDocId, usuario }) =>
-    construirParticipanteAprobado(
-      usuarioDocId,
-      usuario,
-      porUsuario.get(usuarioDocId) || 1,
-      apartado,
-      usuariosConCertificadoVigente.has(usuarioDocId),
-      usuariosConCertificadoQrValido.has(usuarioDocId)
+  const participantes = consolidarParticipantesPorDni(
+    resueltos.map(({ usuarioDocId, usuario }) =>
+      construirParticipanteAprobado(
+        usuarioDocId,
+        usuario,
+        porUsuario.get(usuarioDocId) || 1,
+        apartado,
+        usuariosConCertificadoVigente.has(usuarioDocId),
+        usuariosConCertificadoQrValido.has(usuarioDocId)
+      )
     )
   );
 
@@ -2895,7 +2987,7 @@ async function resolverAprobadosCurso(cursoId: string) {
 
     let rutasInesperadas = 0;
     let noAprobados = 0;
-    let duplicados = 0;
+    let aprobacionesAprobadas = 0;
 
     // usuarioDocId -> cantidad de documentos de aprobación de ese usuario.
     // Dos mapas: quienes siguen disponibles para emitir y quienes fueron
@@ -2918,6 +3010,8 @@ async function resolverAprobadosCurso(cursoId: string) {
         continue;
       }
 
+      aprobacionesAprobadas += 1;
+
       const apartado = usuariosExcluidos.has(usuarioDocId);
       const mapa = apartado ? porUsuarioExcluido : porUsuario;
 
@@ -2930,11 +3024,10 @@ async function resolverAprobadosCurso(cursoId: string) {
         // documentos de aprobación repetidos, no una cuestión de
         // disponibilidad.
         mapa.set(usuarioDocId, previos + 1);
-        duplicados += 1;
       }
     }
 
-    const [participantes, participantesExcluidos] = await Promise.all([
+    const [participantesDisponibles, participantesApartados] = await Promise.all([
       resolverParticipantesAprobados(
         porUsuario,
         false,
@@ -2948,6 +3041,28 @@ async function resolverAprobadosCurso(cursoId: string) {
         usuariosConCertificadoQrValido
       ),
     ]);
+
+    const participantesConsolidados = consolidarParticipantesPorDni([
+      ...participantesDisponibles,
+      ...participantesApartados,
+    ]);
+    const participantes = participantesConsolidados.filter(
+      (participante) => participante.apartado !== true
+    );
+    const participantesExcluidos = participantesConsolidados.filter(
+      (participante) => participante.apartado === true
+    );
+    const duplicados = Math.max(
+      0,
+      aprobacionesAprobadas - participantesConsolidados.length
+    );
+    const duplicadosDetalle = participantesConsolidados
+      .filter((participante) => participante.usuarioDocIds.length > 1)
+      .map((participante) => ({
+        dni: participante.dni,
+        usuarioDocIds: participante.usuarioDocIds,
+        cantidad: participante.usuarioDocIds.length,
+      }));
 
     // Los contadores de calidad de datos se refieren a los DISPONIBLES, que es
     // lo que muestran los indicadores de la pantalla. Así se mantienen las dos
@@ -2988,6 +3103,7 @@ async function resolverAprobadosCurso(cursoId: string) {
         sinUsuario,
         datosIncompletos,
         duplicados,
+        duplicadosDetalle,
         noAprobados,
         rutasInesperadas,
         excluidos,
@@ -3042,6 +3158,7 @@ function esAprobadoDisponibleParaRegistro(participante: ParticipanteAprobado) {
 function proyectarRegistroAprobado(participante: ParticipanteAprobado) {
   return {
     usuarioDocId: participante.usuarioDocId,
+    usuarioDocIds: participante.usuarioDocIds,
     apellidoNombre: participante.apellidoNombre,
     dni: participante.dni,
     departamento: {
@@ -3653,6 +3770,7 @@ type ContextoEmision = {
   certificado: FirestoreRecord;
   curso: FirestoreRecord;
   usuariosAprobados: Set<string>;
+  dnisConCertificadoVigente: Set<string>;
 };
 
 /**
@@ -3702,7 +3820,26 @@ async function prepararContextoEmision(cursoId: string): Promise<ContextoEmision
     if (usuarioDocId) usuariosAprobados.add(usuarioDocId);
   }
 
-  return { certificado, curso, usuariosAprobados };
+  const emitidosVigentes = await queryFirestoreChildCollection(
+    `certificados/${cursoId}`,
+    "emitidos",
+    [{ field: "estado", value: EMITIDOS_ESTADO_VIGENTE }],
+    APROBADOS_MAX_RESULTADOS
+  );
+  const dnisConCertificadoVigente = new Set<string>();
+  emitidosVigentes.forEach((emitido) => {
+    const dniEmitido = normalizeDni(
+      emitido?.participante?.dni || emitido?.dni || ""
+    );
+    if (dniEmitido) dnisConCertificadoVigente.add(dniEmitido);
+  });
+
+  return {
+    certificado,
+    curso,
+    usuariosAprobados,
+    dnisConCertificadoVigente,
+  };
 }
 
 /**
@@ -3731,7 +3868,12 @@ async function emitirCertificadoParaUsuario({
   authUser: AuthenticatedUser;
   contexto?: ContextoEmision;
 }) {
-  const { certificado, curso, usuariosAprobados } =
+  const {
+    certificado,
+    curso,
+    usuariosAprobados,
+    dnisConCertificadoVigente,
+  } =
     contexto || (await prepararContextoEmision(cursoId));
 
   {
@@ -3785,6 +3927,19 @@ async function emitirCertificadoParaUsuario({
           "No se puede emitir el certificado porque los datos del participante están incompletos."
         ),
         { statusCode: 409 }
+      );
+    }
+
+    // La unicidad funcional es por curso + DNI, no por usuarioDocId. Un mismo
+    // afiliado puede existir en más de un documento de `usuarios`; en ese
+    // caso, la emisión individual reconoce el certificado previo antes de
+    // intentar escribir otro para el documento duplicado.
+    if (dnisConCertificadoVigente.has(dni)) {
+      throw Object.assign(
+        new Error(
+          "Este participante ya tiene un certificado vigente emitido para este curso."
+        ),
+        { statusCode: 409, codigo: "ya_emitido" }
       );
     }
 
