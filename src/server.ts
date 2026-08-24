@@ -6256,9 +6256,8 @@ app.get(
           String(trabajo.nombreArchivo || "certificados.pdf")
         )}"`
       );
-
-      const largo = objeto.headers.get("content-length");
-      if (largo) res.setHeader("Content-Length", largo);
+      res.setHeader("Transfer-Encoding", "chunked");
+      res.flushHeaders();
 
       // Streaming, igual que el masivo: el PDF no pasa por la memoria del
       // backend y el bucket sigue privado.
@@ -6664,11 +6663,8 @@ app.get("/api/certificados/admin/pdf-masivo/:cursoId/:jobId/descargar", async (r
         String(trabajo.nombreArchivo || "certificados.pdf")
       )}"`
     );
-
-    // El tamaño lo informa Storage, no el documento del trabajo: si por lo que
-    // fuera no coincidieran, mentirle al navegador cortaría la descarga.
-    const largo = objeto.headers.get("content-length");
-    if (largo) res.setHeader("Content-Length", largo);
+    res.setHeader("Transfer-Encoding", "chunked");
+    res.flushHeaders();
 
     // Streaming: el PDF no pasa por la memoria del backend. Nada de download()
     // ni de Buffer. El bucket sigue privado; esta es la única puerta y está
