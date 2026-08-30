@@ -4934,6 +4934,528 @@ app.post("/api/certificados/validar/:cursoId/:token/registrar", async (req, res)
   }
 });
 
+// ============================================================
+// VALIDACION DE CENA
+//
+// Cena comparte la autorización institucional de certificados, pero conserva
+// sus propios datos funcionales y su transacción de acreditación. La lectura
+// devuelve una foto completa de la reserva; la escritura se hace sólo en
+// /registrar, mediante una transacción REST de Firestore para que dos escaneos
+// simultáneos no acrediten dos veces.
+// ============================================================
+
+const CENA_TOKEN_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const CENA_ANIO_REGEX = /^\d{4}$/;
+
+function parseCenaTokenParam(valor: unknown): string {
+  const token = String(valor ?? "").trim();
+  if (!CENA_TOKEN_REGEX.test(token)) {
+    throw Object.assign(new Error("El código de validación de Cena es inválido."), { statusCode: 400 });
+  }
+  return token;
+}
+
+function parseCenaAnioParam(valor: unknown): string {
+  const anio = String(valor ?? "").trim();
+  if (!CENA_ANIO_REGEX.test(anio)) {
+    throw Object.assign(new Error("El año de la Cena es inválido."), { statusCode: 400 });
+  }
+  return anio;
+}
+
+async function requireAdministradorOValidadorCena(authUser: AuthenticatedUser): Promise<PermisoCertificados> {
+  try {
+    return await requireAdministradorOValidadorCertificados(authUser);
+  } catch (error: any) {
+    if (Number(error?.statusCode) === 403) {
+      throw Object.assign(
+        new Error("No tenés autorización para validar la Cena SIDCA."),
+        { statusCode: 403 }
+      );
+    }
+    throw error;
+  }
+}
+
+function getUbicacionTarjetaCena(tarjeta: FirestoreRecord) {
+  const path = getFirestoreRelativePath(tarjeta);
+  const match = path.match(/^gestion_cena\/(\d{4})\/tarjetas\/([^/]+)$/);
+  if (!match) {
+    throw Object.assign(new Error("La tarjeta de Cena tiene una ubicación inválida."), { statusCode: 500 });
+  }
+
+  const reservaId = String(tarjeta.reservaId || "").trim();
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(reservaId)) {
+    throw Object.assign(new Error("La tarjeta de Cena no tiene una reserva válida."), { statusCode: 500 });
+  }
+
+  return {
+    anio: match[1],
+    tarjetaId: match[2],
+    tarjetaPath: path,
+    reservaId,
+    reservaPath: `gestion_cena/${match[1]}/reservas/${reservaId}`,
+  };
+}
+
+async function buscarTarjetaCenaPorToken(token: string): Promise<FirestoreRecord> {
+  const tarjetas = await queryFirestoreCollectionGroup("tarjetas", [{ field: "token", value: token }], 2);
+  if (tarjetas.length === 0) {
+    throw Object.assign(new Error("Tarjeta de Cena no encontrada o código inválido."), { statusCode: 404 });
+  }
+  if (tarjetas.length > 1) {
+    console.error(`[sidca-chatbot-backend] token de cena duplicado token=${token}`);
+    throw Object.assign(new Error("No se pudo resolver la tarjeta de Cena."), { statusCode: 409 });
+  }
+
+  const tarjeta = tarjetas[0];
+  // El token es el valor firmado en el QR. En tarjetas heredadas el ID del
+  // documento puede diferir de ese token, por lo que no se lo usa como regla
+  // de validación ni se invalida un QR legítimo por esa diferencia.
+  if (String(tarjeta.token || "") !== token) {
+    throw Object.assign(new Error("Tarjeta de Cena no encontrada o código inválido."), { statusCode: 404 });
+  }
+  return tarjeta;
+}
+
+const ordenarTarjetasCena = (a: FirestoreRecord, b: FirestoreRecord) =>
+  Number(a.numeroTarjeta || 0) - Number(b.numeroTarjeta || 0) ||
+  Number(Boolean(a.anulada)) - Number(Boolean(b.anulada)) ||
+  Number(a.numeroReemision || 0) - Number(b.numeroReemision || 0) ||
+  String(a.id || "").localeCompare(String(b.id || ""));
+
+function esTarjetaVigenteCena(tarjeta: FirestoreRecord | null): tarjeta is FirestoreRecord {
+  return tarjeta !== null && tarjeta.anulada !== true && tarjeta.reemplazada !== true;
+}
+
+function tarjetaCenaAcreditada(tarjeta: FirestoreRecord | null): boolean {
+  return esTarjetaVigenteCena(tarjeta) && (tarjeta.validada === true || tarjeta.estado === "validada");
+}
+
+function resumirTarjetasCena(tarjetas: FirestoreRecord[]) {
+  const vigentes = tarjetas.filter(esTarjetaVigenteCena);
+  const acreditadas = vigentes.filter(tarjetaCenaAcreditada).length;
+  return { vigentes, acreditadas, pendientes: vigentes.length - acreditadas };
+}
+
+function normalizarFechaCena(valor: unknown) {
+  if (!valor) return { iso: null, display: null };
+  const fecha = new Date(String(valor));
+  if (Number.isNaN(fecha.getTime())) return { iso: null, display: null };
+  const fechaTexto = new Intl.DateTimeFormat("es-AR", {
+    timeZone: "America/Argentina/Buenos_Aires",
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+  }).format(fecha);
+  const horaTexto = new Intl.DateTimeFormat("es-AR", {
+    timeZone: "America/Argentina/Buenos_Aires",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(fecha);
+  return { iso: fecha.toISOString(), display: `${fechaTexto} - ${horaTexto} hs` };
+}
+
+function normalizarUsuarioCena(usuario: any, nombre: any, email: any, uid: any) {
+  const nombreNormalizado = String(nombre || usuario?.nombre || "").trim();
+  const emailNormalizado = String(email || usuario?.email || usuario?.correo || "").trim();
+  const uidNormalizado = String(uid || usuario?.uid || "").trim();
+  const valorTexto = typeof usuario === "string" ? usuario.trim() : "";
+  const display = nombreNormalizado && emailNormalizado && nombreNormalizado !== emailNormalizado
+    ? `${nombreNormalizado} (${emailNormalizado})`
+    : nombreNormalizado || emailNormalizado || valorTexto || uidNormalizado || "Usuario autorizado";
+  return {
+    nombre: nombreNormalizado || null,
+    email: emailNormalizado || null,
+    uid: uidNormalizado || null,
+    display,
+  };
+}
+
+function completarAuditoriaTarjetaCena(tarjeta: FirestoreRecord, auditoria: FirestoreRecord | null) {
+  if (!auditoria) return tarjeta;
+  return {
+    ...tarjeta,
+    fechaValidacion: tarjeta.fechaValidacion || auditoria.fechaValidacion || null,
+    validadoPor: tarjeta.validadoPor || auditoria.validadoPor || null,
+    validadoPorUid: tarjeta.validadoPorUid || auditoria.validadoPorUid || null,
+    validadoPorEmail: tarjeta.validadoPorEmail || auditoria.validadoPorEmail || null,
+    validadoPorNombre: tarjeta.validadoPorNombre || auditoria.validadoPorNombre || null,
+  };
+}
+
+function presentarTarjetaCena(tarjeta: FirestoreRecord) {
+  const validadoPor = tarjeta.validadoPor || null;
+  const anuladaPor = tarjeta.anuladaPor || null;
+  const fechaValidacion = normalizarFechaCena(tarjeta.fechaValidacion);
+  const fechaAnulacion = normalizarFechaCena(tarjeta.fechaAnulacion);
+  const usuarioValidacion = normalizarUsuarioCena(
+    validadoPor,
+    tarjeta.validadoPorNombre,
+    tarjeta.validadoPorEmail,
+    tarjeta.validadoPorUid
+  );
+  const usuarioAnulacion = normalizarUsuarioCena(
+    anuladaPor,
+    tarjeta.anuladaPorNombre,
+    tarjeta.anuladaPorEmail,
+    tarjeta.anuladaPorUid
+  );
+  return {
+    id: tarjeta.id,
+    tipo: tarjeta.tipo || null,
+    numeroTarjeta: Number(tarjeta.numeroTarjeta || 0),
+    numeroAcompanante: tarjeta.numeroAcompanante ?? null,
+    totalAcompanantes: Number(tarjeta.totalAcompanantes || 0),
+    estado: tarjeta.estado || "pendiente",
+    validada: tarjeta.validada === true,
+    anulada: tarjeta.anulada === true,
+    fechaValidacion: fechaValidacion.iso,
+    fechaValidacionIso: fechaValidacion.iso,
+    fechaValidacionDisplay: fechaValidacion.display,
+    validadoPor,
+    validadoPorUid: usuarioValidacion.uid,
+    validadoPorEmail: usuarioValidacion.email,
+    validadoPorNombre: usuarioValidacion.nombre,
+    validadoPorDisplay: usuarioValidacion.display,
+    fechaAnulacion: fechaAnulacion.iso,
+    fechaAnulacionIso: fechaAnulacion.iso,
+    fechaAnulacionDisplay: fechaAnulacion.display,
+    anuladaPor,
+    anuladaPorUid: usuarioAnulacion.uid,
+    anuladaPorEmail: usuarioAnulacion.email,
+    anuladaPorNombre: usuarioAnulacion.nombre,
+    anuladaPorDisplay: usuarioAnulacion.display,
+    motivoAnulacion: tarjeta.motivoAnulacion || null,
+    reemplazada: tarjeta.reemplazada === true,
+    reemplazadaPor: tarjeta.reemplazadaPor || null,
+    esReemision: tarjeta.esReemision === true,
+    numeroReemision: Number(tarjeta.numeroReemision || 0),
+  };
+}
+
+function presentarReservaCena(reserva: FirestoreRecord) {
+  return {
+    id: reserva.id,
+    anio: Number(reserva.anio || 0),
+    estado: reserva.estado || "activa",
+    afiliado: reserva.afiliado || null,
+    cantidadTarjetas: Number(reserva.cantidadTarjetas || 0),
+    cantidadTitular: Number(reserva.cantidadTitular || 0),
+    cantidadAcompanantes: Number(reserva.cantidadAcompanantes || 0),
+  };
+}
+
+function reservaCenaActiva(reserva: FirestoreRecord): boolean {
+  return String(reserva.estado || "activa") === "activa";
+}
+
+function estadoTarjetaCena(tarjeta: FirestoreRecord | null, reserva: FirestoreRecord) {
+  if (!reservaCenaActiva(reserva)) return "reserva_anulada";
+  if (!tarjeta) return "consulta_reserva";
+  if (tarjeta.reemplazada === true) return "reemplazada";
+  if (!esTarjetaVigenteCena(tarjeta)) return "anulada";
+  if (tarjetaCenaAcreditada(tarjeta)) return "validada";
+  return "pendiente";
+}
+
+async function construirSnapshotReservaCena(
+  tarjeta: FirestoreRecord | null,
+  reserva: FirestoreRecord,
+  anio: string
+) {
+  const tarjetas = await queryFirestoreChildCollection(
+    `gestion_cena/${anio}`,
+    "tarjetas",
+    [{ field: "reservaId", value: reserva.id }],
+    500
+  );
+
+  const requiereFallbackAuditoria = tarjetas.some(
+    (tarjetaActual) => tarjetaCenaAcreditada(tarjetaActual) &&
+      (!tarjetaActual.fechaValidacion ||
+        (!tarjetaActual.validadoPor && !tarjetaActual.validadoPorNombre && !tarjetaActual.validadoPorEmail))
+  );
+  const auditorias = requiereFallbackAuditoria
+    ? await queryFirestoreChildCollection(`gestion_cena/${anio}`, "validaciones", [], 2000)
+    : [];
+  const auditoriaPorTarjeta = new Map<string, FirestoreRecord>();
+  auditorias.forEach((auditoria) => {
+    const tarjetaId = String(auditoria.tarjetaId || "");
+    const token = String(auditoria.token || auditoria.id || "");
+    if (tarjetaId) auditoriaPorTarjeta.set(tarjetaId, auditoria);
+    if (token) auditoriaPorTarjeta.set(token, auditoria);
+  });
+  const tarjetasConAuditoria = tarjetas.map((tarjetaActual) => completarAuditoriaTarjetaCena(
+    tarjetaActual,
+    auditoriaPorTarjeta.get(String(tarjetaActual.id || "")) || auditoriaPorTarjeta.get(String(tarjetaActual.token || "")) || null
+  ));
+  const tarjetaEscaneada = tarjeta
+    ? tarjetasConAuditoria.find((tarjetaActual) => tarjetaActual.id === tarjeta.id) || completarAuditoriaTarjetaCena(
+      tarjeta,
+      auditoriaPorTarjeta.get(String(tarjeta.id || "")) || auditoriaPorTarjeta.get(String(tarjeta.token || "")) || null
+    )
+    : null;
+  const resumen = resumirTarjetasCena(tarjetasConAuditoria);
+  const tarjetaReemplazo = tarjetaEscaneada?.reemplazadaPor
+    ? tarjetasConAuditoria.find((tarjetaActual) => tarjetaActual.id === String(tarjetaEscaneada.reemplazadaPor)) || null
+    : null;
+
+  return {
+    estado: estadoTarjetaCena(tarjetaEscaneada, reserva),
+    puedeAcreditar:
+      Boolean(tarjetaEscaneada) &&
+      reservaCenaActiva(reserva) &&
+      esTarjetaVigenteCena(tarjetaEscaneada) &&
+      !tarjetaCenaAcreditada(tarjetaEscaneada),
+    reserva: presentarReservaCena(reserva),
+    tarjeta: tarjetaEscaneada ? presentarTarjetaCena(tarjetaEscaneada) : null,
+    tarjetaReemplazo: tarjetaReemplazo ? presentarTarjetaCena(tarjetaReemplazo) : null,
+    tarjetas: resumen.vigentes.sort(ordenarTarjetasCena).map(presentarTarjetaCena),
+    tarjetasHistoricas: tarjetasConAuditoria.filter((tarjetaActual) => !esTarjetaVigenteCena(tarjetaActual)).sort(ordenarTarjetasCena).map(presentarTarjetaCena),
+    resumen: {
+      total: resumen.vigentes.length,
+      acreditadas: resumen.acreditadas,
+      pendientes: resumen.pendientes,
+    },
+  };
+}
+
+async function beginFirestoreTransaction(): Promise<string> {
+  const respuesta = await firestoreRequest<{ transaction?: string }>(`${firestoreBaseUrl}:beginTransaction`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+  const transaction = String(respuesta?.transaction || "");
+  if (!transaction) throw new Error("No se pudo iniciar la transacción de Firestore.");
+  return transaction;
+}
+
+async function getFirestoreDocInTransaction(path: string, transaction: string) {
+  const doc = await firestoreRequest<FirestoreDocument>(
+    `${firestoreBaseUrl}/${path}?transaction=${encodeURIComponent(transaction)}`
+  );
+  return doc ? firestoreDocToJs(doc) : null;
+}
+
+async function rollbackFirestoreTransaction(transaction: string) {
+  try {
+    await firestoreRequest(`${firestoreBaseUrl}:rollback`, {
+      method: "POST",
+      body: JSON.stringify({ transaction }),
+    });
+  } catch {
+    // La transacción expira sola; un rollback fallido no tapa el resultado real.
+  }
+}
+
+function esConflictoTransaccionFirestore(error: any): boolean {
+  return String(error?.firestoreStatus || "") === "ABORTED" || /\baborted\b/i.test(String(error?.message || ""));
+}
+
+async function registrarTarjetaCenaAtomica({
+  tarjetaPath,
+  reservaPath,
+  anio,
+  token,
+  authUser,
+  permiso,
+}: {
+  tarjetaPath: string;
+  reservaPath: string;
+  anio: string;
+  token: string;
+  authUser: AuthenticatedUser;
+  permiso: PermisoCertificados;
+}) {
+  for (let intento = 0; intento < 2; intento += 1) {
+    const transaction = await beginFirestoreTransaction();
+    let confirmar = false;
+
+    try {
+      const [tarjeta, reserva] = await Promise.all([
+        getFirestoreDocInTransaction(tarjetaPath, transaction),
+        getFirestoreDocInTransaction(reservaPath, transaction),
+      ]);
+
+      if (!tarjeta || !reserva) {
+        throw Object.assign(new Error("La tarjeta o su reserva ya no están disponibles."), { statusCode: 404 });
+      }
+
+      const estado = estadoTarjetaCena(tarjeta, reserva);
+      if (estado !== "pendiente") {
+        return { resultado: estado === "validada" ? "ya_registrada" : "no_acreditable", tarjeta, reserva };
+      }
+
+      const validadoPor = {
+        uid: authUser.uid,
+        email: authUser.email || "",
+        nombre: permiso.tipo === "validador" ? buildNombreAfiliado(permiso.usuario) : "Administrador SIDCA",
+        tipo: permiso.tipo,
+      };
+      const validadoPorUid = authUser.uid;
+      const validadoPorEmail = authUser.email || "";
+      const validadoPorNombre = validadoPor.nombre || "";
+      const validacionPath = `gestion_cena/${anio}/validaciones/${token}`;
+      const cuerpo = {
+        transaction,
+        writes: [
+          {
+            update: {
+              name: rutaDocumentoFirestore(tarjetaPath),
+              fields: jsToFirestoreFields({
+                estado: "validada",
+                validada: true,
+                validadoPor,
+                validadoPorUid,
+                validadoPorEmail,
+                validadoPorNombre,
+              }),
+            },
+            // Sin esta máscara, el Commit REST reemplaza el documento completo
+            // con los campos de acreditación y pierde su identidad funcional.
+            updateMask: {
+              fieldPaths: [
+                "validada",
+                "estado",
+                "fechaValidacion",
+                "validadoPor",
+                "validadoPorUid",
+                "validadoPorEmail",
+                "validadoPorNombre",
+              ],
+            },
+            updateTransforms: [{ fieldPath: "fechaValidacion", setToServerValue: "REQUEST_TIME" }],
+          },
+          {
+            update: {
+              name: rutaDocumentoFirestore(validacionPath),
+              fields: jsToFirestoreFields({
+                anio: Number(anio),
+                tarjetaId: tarjeta.id,
+                reservaId: reserva.id,
+                token,
+                codigoVisible: tarjeta.codigoVisible || null,
+                afiliadoDni: tarjeta.afiliadoDni || reserva.afiliado?.dni || null,
+                tipo: tarjeta.tipo || null,
+                validadoPor,
+                validadoPorUid,
+                validadoPorEmail,
+                validadoPorNombre,
+              }),
+            },
+            updateTransforms: [{ fieldPath: "fechaValidacion", setToServerValue: "REQUEST_TIME" }],
+          },
+        ],
+      };
+
+      await firestoreRequest(`${firestoreBaseUrl}:commit`, {
+        method: "POST",
+        body: JSON.stringify(cuerpo),
+      });
+      confirmar = true;
+
+      return {
+        resultado: "registrada",
+        tarjeta: { ...tarjeta, estado: "validada", validada: true, validadoPor },
+        reserva,
+      };
+    } catch (error: any) {
+      if (esConflictoTransaccionFirestore(error) && intento === 0) continue;
+      throw error;
+    } finally {
+      if (!confirmar) await rollbackFirestoreTransaction(transaction);
+    }
+  }
+
+  throw new Error("No se pudo registrar la tarjeta de Cena.");
+}
+
+function sendCenaError(res: express.Response, error: any) {
+  const statusCode = [400, 401, 403, 404, 409].includes(Number(error?.statusCode))
+    ? Number(error.statusCode)
+    : 500;
+  if (statusCode === 500) console.error("[sidca-chatbot-backend] Error validación Cena:", error);
+  return res.status(statusCode).json({
+    ok: false,
+    modulo: "cena",
+    error: statusCode === 500 ? "Error interno del servicio de validación de Cena." : String(error?.message || "No se pudo completar la operación."),
+  });
+}
+
+app.get("/api/cena/validar/:token", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    const token = parseCenaTokenParam(req.params.token);
+    const [permiso, tarjeta] = await Promise.all([
+      requireAdministradorOValidadorCena(authUser),
+      buscarTarjetaCenaPorToken(token),
+    ]);
+    const ubicacion = getUbicacionTarjetaCena(tarjeta);
+    const reserva = await getFirestoreDoc(ubicacion.reservaPath);
+    if (!reserva) throw Object.assign(new Error("No se encontró la reserva de esta tarjeta."), { statusCode: 404 });
+    const snapshot = await construirSnapshotReservaCena(tarjeta, reserva, ubicacion.anio);
+    return res.status(200).json({ ok: true, modulo: "cena", validacion: snapshot, permiso: permiso.tipo });
+  } catch (error: any) {
+    return sendCenaError(res, error);
+  }
+});
+
+app.get("/api/cena/reserva", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    await requireAdministradorOValidadorCena(authUser);
+    const anio = parseCenaAnioParam(req.query.anio);
+    const dni = assertValidDni(normalizeDni(String(req.query.dni || "")));
+    const reservas = await queryFirestoreChildCollection(
+      `gestion_cena/${anio}`,
+      "reservas",
+      [{ field: "afiliado.dni", value: dni }],
+      2
+    );
+    if (reservas.length === 0) {
+      throw Object.assign(new Error("No se encontró una reserva de Cena para el DNI indicado."), { statusCode: 404 });
+    }
+    if (reservas.length > 1) {
+      throw Object.assign(new Error("Hay más de una reserva para ese DNI. Consultá al administrador."), { statusCode: 409 });
+    }
+    const snapshot = await construirSnapshotReservaCena(null, reservas[0], anio);
+    return res.status(200).json({ ok: true, modulo: "cena", consulta: "dni", validacion: snapshot });
+  } catch (error: any) {
+    return sendCenaError(res, error);
+  }
+});
+
+app.post("/api/cena/validar/:token/registrar", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    const token = parseCenaTokenParam(req.params.token);
+    const [permiso, tarjetaEncontrada] = await Promise.all([
+      requireAdministradorOValidadorCena(authUser),
+      buscarTarjetaCenaPorToken(token),
+    ]);
+    const ubicacion = getUbicacionTarjetaCena(tarjetaEncontrada);
+    const registro = await registrarTarjetaCenaAtomica({
+      tarjetaPath: ubicacion.tarjetaPath,
+      reservaPath: ubicacion.reservaPath,
+      anio: ubicacion.anio,
+      token,
+      authUser,
+      permiso,
+    });
+    const snapshot = await construirSnapshotReservaCena(registro.tarjeta, registro.reserva, ubicacion.anio);
+    return res.status(200).json({
+      ok: true,
+      modulo: "cena",
+      resultado: registro.resultado,
+      validacion: snapshot,
+    });
+  } catch (error: any) {
+    return sendCenaError(res, error);
+  }
+});
+
 app.post("/api/chatbot/query", chatbotRateLimit, async (req, res) => {
   try {
     const input = bodySchema.parse(req.body);
