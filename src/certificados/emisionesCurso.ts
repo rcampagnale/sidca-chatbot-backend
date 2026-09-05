@@ -173,8 +173,9 @@ export async function listarEmisionesVigentesCurso(
   // Firestore; el documento histórico queda intacto.
   const necesitanCompletar = vigentes.some(
     (emision) =>
-      !tieneAutoridadesUtiles(emision?.certificado?.autoridades) ||
-      !texto(emision?.certificado?.institucionCertificado)
+      emision?.certificado?.institucionCertificado !== "ministerio" &&
+      (!tieneAutoridadesUtiles(emision?.certificado?.autoridades) ||
+        !texto(emision?.certificado?.institucionCertificado))
   );
 
   if (!necesitanCompletar) return vigentes;
@@ -183,8 +184,12 @@ export async function listarEmisionesVigentesCurso(
   if (!configuracion) return vigentes;
 
   const autoridadesCurso = autoridadesDeConfiguracion(configuracion);
-  const institucionCurso =
-    texto(configuracion.institucionCertificado) === "itm" ? "itm" : "sidca";
+  const institucionConfigurada = texto(configuracion.institucionCertificado);
+  const institucionCurso = ["itm", "ministerio"].includes(
+    institucionConfigurada
+  )
+    ? institucionConfigurada
+    : "sidca";
 
   return proyectarEmisiones(vigentes, autoridadesCurso, institucionCurso);
 }
@@ -216,7 +221,8 @@ export async function listarEmisionesVigentesCurso(
 export async function filtrarEmisionesHabilitadas(
   emisiones: any[],
   accessToken: string,
-  segmentoId?: string
+  segmentoId?: string,
+  opciones?: { estrategiaPadron?: "completa" | "dirigida" }
 ): Promise<{
   habilitadas: any[];
   omitidosAfiliacion: number;
@@ -234,7 +240,11 @@ export async function filtrarEmisionesHabilitadas(
 
   const padron = await resolverPadronPorDni(
     emisiones.map((emision) => emision?.participante?.dni),
-    { proyecto: projectId(), accessToken }
+    {
+      proyecto: projectId(),
+      accessToken,
+      estrategia: opciones?.estrategiaPadron,
+    }
   );
 
   const clave = (emision: any) =>
@@ -270,6 +280,13 @@ export async function filtrarEmisionesHabilitadas(
 function proyectarEmisiones(vigentes: any[], autoridadesCurso: any[], institucionCurso: string) {
   return vigentes.map((emision) => {
     const certificado = emision.certificado || {};
+
+    // El modelo Ministerio siempre se imprime desde su snapshot v1. Nunca se
+    // completa con la configuración actual del curso, ni siquiera si ésta fue
+    // modificada después de emitir el certificado.
+    if (certificado.institucionCertificado === "ministerio") {
+      return emision;
+    }
 
     const autoridades = tieneAutoridadesUtiles(certificado.autoridades)
       ? certificado.autoridades.slice(0, 2).map(normalizarAutoridad)

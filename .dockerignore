@@ -8,3 +8,7 @@ dist
 npm-debug.log
 Dockerfile*
 README.md
+tmp/
+test-output/
+*.pdf
+diagnostico-*.json

@@ -42,6 +42,25 @@ import {
 const COLECCION_ADHERENTES = "adherentes";
 const COLECCION_NUEVO_AFILIADO = "nuevoAfiliado";
 const COLECCION_USUARIOS = "usuarios";
+const COLECCIONES_PADRON = [
+  COLECCION_ADHERENTES,
+  COLECCION_NUEVO_AFILIADO,
+  COLECCION_USUARIOS,
+] as const;
+
+// Firestore admite hasta 30 disyunciones en una consulta `IN`. No se combina
+// con otros filtros, así que cada lote usa el máximo permitido por la API.
+const MAX_DNIS_POR_CONSULTA_IN = 30;
+const CAMPOS_PADRON_POR_COLECCION: Record<
+  (typeof COLECCIONES_PADRON)[number],
+  readonly string[]
+> = {
+  // `adherentes.activo` se ignora por regla funcional: sus documentos no
+  // distinguen habilitación. Sólo aporta presencia y departamento.
+  adherentes: ["dni", "departamento"],
+  nuevoAfiliado: ["dni", "activo", "departamento"],
+  usuarios: ["dni", "activo", "departamento"],
+};
 
 export type TipoAfiliacion = "adherente" | "cotizante" | "no_verificada";
 
@@ -162,6 +181,11 @@ const coleccionCache = new Map<string, ColeccionCacheEntry>();
 // en la caché de 45 segundos.
 const coleccionEnCurso = new Map<string, Promise<Record<string, any>[]>>();
 
+// El Job puede pedir el padrón más de una vez durante la vida de una misma
+// instancia. Esta caché guarda tanto coincidencias como ausencias por DNI y
+// fuente, sin volver a descargar una colección completa.
+const dniColeccionCache = new Map<string, ColeccionCacheEntry>();
+
 async function listarColeccionCacheada(
   proyecto: string,
   accessToken: string,
@@ -206,6 +230,137 @@ const valorFirestore = (campo: any): string => {
   return "";
 };
 
+const dividirEnLotes = <T>(valores: T[], tamano: number): T[][] => {
+  const lotes: T[][] = [];
+  for (let indice = 0; indice < valores.length; indice += tamano) {
+    lotes.push(valores.slice(indice, indice + tamano));
+  }
+  return lotes;
+};
+
+type ResultadoColeccionDirigida = {
+  documentos: Record<string, any>[];
+  consultas: number;
+  documentosLeidos: number;
+  cacheados: number;
+};
+
+/**
+ * Consulta una colección raíz sólo para los DNI solicitados.
+ *
+ * Firestore no considera iguales un string y un integer. Por eso cada lote
+ * se consulta en ambas representaciones, igual que la búsqueda individual
+ * histórica de usuarios/nuevoAfiliado en server.ts. Las consultas de cada
+ * lote corren juntas, pero los lotes avanzan de a uno para no abrir cientos
+ * de requests simultáneos en un curso grande.
+ */
+async function listarColeccionPorDnis(
+  proyecto: string,
+  accessToken: string,
+  coleccion: (typeof COLECCIONES_PADRON)[number],
+  dnis: string[]
+): Promise<ResultadoColeccionDirigida> {
+  const inicio = Date.now();
+  const porDni = new Map<string, Record<string, any>[]>();
+  const faltantes: string[] = [];
+  let cacheados = 0;
+
+  for (const dni of dnis) {
+    const clave = `${proyecto}/${coleccion}/${dni}`;
+    const cacheado = dniColeccionCache.get(clave);
+    if (cacheado && cacheado.expiraEn > Date.now()) {
+      porDni.set(dni, cacheado.documentos);
+      cacheados += 1;
+    } else {
+      faltantes.push(dni);
+    }
+  }
+
+  let consultas = 0;
+  let documentosLeidos = 0;
+  const baseUrl = `https://firestore.googleapis.com/v1/projects/${proyecto}/databases/(default)/documents:runQuery`;
+
+  const consultar = async (lote: string[], tipo: "string" | "integer") => {
+    consultas += 1;
+    const valores = lote.map((dni) =>
+      tipo === "integer"
+        ? { integerValue: String(Number(dni)) }
+        : { stringValue: dni }
+    );
+    const respuesta = await fetch(baseUrl, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        structuredQuery: {
+          from: [{ collectionId: coleccion }],
+          select: {
+            fields: CAMPOS_PADRON_POR_COLECCION[coleccion].map((fieldPath) => ({
+              fieldPath,
+            })),
+          },
+          where: {
+            fieldFilter: {
+              field: { fieldPath: "dni" },
+              op: "IN",
+              value: { arrayValue: { values: valores } },
+            },
+          },
+        },
+      }),
+    });
+
+    if (!respuesta.ok) {
+      const detalle: any = await respuesta.json().catch(() => null);
+      throw new Error(
+        `Firestore ${respuesta.status} al consultar ${coleccion} por DNI: ${
+          detalle?.error?.message || respuesta.statusText
+        }`
+      );
+    }
+
+    const filas: any[] = await respuesta.json();
+    const documentos = filas
+      .map((fila) => fila?.document?.fields)
+      .filter((campos): campos is Record<string, any> => Boolean(campos));
+    documentosLeidos += documentos.length;
+    return documentos;
+  };
+
+  for (const lote of dividirEnLotes(faltantes, MAX_DNIS_POR_CONSULTA_IN)) {
+    const [comoTexto, comoNumero] = await Promise.all([
+      consultar(lote, "string"),
+      consultar(lote, "integer"),
+    ]);
+
+    for (const campos of [...comoTexto, ...comoNumero]) {
+      const dni = normalizar(valorFirestore(campos?.dni));
+      if (!dni || !lote.includes(dni)) continue;
+      const existentes = porDni.get(dni) || [];
+      existentes.push(campos);
+      porDni.set(dni, existentes);
+    }
+  }
+
+  for (const dni of faltantes) {
+    const documentos = porDni.get(dni) || [];
+    porDni.set(dni, documentos);
+    dniColeccionCache.set(`${proyecto}/${coleccion}/${dni}`, {
+      documentos,
+      expiraEn: Date.now() + COLECCION_CACHE_TTL_MS,
+    });
+  }
+
+  const documentos = dnis.flatMap((dni) => porDni.get(dni) || []);
+  console.log(
+    `[padron-perf] coleccion=${coleccion} dnis=${dnis.length} consultas=${consultas} documentos=${documentosLeidos} cacheados=${cacheados} ms=${Date.now() - inicio}`
+  );
+
+  return { documentos, consultas, documentosLeidos, cacheados };
+}
+
 function indexarPorDni(
   documentos: Record<string, any>[],
   dnisSolicitados: Set<string>
@@ -222,6 +377,47 @@ function indexarPorDni(
   }
 
   return indice;
+}
+
+type FuentesPadron = {
+  adherentes: Record<string, any>[];
+  nuevoAfiliado: Record<string, any>[];
+  usuarios: Record<string, any>[];
+};
+
+export function resolverPadronDesdeFuentes(
+  dnis: Array<string | number | null | undefined>,
+  fuentes: FuentesPadron
+): Map<string, { afiliacion: Afiliacion; departamento: Departamento }> {
+  const unicos = [...new Set(dnis.map(normalizar).filter(Boolean))];
+  const salida = new Map<
+    string,
+    { afiliacion: Afiliacion; departamento: Departamento }
+  >();
+  const solicitados = new Set(unicos);
+  const adherentesPorDni = indexarPorDni(fuentes.adherentes, solicitados);
+  const nuevoAfiliadoPorDni = indexarPorDni(
+    fuentes.nuevoAfiliado,
+    solicitados
+  );
+  const usuariosPorDni = indexarPorDni(fuentes.usuarios, solicitados);
+
+  for (const dni of unicos) {
+    const adherentes = adherentesPorDni.get(dni) || [];
+    const nuevoAfiliado = nuevoAfiliadoPorDni.get(dni) || [];
+    const usuarios = usuariosPorDni.get(dni) || [];
+
+    salida.set(dni, {
+      afiliacion: proyectarAfiliacion(adherentes, nuevoAfiliado, usuarios),
+      departamento: proyectarDepartamento(
+        nuevoAfiliado,
+        usuarios,
+        adherentes
+      ),
+    });
+  }
+
+  return salida;
 }
 
 /**
@@ -317,26 +513,50 @@ export async function resolverAfiliacionPorDni(
  */
 export async function resolverPadronPorDni(
   dnis: Array<string | number | null | undefined>,
-  opciones: { proyecto: string; accessToken: string; tamanoLote?: number }
+  opciones: {
+    proyecto: string;
+    accessToken: string;
+    tamanoLote?: number;
+    estrategia?: "completa" | "dirigida";
+  }
 ): Promise<Map<string, { afiliacion: Afiliacion; departamento: Departamento }>> {
   const { proyecto, accessToken } = opciones;
 
   const unicos = [...new Set(dnis.map(normalizar).filter(Boolean))];
-  const salida = new Map<
-    string,
-    { afiliacion: Afiliacion; departamento: Departamento }
-  >();
-
-  if (!unicos.length) return salida;
+  if (!unicos.length) return new Map();
 
   const inicio = Date.now();
+  if (opciones.estrategia === "dirigida") {
+    const [adherentes, nuevoAfiliado, usuarios] = await Promise.all(
+      COLECCIONES_PADRON.map((coleccion) =>
+        listarColeccionPorDnis(proyecto, accessToken, coleccion, unicos)
+      )
+    );
+    const consultas =
+      adherentes.consultas + nuevoAfiliado.consultas + usuarios.consultas;
+    const documentos =
+      adherentes.documentosLeidos +
+      nuevoAfiliado.documentosLeidos +
+      usuarios.documentosLeidos;
+    const cacheados =
+      adherentes.cacheados + nuevoAfiliado.cacheados + usuarios.cacheados;
+
+    console.log(
+      `[padron-perf] estrategia=dirigida dnis=${unicos.length} consultas=${consultas} documentos=${documentos} cacheados=${cacheados} ms=${Date.now() - inicio}`
+    );
+    return resolverPadronDesdeFuentes(unicos, {
+      adherentes: adherentes.documentos,
+      nuevoAfiliado: nuevoAfiliado.documentos,
+      usuarios: usuarios.documentos,
+    });
+  }
+
   const clavesCache = [COLECCION_ADHERENTES, COLECCION_NUEVO_AFILIADO, COLECCION_USUARIOS]
     .map((coleccion) => `${proyecto}/${coleccion}`);
   const cacheHit = clavesCache.every(
     (clave) => (coleccionCache.get(clave)?.expiraEn || 0) > Date.now()
   );
 
-  const solicitados = new Set(unicos);
   const [documentosAdherentes, documentosNuevoAfiliado, documentosUsuarios] =
     await Promise.all([
       listarColeccionCacheada(proyecto, accessToken, COLECCION_ADHERENTES),
@@ -346,29 +566,11 @@ export async function resolverPadronPorDni(
 
   console.log(`[perf] resolverPadron dnis=${unicos.length} cache=${cacheHit ? "hit" : "miss"} tiempo=${Date.now() - inicio}ms`);
 
-  const adherentesPorDni = indexarPorDni(documentosAdherentes, solicitados);
-  const nuevoAfiliadoPorDni = indexarPorDni(
-    documentosNuevoAfiliado,
-    solicitados
-  );
-  const usuariosPorDni = indexarPorDni(documentosUsuarios, solicitados);
-
-  for (const dni of unicos) {
-    const adherentes = adherentesPorDni.get(dni) || [];
-    const nuevoAfiliado = nuevoAfiliadoPorDni.get(dni) || [];
-    const usuarios = usuariosPorDni.get(dni) || [];
-
-    salida.set(dni, {
-      afiliacion: proyectarAfiliacion(adherentes, nuevoAfiliado, usuarios),
-      departamento: proyectarDepartamento(
-        nuevoAfiliado,
-        usuarios,
-        adherentes
-      ),
-    });
-  }
-
-  return salida;
+  return resolverPadronDesdeFuentes(unicos, {
+    adherentes: documentosAdherentes,
+    nuevoAfiliado: documentosNuevoAfiliado,
+    usuarios: documentosUsuarios,
+  });
 }
 
 /** Primer `departamento` no vacío de un conjunto de documentos. */

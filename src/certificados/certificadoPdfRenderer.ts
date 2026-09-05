@@ -2,6 +2,7 @@ import QRCode from "qrcode";
 import sharp from "sharp";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { renderCertificadoMinisterioPdfPage } from "./certificadoMinisterioPdfRenderer.js";
 
 let sidcaBuffer: Buffer | null = null;
 let itmBuffer: Buffer | null = null;
@@ -108,8 +109,12 @@ export async function renderCertificadoPdfPage(
   doc: PDFKit.PDFDocument,
   emision: any
 ) {
-  const { sidcaBuffer, itmBuffer } = await templates();
   const certificado = emision?.certificado || {};
+  if (certificado.institucionCertificado === "ministerio") {
+    return renderCertificadoMinisterioPdfPage(doc, emision);
+  }
+
+  const { sidcaBuffer, itmBuffer } = await templates();
   const participante = emision?.participante || {};
   const itm = certificado.institucionCertificado === "itm";
   const template = itm ? itmBuffer : sidcaBuffer;

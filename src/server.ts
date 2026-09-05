@@ -4,6 +4,7 @@ import express from "express";
 import cors from "cors";
 import multer from "multer";
 import OpenAI, { toFile } from "openai";
+import { GoogleAuth } from "google-auth-library";
 import { z } from "zod";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import { runChatbotWorkflow } from "./openaiWorkflow.js";
@@ -58,6 +59,10 @@ const upload = multer({
 const registroInscriptosUpload = multer({
   storage: multer.memoryStorage(),
   limits: { files: 10, fileSize: 15 * 1024 * 1024 },
+});
+const firmaMinisterioUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { files: 1, fileSize: 2 * 1024 * 1024 },
 });
 const registroExcelMimeTypes = new Set([
   "application/vnd.ms-excel",
@@ -469,52 +474,25 @@ function jsToFirestoreFields(data: Record<string, any>): Record<string, Firestor
   );
 }
 
-let googleAccessTokenCache:
-  | {
-      token: string;
-      expiresAt: number;
-    }
-  | null = null;
+const googleAuth = new GoogleAuth({
+  scopes: ["https://www.googleapis.com/auth/cloud-platform"],
+});
 
 async function getGoogleAccessToken(): Promise<string> {
   const explicitToken = process.env.GOOGLE_OAUTH_ACCESS_TOKEN?.trim();
   if (explicitToken) return explicitToken;
 
-  if (
-    googleAccessTokenCache &&
-    googleAccessTokenCache.expiresAt > Date.now() + 60_000
-  ) {
-    return googleAccessTokenCache.token;
-  }
+  const client = await googleAuth.getClient();
+  const accessToken = await client.getAccessToken();
+  const token = typeof accessToken === "string" ? accessToken : accessToken?.token;
 
-  const metadataResponse = await fetch(
-    "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
-    {
-      headers: {
-        "Metadata-Flavor": "Google",
-      },
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    }
-  );
-
-  if (!metadataResponse.ok) {
+  if (!token) {
     throw new Error(
-      "No se pudo obtener token de Google para Firestore. Configurá GOOGLE_OAUTH_ACCESS_TOKEN en local o ejecutá en Cloud Run con service account."
+      "No se pudo obtener un Google Access Token mediante Application Default Credentials."
     );
   }
 
-  const data = await metadataResponse.json();
-  if (!data?.access_token) {
-    throw new Error("La metadata de Google no devolvió access_token para Firestore.");
-  }
-
-  const expiresInSeconds = Number(data.expires_in || 3000);
-  googleAccessTokenCache = {
-    token: String(data.access_token),
-    expiresAt: Date.now() + Math.max(60, expiresInSeconds) * 1000,
-  };
-
-  return googleAccessTokenCache.token;
+  return token;
 }
 
 async function firestoreRequest<T>(
@@ -845,6 +823,77 @@ async function queryFirestoreChildCollection(
     .map((row) => row.document)
     .filter((doc): doc is FirestoreDocument => Boolean(doc))
     .map((doc) => firestoreDocToJs(doc));
+}
+
+/**
+ * Consulta una subcolección completa, paginando por nombre de documento.
+ *
+ * El listado normal de emisiones usa límites pequeños porque atiende una
+ * pantalla. El reinicio administrativo necesita recorrer todo el curso sin
+ * truncar el borrado al primer lote.
+ */
+async function queryFirestoreChildCollectionCompleta(
+  parentPath: string,
+  collectionId: string,
+  filters: Array<{ field: string; op?: string; value: any }>,
+  limit = 10_000,
+  pageSize = 300
+): Promise<FirestoreRecord[]> {
+  const where =
+    filters.length === 0
+      ? undefined
+      : filters.length === 1
+      ? makeFieldFilter(filters[0].field, filters[0].op || "EQUAL", filters[0].value)
+      : {
+          compositeFilter: {
+            op: "AND",
+            filters: filters.map((filter) =>
+              makeFieldFilter(filter.field, filter.op || "EQUAL", filter.value)
+            ),
+          },
+        };
+
+  const documentos: FirestoreRecord[] = [];
+  let cursor: string | null = null;
+
+  while (documentos.length < limit) {
+    const restantes = limit - documentos.length;
+    const tamanoPagina = Math.min(pageSize, restantes);
+    const structuredQuery: Record<string, any> = {
+      from: [{ collectionId }],
+      ...(where ? { where } : {}),
+      orderBy: [{ field: { fieldPath: "__name__" }, direction: "ASCENDING" }],
+      limit: tamanoPagina,
+    };
+
+    if (cursor) {
+      structuredQuery.startAt = {
+        values: [{ referenceValue: cursor }],
+        before: false,
+      };
+    }
+
+    const result = await firestoreRequest<Array<{ document?: FirestoreDocument }>>(
+      `${firestoreBaseUrl}/${parentPath}:runQuery`,
+      {
+        method: "POST",
+        body: JSON.stringify({ structuredQuery }),
+      }
+    );
+
+    const pagina = (result || [])
+      .map((row) => row.document)
+      .filter((doc): doc is FirestoreDocument => Boolean(doc));
+
+    if (pagina.length === 0) break;
+
+    for (const doc of pagina) documentos.push(firestoreDocToJs(doc));
+    cursor = pagina[pagina.length - 1].name;
+
+    if (pagina.length < tamanoPagina) break;
+  }
+
+  return documentos;
 }
 
 function cursoIdDesdeRegistroInscriptos(archivo: FirestoreRecord): string {
@@ -2031,10 +2080,10 @@ function parseCertificadoTokenParam(valor: unknown): string {
  * Institución que emite el certificado.
  *
  * Determina qué plantilla usa el frontend. Firestore guarda SÓLO el valor
- * semántico —"sidca" o "itm"—, nunca el nombre del archivo PNG: el asset es
+ * semántico —"sidca", "itm" o "ministerio"—, nunca el nombre del asset: el
  * un detalle del frontend y puede cambiar sin tocar los datos.
  */
-const INSTITUCIONES_CERTIFICADO = ["sidca", "itm"] as const;
+const INSTITUCIONES_CERTIFICADO = ["sidca", "itm", "ministerio"] as const;
 
 type InstitucionCertificado = (typeof INSTITUCIONES_CERTIFICADO)[number];
 
@@ -2048,7 +2097,10 @@ type InstitucionCertificado = (typeof INSTITUCIONES_CERTIFICADO)[number];
 function normalizarInstitucionCertificado(
   record: FirestoreRecord | null | undefined
 ): InstitucionCertificado {
-  return record?.institucionCertificado === "itm" ? "itm" : "sidca";
+  return record?.institucionCertificado === "itm" ||
+    record?.institucionCertificado === "ministerio"
+    ? record.institucionCertificado
+    : "sidca";
 }
 
 /**
@@ -2073,6 +2125,29 @@ const autoridadCertificadoSchema = z.strictObject({
   orden: z.number().int().min(1).max(2),
 });
 
+const FIRMANTES_MINISTERIO_IDS = [
+  "firmante_1",
+  "firmante_2",
+  "firmante_3",
+] as const;
+
+const firmanteMinisterioSchema = z.strictObject({
+  id: z.enum(FIRMANTES_MINISTERIO_IDS),
+  orden: z.number().int().min(1).max(3),
+  nombre: z.string().trim().max(160),
+  cargo: z.string().trim().max(300),
+  organismo: z.string().trim().max(400),
+  activo: z.boolean(),
+  imagenStoragePath: z.string().trim().max(500).optional().default(""),
+  imagenVersion: z.number().int().min(0).max(100000).optional().default(0),
+  imagenSha256: z
+    .string()
+    .trim()
+    .regex(/^(|[a-f0-9]{64})$/, "El hash de la firma no es válido.")
+    .optional()
+    .default(""),
+});
+
 /**
  * Cuerpo aceptado por PUT.
  *
@@ -2083,14 +2158,40 @@ const autoridadCertificadoSchema = z.strictObject({
  * "firmas" ya no se acepta: strictObject lo rechaza si alguien lo enviara.
  */
 const configuracionCertificadoSchema = z.strictObject({
-  titulo: z.string().trim().min(1, "El título del certificado es obligatorio.").max(300),
-  resolucion: z.string().trim().min(1, "La resolución es obligatoria.").max(200),
-  cargaHoraria: z.string().trim().min(1, "La carga horaria es obligatoria.").max(100),
-  dias: z.string().trim().min(1, "Las fechas de realización son obligatorias.").max(300),
-  fecha: z.string().trim().min(1, "La fecha del certificado es obligatoria.").max(200),
-  modalidad: z.string().trim().min(1, "La modalidad es obligatoria.").max(120),
+  titulo: z.string().trim().max(300),
+  resolucion: z.string().trim().max(200),
+  cargaHoraria: z.string().trim().max(100),
+  dias: z.string().trim().max(300),
+  fecha: z.string().trim().max(200),
+  modalidad: z.string().trim().max(120),
   institucionCertificado: z.enum(INSTITUCIONES_CERTIFICADO),
   autoridades: z.array(autoridadCertificadoSchema).max(2).optional().default([]),
+  tipoActividad: z.string().trim().max(100).optional().default(""),
+  fechaInicio: z.string().trim().max(10).optional().default(""),
+  fechaFin: z.string().trim().max(10).optional().default(""),
+  localidad: z.string().trim().max(160).optional().default(""),
+  departamento: z.string().trim().max(160).optional().default(""),
+  niveles: z.array(z.string().trim().min(1).max(60)).max(12).optional().default([]),
+  textoEvaluacion: z.string().trim().max(500).optional().default(""),
+  textoAuspicio: z.string().trim().max(700).optional().default(""),
+  firmantesMinisterio: z.array(firmanteMinisterioSchema).max(3).optional().default([]),
+}).superRefine((valor, contexto) => {
+  if (valor.institucionCertificado === "ministerio") return;
+
+  const obligatorios = [
+    ["titulo", "El título del certificado es obligatorio."],
+    ["resolucion", "La resolución es obligatoria."],
+    ["cargaHoraria", "La carga horaria es obligatoria."],
+    ["dias", "Las fechas de realización son obligatorias."],
+    ["fecha", "La fecha del certificado es obligatoria."],
+    ["modalidad", "La modalidad es obligatoria."],
+  ] as const;
+
+  obligatorios.forEach(([campo, mensaje]) => {
+    if (!valor[campo]) {
+      contexto.addIssue({ code: z.ZodIssueCode.custom, path: [campo], message: mensaje });
+    }
+  });
 });
 
 const ESTADOS_CONFIGURACION_CERTIFICADO = new Set(["borrador", "lista"]);
@@ -2141,6 +2242,30 @@ function obtenerAutoridadesConfiguracion(
   }));
 }
 
+function obtenerFirmantesMinisterioConfiguracion(
+  record: FirestoreRecord | null | undefined
+): Record<string, any>[] {
+  const porId = new Map(
+    (Array.isArray(record?.firmantesMinisterio) ? record!.firmantesMinisterio : [])
+      .map((firmante: any) => [String(firmante?.id || ""), firmante])
+  );
+
+  return FIRMANTES_MINISTERIO_IDS.map((id, indice) => {
+    const firmante: any = porId.get(id) || {};
+    return {
+      id,
+      orden: indice + 1,
+      nombre: String(firmante.nombre || "").trim(),
+      cargo: String(firmante.cargo || "").trim(),
+      organismo: String(firmante.organismo || "").trim(),
+      activo: firmante.activo !== false,
+      imagenStoragePath: String(firmante.imagenStoragePath || "").trim(),
+      imagenVersion: Math.max(0, Number(firmante.imagenVersion || 0) || 0),
+      imagenSha256: String(firmante.imagenSha256 || "").trim(),
+    };
+  });
+}
+
 /**
  * Proyecta el documento de Firestore a la respuesta pública del módulo.
  *
@@ -2163,6 +2288,18 @@ function mapConfiguracionCertificado(
     modalidad: record.modalidad || "",
     institucionCertificado: normalizarInstitucionCertificado(record),
     autoridades: obtenerAutoridadesConfiguracion(record),
+    tipoActividad: record.tipoActividad || "",
+    fechaInicio: record.fechaInicio || "",
+    fechaFin: record.fechaFin || "",
+    localidad: record.localidad || "",
+    departamento: record.departamento || "",
+    niveles: Array.isArray(record.niveles) ? record.niveles : [],
+    textoEvaluacion: record.textoEvaluacion || "",
+    textoAuspicio: record.textoAuspicio || "",
+    firmantesMinisterio:
+      normalizarInstitucionCertificado(record) === "ministerio"
+        ? obtenerFirmantesMinisterioConfiguracion(record)
+        : [],
     estadoConfiguracion: record.estadoConfiguracion || "borrador",
     creadoEn: record.creadoEn || null,
     actualizadoEn: record.actualizadoEn || null,
@@ -2189,6 +2326,123 @@ function normalizarAutoridadesCertificado(
       referencia: autoridad.referencia || "",
       orden: indice + 1,
     }));
+}
+
+function normalizarFirmantesMinisterio(
+  firmantes: z.infer<typeof firmanteMinisterioSchema>[]
+): Record<string, any>[] {
+  const porId = new Map(firmantes.map((firmante) => [firmante.id, firmante]));
+
+  return FIRMANTES_MINISTERIO_IDS.map((id, indice) => {
+    const firmante = porId.get(id);
+    return {
+      id,
+      orden: indice + 1,
+      nombre: String(firmante?.nombre || "").trim(),
+      cargo: String(firmante?.cargo || "").trim(),
+      organismo: String(firmante?.organismo || "").trim(),
+      activo: firmante?.activo !== false,
+      imagenStoragePath: String(firmante?.imagenStoragePath || "").trim(),
+      imagenVersion: Math.max(0, Number(firmante?.imagenVersion || 0) || 0),
+      imagenSha256: String(firmante?.imagenSha256 || "").trim(),
+    };
+  });
+}
+
+function parseFirmanteMinisterioId(value: unknown): (typeof FIRMANTES_MINISTERIO_IDS)[number] {
+  if (!FIRMANTES_MINISTERIO_IDS.includes(value as any)) {
+    throw Object.assign(new Error("El firmante indicado no es válido."), { statusCode: 400 });
+  }
+  return value as (typeof FIRMANTES_MINISTERIO_IDS)[number];
+}
+
+function validarArchivoFirmaMinisterio(file: Express.Multer.File): {
+  extension: "png" | "jpg";
+  mimeType: "image/png" | "image/jpeg";
+} {
+  const extension = String(file.originalname || "").toLowerCase().split(".").pop();
+  const mimeType = String(file.mimetype || "").toLowerCase();
+  const buffer = file.buffer;
+  const esPng = buffer?.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+  const esJpeg = buffer?.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff;
+
+  if (!buffer?.length || file.size > 2 * 1024 * 1024) {
+    throw Object.assign(new Error("La firma debe pesar como máximo 2 MB."), { statusCode: 400 });
+  }
+  if (esPng && extension === "png" && mimeType === "image/png") {
+    return { extension: "png", mimeType: "image/png" };
+  }
+  if (esJpeg && ["jpg", "jpeg"].includes(extension || "") && mimeType === "image/jpeg") {
+    return { extension: "jpg", mimeType: "image/jpeg" };
+  }
+  throw Object.assign(new Error("La firma debe ser un PNG o JPEG válido."), { statusCode: 400 });
+}
+
+function esFechaIsoValida(valor: unknown): boolean {
+  const texto = String(valor || "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(texto)) return false;
+  const [anio, mes, dia] = texto.split("-").map(Number);
+  const fecha = new Date(Date.UTC(anio, mes - 1, dia));
+  return fecha.getUTCFullYear() === anio && fecha.getUTCMonth() === mes - 1 && fecha.getUTCDate() === dia;
+}
+
+function validarConfiguracionMinisterioParaEmision(
+  certificado: FirestoreRecord,
+  participante: { apellidoNombre: string; dni: string }
+): Record<string, any>[] {
+  const requeridos: [string, string][] = [
+    ["titulo", "Falta el título del certificado."],
+    ["modalidad", "Falta la modalidad."],
+    ["cargaHoraria", "Falta la carga horaria."],
+    ["resolucion", "Falta la resolución."],
+    ["tipoActividad", "Falta el tipo de actividad."],
+    ["fechaInicio", "Falta la fecha de inicio."],
+    ["fechaFin", "Falta la fecha de finalización."],
+    ["fecha", "Falta la fecha de expedición."],
+  ];
+
+  for (const [campo, mensaje] of requeridos) {
+    if (!String(certificado[campo] || "").trim()) {
+      throw Object.assign(new Error(`No se puede emitir el certificado Ministerio: ${mensaje}`), { statusCode: 409 });
+    }
+  }
+
+  if (!String(participante.apellidoNombre || "").trim() || !String(participante.dni || "").trim()) {
+    throw Object.assign(new Error("No se puede emitir el certificado Ministerio porque faltan datos del participante."), { statusCode: 409 });
+  }
+
+  if (!esFechaIsoValida(certificado.fechaInicio) || !esFechaIsoValida(certificado.fechaFin)) {
+    throw Object.assign(new Error("Las fechas de inicio y finalización deben tener formato válido."), { statusCode: 409 });
+  }
+  if (String(certificado.fechaInicio) > String(certificado.fechaFin)) {
+    throw Object.assign(new Error("La fecha de finalización no puede ser anterior a la fecha de inicio."), { statusCode: 409 });
+  }
+  if (!esFechaIsoValida(certificado.fecha)) {
+    throw Object.assign(new Error("La fecha de expedición no es válida."), { statusCode: 409 });
+  }
+  if (!Array.isArray(certificado.niveles) || !certificado.niveles.some((nivel: unknown) => String(nivel || "").trim())) {
+    throw Object.assign(new Error("Debe seleccionar al menos un nivel educativo."), { statusCode: 409 });
+  }
+
+  const firmantes = obtenerFirmantesMinisterioConfiguracion(certificado);
+  const activos = firmantes.filter((firmante) => firmante.activo !== false);
+  if (!activos.length) {
+    throw Object.assign(new Error("Debe existir al menos un firmante activo."), { statusCode: 409 });
+  }
+  activos.forEach((firmante, indice) => {
+    const nombre = String(firmante.nombre || `Firmante ${indice + 1}`).trim();
+    if (!String(firmante.nombre || "").trim() || !String(firmante.cargo || "").trim() || !String(firmante.organismo || "").trim()) {
+      throw Object.assign(new Error(`El firmante "${nombre}" debe tener nombre, cargo y organismo.`), { statusCode: 409 });
+    }
+    if (!String(firmante.imagenStoragePath || "").trim() || Number(firmante.imagenVersion || 0) <= 0 || !/^[a-f0-9]{64}$/.test(String(firmante.imagenSha256 || "").trim())) {
+      throw Object.assign(
+        new Error(`El firmante "${nombre}" todavía no tiene una firma digital guardada. Cargue la firma desde Configuración antes de emitir certificados.`),
+        { statusCode: 409 }
+      );
+    }
+  });
+
+  return firmantes;
 }
 
 const mapValidadorAdmin = (doc: FirestoreRecord) => ({
@@ -2690,19 +2944,35 @@ app.put("/api/certificados/admin/configuracion/:cursoId", async (req, res) => {
 
       institucionCertificado: datosValidados.institucionCertificado,
 
-      // Sustituye a "firmas". El campo legacy puede seguir existiendo
-      // físicamente en documentos anteriores: updateFirestoreDoc usa
-      // updateMask, así que no se toca lo que no se nombra. No se borra
-      // automáticamente — es historial, y quitarlo no aporta nada.
-      autoridades: normalizarAutoridadesCertificado(
-        datosValidados.autoridades || []
-      ),
-
       estadoConfiguracion,
 
       actualizadoEn: ahora,
       actualizadoPor: authUser.uid,
     };
+
+    if (datosValidados.institucionCertificado === "ministerio") {
+      Object.assign(datos, {
+        tipoActividad: datosValidados.tipoActividad,
+        fechaInicio: datosValidados.fechaInicio,
+        fechaFin: datosValidados.fechaFin,
+        localidad: datosValidados.localidad,
+        departamento: datosValidados.departamento,
+        niveles: datosValidados.niveles,
+        textoEvaluacion: datosValidados.textoEvaluacion,
+        textoAuspicio: datosValidados.textoAuspicio,
+        firmantesMinisterio: normalizarFirmantesMinisterio(
+          datosValidados.firmantesMinisterio || []
+        ),
+      });
+    } else {
+      // Sustituye a "firmas". El campo legacy puede seguir existiendo
+      // físicamente en documentos anteriores: updateFirestoreDoc usa
+      // updateMask, así que no se toca lo que no se nombra. No se borra
+      // automáticamente — es historial, y quitarlo no aporta nada.
+      datos.autoridades = normalizarAutoridadesCertificado(
+        datosValidados.autoridades || []
+      );
+    }
 
     // creadoEn / creadoPor se escriben una sola vez. Al no incluirlos en el
     // updateMask cuando ya existen, quedan intactos y además se evita
@@ -2725,6 +2995,120 @@ app.put("/api/certificados/admin/configuracion/:cursoId", async (req, res) => {
     return sendCertificadosError(res, error);
   }
 });
+
+app.post(
+  "/api/certificados/admin/configuracion/:cursoId/firmantes/:firmanteId/imagen",
+  firmaMinisterioUpload.single("imagen"),
+  async (req, res) => {
+    try {
+      const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+      await requireAdministrador(authUser);
+
+      const cursoId = parseCursoIdParam(req.params.cursoId);
+      const firmanteId = parseFirmanteMinisterioId(req.params.firmanteId);
+      const archivo = req.file;
+
+      if (!archivo) {
+        throw Object.assign(new Error("Seleccioná una firma para subir."), { statusCode: 400 });
+      }
+
+      const imagen = validarArchivoFirmaMinisterio(archivo);
+      const existente = await getFirestoreDoc(`certificados/${cursoId}`);
+
+      if (!existente || normalizarInstitucionCertificado(existente) !== "ministerio") {
+        throw Object.assign(
+          new Error("Primero guardá la configuración del Modelo Ministerio."),
+          { statusCode: 409 }
+        );
+      }
+
+      const firmantes = obtenerFirmantesMinisterioConfiguracion(existente);
+      const indice = firmantes.findIndex((firmante) => firmante.id === firmanteId);
+      const actual = firmantes[indice];
+      const version = Math.max(0, Number(actual?.imagenVersion || 0)) + 1;
+      const storagePath = `certificados-assets/firmas/${cursoId}/${firmanteId}/v${version}-${crypto.randomUUID()}/firma.${imagen.extension}`;
+      const imagenSha256 = crypto.createHash("sha256").update(archivo.buffer).digest("hex");
+
+      await uploadGoogleStorageObject(
+        bucketRegistroInscriptos(),
+        storagePath,
+        archivo.buffer,
+        imagen.mimeType
+      );
+
+      firmantes[indice] = {
+        ...actual,
+        imagenStoragePath: storagePath,
+        imagenVersion: version,
+        imagenSha256,
+      };
+
+      const guardado = await updateFirestoreDoc(`certificados/${cursoId}`, {
+        firmantesMinisterio: firmantes,
+        actualizadoEn: new Date(),
+        actualizadoPor: authUser.uid,
+      });
+
+      return res.status(201).json({
+        ok: true,
+        configuracion: mapConfiguracionCertificado(guardado, cursoId),
+      });
+    } catch (error: any) {
+      return sendCertificadosError(res, error);
+    }
+  }
+);
+
+app.get(
+  "/api/certificados/admin/configuracion/:cursoId/firmantes/:firmanteId/imagen",
+  async (req, res) => {
+    try {
+      const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+      await requireAdministrador(authUser);
+
+      const cursoId = parseCursoIdParam(req.params.cursoId);
+      const firmanteId = parseFirmanteMinisterioId(req.params.firmanteId);
+      const configuracion = await getFirestoreDoc(`certificados/${cursoId}`);
+
+      if (!configuracion || normalizarInstitucionCertificado(configuracion) !== "ministerio") {
+        throw Object.assign(new Error("La firma no está disponible."), { statusCode: 404 });
+      }
+
+      const firmante = obtenerFirmantesMinisterioConfiguracion(configuracion).find(
+        (item) => item.id === firmanteId
+      );
+      const storagePath = String(firmante?.imagenStoragePath || "");
+
+      if (!storagePath) {
+        throw Object.assign(new Error("La firma no está disponible."), { statusCode: 404 });
+      }
+
+      const objeto = await storageRegistroRequest(
+        "GET",
+        bucketRegistroInscriptos(),
+        storagePath
+      );
+
+      if (!objeto.ok || !objeto.body) {
+        if (objeto.status === 404) {
+          throw Object.assign(new Error("La firma no está disponible."), { statusCode: 404 });
+        }
+        await storageRegistroError(objeto);
+      }
+
+      res.setHeader(
+        "Content-Type",
+        storagePath.toLowerCase().endsWith(".png") ? "image/png" : "image/jpeg"
+      );
+      res.setHeader("Cache-Control", "private, no-store");
+      const largo = objeto.headers.get("content-length");
+      if (largo) res.setHeader("Content-Length", largo);
+      await pipeline(Readable.fromWeb(objeto.body as any), res);
+    } catch (error: any) {
+      return sendCertificadosError(res, error);
+    }
+  }
+);
 
 /**
  * Elimina la configuración de certificado de un curso.
@@ -4117,6 +4501,50 @@ app.get(
   }
 );
 
+app.get(
+  "/api/certificados/admin/emision/:cursoId/usuario/:usuarioDocId/firmantes/:firmanteId/imagen",
+  async (req, res) => {
+    try {
+      const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+      await requireAdministrador(authUser);
+      const cursoId = parseCursoIdParam(req.params.cursoId);
+      const usuarioDocId = parseUsuarioDocIdParam(req.params.usuarioDocId);
+      const firmanteId = parseFirmanteMinisterioId(req.params.firmanteId);
+      const emitidos = await queryFirestoreChildCollection(
+        `certificados/${cursoId}`,
+        "emitidos",
+        [{ field: "usuarioDocId", value: usuarioDocId }],
+        20
+      );
+      const emision = emitidos.find((emitido) => emitido.estado === EMITIDOS_ESTADO_VIGENTE);
+      const certificado = emision?.certificado;
+      if (!emision || certificado?.institucionCertificado !== "ministerio") {
+        throw Object.assign(new Error("La firma histórica no está disponible."), { statusCode: 404 });
+      }
+      const firmante = (Array.isArray(certificado.firmantesMinisterio) ? certificado.firmantesMinisterio : [])
+        .find((item: any) => item?.id === firmanteId && item?.activo !== false);
+      const storagePath = String(firmante?.imagenStoragePath || "").trim();
+      if (!storagePath) {
+        throw Object.assign(new Error("La firma histórica no está disponible."), { statusCode: 404 });
+      }
+      const objeto = await storageRegistroRequest("GET", bucketRegistroInscriptos(), storagePath);
+      if (!objeto.ok || !objeto.body) {
+        if (objeto.status === 404) {
+          throw Object.assign(new Error("La firma histórica no está disponible."), { statusCode: 404 });
+        }
+        await storageRegistroError(objeto);
+      }
+      res.setHeader("Content-Type", storagePath.toLowerCase().endsWith(".png") ? "image/png" : "image/jpeg");
+      res.setHeader("Cache-Control", "private, no-store");
+      const largo = objeto.headers.get("content-length");
+      if (largo) res.setHeader("Content-Length", largo);
+      await pipeline(Readable.fromWeb(objeto.body as any), res);
+    } catch (error: any) {
+      return sendCertificadosError(res, error);
+    }
+  }
+);
+
 app.get("/api/certificados/admin/emision/:cursoId/emitidos", async (req, res) => {
   try {
     const authUser = await verifyFirebaseIdToken(req.headers.authorization);
@@ -4140,6 +4568,139 @@ app.get("/api/certificados/admin/emision/:cursoId/emitidos", async (req, res) =>
   }
 });
 
+/** Índice de unicidad por participante dentro de cada curso. */
+const EMISION_INDICE_COLECCION = "emisionUsuarios";
+
+/**
+ * Devuelve el objeto de Storage de un trabajo PDF sólo si coincide con la
+ * ruta determinística que genera este backend. Un valor inesperado nunca se
+ * usa para borrar un objeto arbitrario.
+ */
+function objetoPdfTrabajoSeguro(cursoId: string, trabajo: FirestoreRecord): string {
+  const jobId = String(trabajo?.jobId || trabajo?.id || "").trim();
+  if (!CERTIFICADO_ID_REGEX.test(jobId)) return "";
+
+  const segmentoId = String(trabajo?.segmentoId || "").trim();
+  const esperado = segmentoId && esSegmentoValido(segmentoId)
+    ? pdfSegmentoObjectName(cursoId, segmentoId, jobId)
+    : pdfObjectName(cursoId, jobId);
+  const declarado = String(trabajo?.objectName || trabajo?.storagePath || "").trim();
+
+  return declarado === esperado ? declarado : "";
+}
+
+/**
+ * Elimina las emisiones y los artefactos derivados de UN curso.
+ *
+ * La configuración principal se conserva. Los documentos de verificaciones
+ * quedan bajo emisiones que ya no existen y por eso no pueden validarse por
+ * QR; no forman parte de ningún índice funcional de vigencia.
+ */
+async function reiniciarEmisionesCurso(cursoId: string) {
+  const certificado = await obtenerCertificadoParaEmision(cursoId);
+  const [emisiones, indices, trabajos] = await Promise.all([
+    queryFirestoreChildCollectionCompleta(
+      `certificados/${cursoId}`,
+      "emitidos",
+      []
+    ),
+    queryFirestoreChildCollectionCompleta(
+      `certificados/${cursoId}`,
+      EMISION_INDICE_COLECCION,
+      []
+    ),
+    queryFirestoreChildCollectionCompleta(
+      `certificados/${cursoId}`,
+      "trabajosPdf",
+      []
+    ),
+  ]);
+
+  const objetosPdf = Array.from(
+    new Set(
+      trabajos
+        .map((trabajo) => objetoPdfTrabajoSeguro(cursoId, trabajo))
+        .filter(Boolean)
+    )
+  );
+  const bucketPdf = normalizarBucket(process.env.CERTIFICADOS_PDF_BUCKET);
+
+  // Se valida el acceso antes de borrar Firestore para no dejar emisiones
+  // reiniciadas mientras los archivos derivados siguen activos.
+  if (objetosPdf.length && !bucketPdf) {
+    throw Object.assign(
+      new Error("No se puede reiniciar: falta configurar el bucket de PDFs."),
+      { statusCode: 500 }
+    );
+  }
+
+  let archivosEliminados = 0;
+  for (const objectName of objetosPdf) {
+    await deleteGoogleStorageObject(bucketPdf, objectName);
+    archivosEliminados += 1;
+  }
+
+  await Promise.all(
+    trabajos.map((trabajo) =>
+      deleteFirestoreDoc(`certificados/${cursoId}/trabajosPdf/${trabajo.id}`)
+    )
+  );
+
+  await Promise.all(
+    emisiones.map((emision) =>
+      deleteFirestoreDoc(`certificados/${cursoId}/emitidos/${emision.id}`)
+    )
+  );
+
+  await Promise.all(
+    indices.map((indice) =>
+      deleteFirestoreDoc(
+        `certificados/${cursoId}/${EMISION_INDICE_COLECCION}/${indice.id}`
+      )
+    )
+  );
+
+  if (String(certificado.pdfMasivoJobActual || "").trim()) {
+    await updateFirestoreDoc(`certificados/${cursoId}`, {
+      pdfMasivoJobActual: null,
+    });
+  }
+
+  invalidarCacheAprobadosCurso(cursoId);
+
+  return {
+    cursoId,
+    emisionesEliminadas: emisiones.length,
+    tokensEliminados: emisiones.filter((emision) => String(emision.token || emision.id || "").trim()).length,
+    archivosEliminados,
+    trabajosPdfEliminados: trabajos.length,
+  };
+}
+
+app.delete(
+  "/api/certificados/admin/emision/:cursoId/reiniciar-emisiones",
+  async (req, res) => {
+    try {
+      const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+      await requireAdministrador(authUser);
+      const cursoId = parseCursoIdParam(req.params.cursoId);
+      const resultado = await reiniciarEmisionesCurso(cursoId);
+
+      console.log(
+        `[sidca-chatbot-backend] emisiones reiniciadas curso=${cursoId} emisiones=${resultado.emisionesEliminadas} trabajosPdf=${resultado.trabajosPdfEliminados} por=${authUser.uid}`
+      );
+
+      return res.status(200).json({
+        ok: true,
+        modulo: "certificados",
+        ...resultado,
+      });
+    } catch (error: any) {
+      return sendCertificadosError(res, error);
+    }
+  }
+);
+
 /**
  * Índice de unicidad por participante.
  *
@@ -4153,8 +4714,6 @@ app.get("/api/certificados/admin/emision/:cursoId/emitidos", async (req, res) =>
  * propio usuarioDocId, así que sólo puede existir una vez por curso, y
  * Firestore lo hace cumplir en el servidor.
  */
-const EMISION_INDICE_COLECCION = "emisionUsuarios";
-
 /** Ruta absoluta de un documento, como la exige documents:commit. */
 const rutaDocumentoFirestore = (path: string) =>
   `projects/${firebaseProjectId}/databases/(default)/documents/${path}`;
@@ -4491,44 +5050,9 @@ async function emitirCertificadoParaUsuario({
       );
     }
 
-    // 9. Autoridades. El PUT permite guardar borradores incompletos, pero un
-    //    certificado emitido es irreversible: tiene que salir con las dos
-    //    autoridades completas. Se leen con el helper, que además resuelve las
-    //    configuraciones legacy que todavía tienen "firmas".
-    //    "Completa" significa nombre + cargo: organismo y referencia son
-    //    renglones opcionales y no pueden bloquear una emisión.
-    const autoridadesCertificado = obtenerAutoridadesConfiguracion(certificado);
-
-    const autoridadesCompletas =
-      autoridadesCertificado.length === 2 &&
-      autoridadesCertificado.every(
-        (autoridad) =>
-          String(autoridad.nombre || "").trim() !== "" &&
-          String(autoridad.cargo || "").trim() !== ""
-      );
-
-    if (!autoridadesCompletas) {
-      throw Object.assign(
-        new Error(
-          "No se puede emitir el certificado porque faltan completar las dos autoridades."
-        ),
-        { statusCode: 409 }
-      );
-    }
-
-    // 10. Institución. Las configuraciones anteriores al campo se emiten como
-    //     "sidca", que era la única plantilla existente.
-    const institucionCertificado =
-      normalizarInstitucionCertificado(certificado);
-
-    // 11. Token y URL de validación.
-    const token = await generarTokenCertificado(cursoId);
-    const urlValidacion = `${CERTIFICADOS_VALIDACION_BASE_URL}/${cursoId}/${token}`;
-
-    const ahora = new Date();
-
-    // 10. Snapshot. El título del curso sale del curso REAL; el resto, de la
-    //     configuración. Nada viene del body.
+    // 9. Institución y snapshot documental. Las configuraciones anteriores
+    //    al campo se mantienen como SIDCA, sin migrarlas.
+    const institucionCertificado = normalizarInstitucionCertificado(certificado);
     const participante = {
       usuarioDocId,
       dni,
@@ -4536,6 +5060,41 @@ async function emitirCertificadoParaUsuario({
       ...(apellido ? { apellido } : {}),
       ...(nombre ? { nombre } : {}),
     };
+    let autoridadesCertificado: Record<string, any>[] = [];
+    let firmantesMinisterio: Record<string, any>[] = [];
+
+    if (institucionCertificado === "ministerio") {
+      firmantesMinisterio = validarConfiguracionMinisterioParaEmision(
+        certificado,
+        participante
+      );
+    } else {
+      // El PUT permite guardar borradores incompletos, pero un certificado
+      // SIDCA/ITM emitido es irreversible y conserva su regla histórica.
+      autoridadesCertificado = obtenerAutoridadesConfiguracion(certificado);
+      const autoridadesCompletas =
+        autoridadesCertificado.length === 2 &&
+        autoridadesCertificado.every(
+          (autoridad) =>
+            String(autoridad.nombre || "").trim() !== "" &&
+            String(autoridad.cargo || "").trim() !== ""
+        );
+
+      if (!autoridadesCompletas) {
+        throw Object.assign(
+          new Error(
+            "No se puede emitir el certificado porque faltan completar las dos autoridades."
+          ),
+          { statusCode: 409 }
+        );
+      }
+    }
+
+    // 11. Token y URL de validación.
+    const token = await generarTokenCertificado(cursoId);
+    const urlValidacion = `${CERTIFICADOS_VALIDACION_BASE_URL}/${cursoId}/${token}`;
+
+    const ahora = new Date();
 
     // La institución y las autoridades forman parte del SNAPSHOT: si mañana
     // se cambia la institución del curso o el cargo de una autoridad, el
@@ -4550,6 +5109,22 @@ async function emitirCertificadoParaUsuario({
       fecha: String(certificado.fecha || ""),
       modalidad: String(certificado.modalidad || ""),
       autoridades: autoridadesCertificado,
+      ...(institucionCertificado === "ministerio"
+        ? {
+            layoutVersion: "ministerio-v1",
+            tipoActividad: String(certificado.tipoActividad || ""),
+            fechaInicio: String(certificado.fechaInicio || ""),
+            fechaFin: String(certificado.fechaFin || ""),
+            localidad: String(certificado.localidad || ""),
+            departamento: String(certificado.departamento || ""),
+            niveles: Array.isArray(certificado.niveles)
+              ? certificado.niveles.map((nivel: unknown) => String(nivel || "").trim()).filter(Boolean)
+              : [],
+            textoEvaluacion: String(certificado.textoEvaluacion || ""),
+            textoAuspicio: String(certificado.textoAuspicio || ""),
+            firmantesMinisterio,
+          }
+        : {}),
     };
 
     const datos = {
@@ -4768,17 +5343,14 @@ app.post("/api/certificados/admin/emision/:cursoId/emitir-masivo", async (req, r
 });
 
 // ============================================================
-// VALIDACIÓN DE UN CERTIFICADO ESCANEADO
+// VALIDACIÓN PÚBLICA DE UN CERTIFICADO ESCANEADO
 //
-// Es el endpoint al que llega la página que abre el QR.
+// Es el endpoint al que llega la página que abre el QR. El token aleatorio
+// identifica la emisión, pero no reemplaza el filtrado del DTO: nunca se
+// devuelve el documento completo de Firestore ni datos del administrador.
 //
-// NO va bajo /admin porque también lo usan los validadores designados, que no
-// son administradores. Pero NO es público: el token del QR es difícil de
-// adivinar, y eso no reemplaza autenticación. Sin Firebase ID Token no
-// devuelve nada.
-//
-// Sólo LECTURA: no registra el escaneo ni toca el documento. La auditoría de
-// verificaciones, si se decide llevarla, será otra etapa.
+// Sólo LECTURA: la acción administrativa de registrar un curso validado vive
+// en el POST siguiente y conserva su autenticación.
 // ============================================================
 
 const EMITIDOS_ESTADOS_CONOCIDOS = new Set([
@@ -4787,43 +5359,109 @@ const EMITIDOS_ESTADOS_CONOCIDOS = new Set([
   "reemplazado",
 ]);
 
-app.get("/api/certificados/validar/:cursoId/:token", async (req, res) => {
+function proyectarParticipanteValidacionPublica(
+  participante: FirestoreRecord | null | undefined
+): Record<string, any> {
+  return {
+    apellidoNombre: String(participante?.apellidoNombre || "").trim(),
+    dni: String(participante?.dni || "").trim(),
+  };
+}
+
+function proyectarCertificadoValidacionPublica(
+  certificado: FirestoreRecord | null | undefined
+): Record<string, any> {
+  const fuente = certificado || {};
+  const institucionCertificado = normalizarInstitucionCertificado(fuente);
+  const coleccionesFirmantes = [
+    fuente.firmantesMinisterio,
+    fuente.firmas,
+    fuente.autoridades,
+  ];
+  let firmaReferencia: any = null;
+
+  for (const coleccion of coleccionesFirmantes) {
+    if (!Array.isArray(coleccion)) continue;
+    firmaReferencia =
+      coleccion.find((firma: any) => String(firma?.id || "") === "firmante_3") ||
+      coleccion[2] ||
+      null;
+    if (firmaReferencia) break;
+  }
+
+  const textoFirmaReferencia = [
+    firmaReferencia?.institucion,
+    firmaReferencia?.institucionCertificado,
+    firmaReferencia?.organismo,
+    firmaReferencia?.nombre,
+    firmaReferencia?.cargo,
+  ]
+    .map((valor) => String(valor || "").trim())
+    .filter(Boolean)
+    .join(" ")
+    .toLocaleLowerCase("es-AR");
+
+  // La institución de la validación representa exclusivamente a la firma 3.
+  // No se infiere desde el modelo visual de la plantilla.
+  let institucionValidacion = "";
+  if (
+    textoFirmaReferencia.includes("endrizzi") ||
+    textoFirmaReferencia.includes("instituto tecnologico municipal") ||
+    textoFirmaReferencia.includes("instituto tecnológico municipal")
+  ) {
+    institucionValidacion = "itm";
+  } else if (
+    textoFirmaReferencia.includes("sidca") ||
+    textoFirmaReferencia.includes("sindicato de docentes de catamarca") ||
+    textoFirmaReferencia.includes("secretario general")
+  ) {
+    institucionValidacion = "sidca";
+  }
+
+  const resultado: Record<string, any> = {
+    cursoTitulo: String(fuente.cursoTitulo || ""),
+    titulo: String(fuente.titulo || ""),
+    resolucion: String(fuente.resolucion || ""),
+    cargaHoraria: String(fuente.cargaHoraria || ""),
+    dias: String(fuente.dias || ""),
+    fecha: String(fuente.fecha || ""),
+    modalidad: String(fuente.modalidad || ""),
+    institucionCertificado,
+    institucionValidacion,
+  };
+
+  if (institucionCertificado === "ministerio") {
+    Object.assign(resultado, {
+      layoutVersion: String(fuente.layoutVersion || "ministerio-v1"),
+      tipoActividad: String(fuente.tipoActividad || ""),
+      fechaInicio: String(fuente.fechaInicio || ""),
+      fechaFin: String(fuente.fechaFin || ""),
+      localidad: String(fuente.localidad || ""),
+      departamento: String(fuente.departamento || ""),
+      niveles: Array.isArray(fuente.niveles)
+        ? fuente.niveles.map((nivel: unknown) => String(nivel || "").trim()).filter(Boolean)
+        : [],
+      textoEvaluacion: String(fuente.textoEvaluacion || ""),
+      textoAuspicio: String(fuente.textoAuspicio || ""),
+    });
+  }
+
+  return resultado;
+}
+
+const responderValidacionCertificadoPublica = async (req: express.Request, res: express.Response) => {
   try {
-    const inicioValidacion = Date.now();
-
-    const inicioFirebaseAuth = Date.now();
-    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
-    const firebaseAuth = Date.now() - inicioFirebaseAuth;
-
     const cursoId = parseCursoIdParam(req.params.cursoId);
     const token = parseCertificadoTokenParam(req.params.token);
 
-    // Auth ya terminó: recién ahora se pueden iniciar en paralelo la
-    // autorización y la lectura directa del certificado.
-    let resolverPermiso = 0;
-    const inicioResolverPermiso = Date.now();
-    const permisoPromise = requireAdministradorOValidadorCertificados(authUser)
-      .finally(() => {
-        resolverPermiso = Date.now() - inicioResolverPermiso;
-      });
-
     // El token ES el ID del documento: lectura directa, sin query.
-    let leerCertificado = 0;
-    const inicioLeerCertificado = Date.now();
-    const emisionPromise = getFirestoreDoc(
+    const emision = await getFirestoreDoc(
       `certificados/${cursoId}/emitidos/${token}`
-    ).finally(() => {
-      leerCertificado = Date.now() - inicioLeerCertificado;
-    });
-
-    const [permiso, emision] = await Promise.all([
-      permisoPromise,
-      emisionPromise,
-    ]);
+    );
 
     const noEncontrado = () =>
       Object.assign(
-        new Error("Certificado no encontrado o código de validación inválido."),
+        new Error("No se encontró un certificado vigente asociado a este código."),
         { statusCode: 404 }
       );
 
@@ -4848,11 +5486,51 @@ app.get("/api/certificados/validar/:cursoId/:token", async (req, res) => {
       );
     }
 
-    console.log(
-      `[sidca-chatbot-backend] certificado validado curso=${cursoId} estado=${estado} por=${permiso.tipo}`
-    );
+    return res.status(200).json({
+      ok: true,
+      modulo: "certificados",
+      validacion: {
+        valido,
+        estado,
+        participante: proyectarParticipanteValidacionPublica(emision.participante),
+        certificado: proyectarCertificadoValidacionPublica(emision.certificado),
+        emitidoEn: emision.emitidoEn || null,
+      },
+    });
+  } catch (error: any) {
+    return sendCertificadosError(res, error);
+  }
+};
 
-    const inicioRegistrarVerificacion = Date.now();
+/**
+ * Consulta institucional autenticada. Conserva la auditoría del escaneo y el
+ * estado administrativo de registro, que nunca se expone por el QR público.
+ */
+const responderValidacionCertificadoInstitucional = async (
+  req: express.Request,
+  res: express.Response
+) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    const cursoId = parseCursoIdParam(req.params.cursoId);
+    const token = parseCertificadoTokenParam(req.params.token);
+    const [permiso, emision] = await Promise.all([
+      requireAdministradorOValidadorCertificados(authUser),
+      getFirestoreDoc(`certificados/${cursoId}/emitidos/${token}`),
+    ]);
+    const noEncontrado = () =>
+      Object.assign(
+        new Error("Certificado no encontrado o código de validación inválido."),
+        { statusCode: 404 }
+      );
+
+    if (!emision) throw noEncontrado();
+    if (String(emision.cursoId || "") !== cursoId) throw noEncontrado();
+    if (emision.token && String(emision.token) !== token) throw noEncontrado();
+
+    const estado = String(emision.estado || "");
+    const valido = estado === EMITIDOS_ESTADO_VIGENTE;
+    const validadoEn = new Date().toISOString();
     const verificado = await addFirestoreDoc(
       `certificados/${cursoId}/emitidos/${token}/verificaciones`,
       {
@@ -4862,15 +5540,13 @@ app.get("/api/certificados/validar/:cursoId/:token", async (req, res) => {
         valido,
         validadorUid: authUser.uid,
         validadorEmail: authUser.email || "",
-        validadorNombre: permiso.tipo === "validador" ? buildNombreAfiliado(permiso.usuario) : "Administrador SIDCA",
+        validadorNombre:
+          permiso.tipo === "validador"
+            ? buildNombreAfiliado(permiso.usuario)
+            : "Administrador SIDCA",
         tipoValidador: permiso.tipo,
-        validadoEn: new Date().toISOString(),
+        validadoEn,
       }
-    );
-    const registrarVerificacion = Date.now() - inicioRegistrarVerificacion;
-
-    console.log(
-      `[perf] validar-certificado firebaseAuth=${firebaseAuth}ms resolverPermiso=${resolverPermiso}ms leerCertificado=${leerCertificado}ms registrarVerificacion=${registrarVerificacion}ms total=${Date.now() - inicioValidacion}ms estado=${estado || "(vacio)"} tipoValidador=${permiso.tipo}`
     );
 
     return res.status(200).json({
@@ -4881,13 +5557,13 @@ app.get("/api/certificados/validar/:cursoId/:token", async (req, res) => {
         estado,
         certificadoId: emision.certificadoId || token,
         cursoId,
-        participante: emision.participante || null,
-        certificado: emision.certificado || null,
+        participante: proyectarParticipanteValidacionPublica(emision.participante),
+        certificado: proyectarCertificadoValidacionPublica(emision.certificado),
         emitidoEn: emision.emitidoEn || null,
         registroCurso: emision.registroCurso || null,
       },
       verificacion: {
-        validadoEn: verificado.validadoEn,
+        validadoEn: verificado.validadoEn || validadoEn,
         validador: {
           nombre: verificado.validadorNombre,
           email: verificado.validadorEmail || null,
@@ -4898,7 +5574,12 @@ app.get("/api/certificados/validar/:cursoId/:token", async (req, res) => {
   } catch (error: any) {
     return sendCertificadosError(res, error);
   }
-});
+};
+
+// Ruta explícita para el QR público. La ruta histórica queda como alias de
+// lectura para no romper clientes internos ya publicados.
+app.get("/api/certificados/publico/validar/:cursoId/:token", responderValidacionCertificadoPublica);
+app.get("/api/certificados/validar/:cursoId/:token", responderValidacionCertificadoInstitucional);
 
 /** Registra una sola vez que un certificado fue presentado y validado. */
 app.post("/api/certificados/validar/:cursoId/:token/registrar", async (req, res) => {
@@ -7137,9 +7818,9 @@ app.get("/api/certificados/admin/pdf-masivo/:cursoId/:jobId/descargar", async (r
     // una máquina de desarrollo exige `gcloud auth application-default login`:
     // sin eso falla con "Could not load the default credentials" antes de
     // emitir un solo pedido. getGoogleAccessToken() es el helper que ya usa
-    // todo el backend y cubre los dos casos —GOOGLE_OAUTH_ACCESS_TOKEN en
-    // local, Metadata Server en producción—, así que la descarga se comporta
-    // igual en ambos entornos y con la misma identidad de siempre.
+    // todo el backend y resuelve Application Default Credentials (ADC):
+    // `gcloud auth application-default login` en local y la service account
+    // automática del servicio en Cloud Run.
     const urlObjeto = `https://storage.googleapis.com/storage/v1/b/${encodeURIComponent(
       bucket
     )}/o/${encodeURIComponent(objectName)}?alt=media`;

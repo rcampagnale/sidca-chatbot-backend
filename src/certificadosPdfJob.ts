@@ -211,7 +211,10 @@ const main = async () => {
     } = await filtrarEmisionesHabilitadas(
       vigentes,
       await obtenerAccessToken(),
-      segmentoId || undefined
+      segmentoId || undefined,
+      // El Job sólo necesita los DNI de las emisiones vigentes de este curso.
+      // La pantalla y las rutas de emisión conservan su lectura completa.
+      { estrategiaPadron: "dirigida" }
     );
 
     // Un solo log con los contadores del filtrado. Sin tokens, sin documentos.
