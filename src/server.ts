@@ -3146,6 +3146,15 @@ app.get(
         throw Object.assign(new Error("La firma no está disponible."), { statusCode: 404 });
       }
 
+      const imagenSha256 = String(firmante?.imagenSha256 || "").trim();
+      const etag = imagenSha256 ? `"${imagenSha256}"` : "";
+      const ifNoneMatch = String(req.headers["if-none-match"] || "");
+      if (etag && ifNoneMatch.split(",").map((valor) => valor.trim()).includes(etag)) {
+        res.setHeader("Cache-Control", "private, max-age=31536000, immutable");
+        res.setHeader("ETag", etag);
+        return res.status(304).end();
+      }
+
       const objeto = await storageRegistroRequest(
         "GET",
         bucketRegistroInscriptos(),
@@ -3163,7 +3172,8 @@ app.get(
         "Content-Type",
         storagePath.toLowerCase().endsWith(".png") ? "image/png" : "image/jpeg"
       );
-      res.setHeader("Cache-Control", "private, no-store");
+      res.setHeader("Cache-Control", "private, max-age=31536000, immutable");
+      if (etag) res.setHeader("ETag", etag);
       const largo = objeto.headers.get("content-length");
       if (largo) res.setHeader("Content-Length", largo);
       await pipeline(Readable.fromWeb(objeto.body as any), res);
@@ -4590,6 +4600,14 @@ app.get(
       if (!storagePath) {
         throw Object.assign(new Error("La firma histórica no está disponible."), { statusCode: 404 });
       }
+      const imagenSha256 = String(firmante?.imagenSha256 || "").trim();
+      const etag = imagenSha256 ? `"${imagenSha256}"` : "";
+      const ifNoneMatch = String(req.headers["if-none-match"] || "");
+      if (etag && ifNoneMatch.split(",").map((valor) => valor.trim()).includes(etag)) {
+        res.setHeader("Cache-Control", "private, max-age=31536000, immutable");
+        res.setHeader("ETag", etag);
+        return res.status(304).end();
+      }
       const objeto = await storageRegistroRequest("GET", bucketRegistroInscriptos(), storagePath);
       if (!objeto.ok || !objeto.body) {
         if (objeto.status === 404) {
@@ -4598,7 +4616,8 @@ app.get(
         await storageRegistroError(objeto);
       }
       res.setHeader("Content-Type", storagePath.toLowerCase().endsWith(".png") ? "image/png" : "image/jpeg");
-      res.setHeader("Cache-Control", "private, no-store");
+      res.setHeader("Cache-Control", "private, max-age=31536000, immutable");
+      if (etag) res.setHeader("ETag", etag);
       const largo = objeto.headers.get("content-length");
       if (largo) res.setHeader("Content-Length", largo);
       await pipeline(Readable.fromWeb(objeto.body as any), res);
