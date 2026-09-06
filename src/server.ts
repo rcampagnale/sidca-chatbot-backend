@@ -1116,13 +1116,24 @@ async function findRegistrosValidadorByAuth(authUser: AuthenticatedUser): Promis
   return [...encontrados.values()];
 }
 
-/**
- * Resuelve el permiso de validador SIN caché. Es el cuerpo original de
- * requireValidadorCertificados, extraído tal cual: ninguna regla de
- * autorización cambia acá, sólo se envuelve en una caché más abajo.
- */
-async function resolverValidadorCertificadosSinCache(
-  authUser: AuthenticatedUser
+type ModuloValidador = "certificados" | "cena";
+type PermisosValidador = { certificados: boolean; cena: boolean };
+
+function permisosValidador(doc: FirestoreRecord): PermisosValidador {
+  const permisos = doc.permisos && typeof doc.permisos === "object" ? doc.permisos : null;
+  if (permisos && ("certificados" in permisos || "cena" in permisos)) {
+    return { certificados: permisos.certificados === true, cena: permisos.cena === true };
+  }
+  return { certificados: doc.validarCertificados === true, cena: false };
+}
+
+function tienePermisoValidador(doc: FirestoreRecord, modulo: ModuloValidador) {
+  return permisosValidador(doc)[modulo] === true;
+}
+
+async function resolverValidadorModuloSinCache(
+  authUser: AuthenticatedUser,
+  modulo: ModuloValidador
 ): Promise<FirestoreRecord> {
   const registros = await findRegistrosValidadorByAuth(authUser);
   if (registros.length === 0) {
@@ -1135,13 +1146,13 @@ async function resolverValidadorCertificadosSinCache(
   const dnis = new Set(registros.map((doc) => normalizeDni(doc.dni)).filter(Boolean));
   if (dnis.size > 1) {
     console.warn(`[sidca-chatbot-backend] validador email ambiguo uid=${authUser.uid}`);
-    throw Object.assign(new Error("No tenés autorización para validar certificados SIDCA."), { statusCode: 403 });
+    throw Object.assign(new Error(`No tenés autorización para validar ${modulo === "cena" ? "la Cena SIDCA" : "certificados SIDCA"}.`), { statusCode: 403 });
   }
-  const autorizado = registros.find((doc) => doc.validarCertificados === true);
-  console.info(`[sidca-chatbot-backend] validador resuelto uid=${authUser.uid} origen=${registros.map((d) => String(d.path || "").split("/")[0]).filter(Boolean).join("+")} dni=${[...dnis][0] || "-"} permiso=${Boolean(autorizado)}`);
+  const autorizado = registros.find((doc) => tienePermisoValidador(doc, modulo));
+  console.info(`[sidca-chatbot-backend] validador resuelto uid=${authUser.uid} modulo=${modulo} origen=${registros.map((d) => String(d.path || "").split("/")[0]).filter(Boolean).join("+")} dni=${[...dnis][0] || "-"} permiso=${Boolean(autorizado)}`);
   if (!autorizado) {
     throw Object.assign(
-      new Error("No tenés autorización para validar certificados SIDCA."),
+      new Error(`No tenés autorización para validar ${modulo === "cena" ? "la Cena SIDCA" : "certificados SIDCA"}.`),
       { statusCode: 403 }
     );
   }
@@ -1177,18 +1188,24 @@ const validadorPermisoCache = new Map<string, ValidadorPermisoCacheEntry>();
 // resuelve su permiso, las solicitudes simultáneas comparten una sola carga.
 const validadorPermisoEnCurso = new Map<string, Promise<FirestoreRecord>>();
 
+function invalidarCachePermisosValidador(uid: string) {
+  const uidNormalizado = String(uid || "").trim();
+  if (!uidNormalizado) return;
+  for (const modulo of ["certificados", "cena"] as const) {
+    validadorPermisoCache.delete(`${uidNormalizado}:${modulo}`);
+  }
+  console.info(`[sidca-chatbot-backend] caché de permisos invalidada uid=${uidNormalizado} modulos=certificados+cena`);
+}
+
 /**
- * Exige que el usuario tenga permiso explícito para validar certificados.
- * El permiso se controla mediante:
- *
- * validarCertificados: true
- *
- * en el documento correspondiente de la colección usuarios.
+ * Exige que el usuario tenga permiso explícito para el módulo solicitado.
  */
-async function requireValidadorCertificados(
-  authUser: AuthenticatedUser
+async function requireValidadorModulo(
+  authUser: AuthenticatedUser,
+  modulo: ModuloValidador
 ): Promise<FirestoreRecord> {
-  const cacheado = validadorPermisoCache.get(authUser.uid);
+  const clave = `${authUser.uid}:${modulo}`;
+  const cacheado = validadorPermisoCache.get(clave);
 
   if (cacheado && cacheado.expiraEn > Date.now()) {
     console.log(`[perf] resolverPermiso uid=${authUser.uid} cache=hit resultado=${cacheado.ok ? "autorizado" : "rechazado"}`);
@@ -1196,16 +1213,16 @@ async function requireValidadorCertificados(
     throw Object.assign(new Error(cacheado.mensaje), { statusCode: cacheado.statusCode });
   }
 
-  const resolucionExistente = validadorPermisoEnCurso.get(authUser.uid);
+  const resolucionExistente = validadorPermisoEnCurso.get(clave);
   if (resolucionExistente) {
     console.log(`[perf] resolverPermiso uid=${authUser.uid} cache=shared`);
     return resolucionExistente;
   }
 
   const inicio = Date.now();
-  const resolucion = resolverValidadorCertificadosSinCache(authUser)
+  const resolucion = resolverValidadorModuloSinCache(authUser, modulo)
     .then((autorizado) => {
-      validadorPermisoCache.set(authUser.uid, {
+      validadorPermisoCache.set(clave, {
         ok: true,
         registro: autorizado,
         expiraEn: Date.now() + VALIDADOR_PERMISO_CACHE_TTL_MS,
@@ -1219,9 +1236,9 @@ async function requireValidadorCertificados(
       // Sólo un rechazo funcional 403 se cachea negativamente. Los fallos de
       // infraestructura se reintentan de inmediato en el siguiente pedido.
       if (statusCode === 403) {
-        validadorPermisoCache.set(authUser.uid, {
+        validadorPermisoCache.set(clave, {
           ok: false,
-          mensaje: String(error?.message || "No tenés autorización para validar certificados SIDCA."),
+          mensaje: String(error?.message || `No tenés autorización para validar ${modulo === "cena" ? "la Cena SIDCA" : "certificados SIDCA"}.`),
           statusCode,
           expiraEn: Date.now() + VALIDADOR_PERMISO_CACHE_TTL_MS,
         });
@@ -1230,11 +1247,15 @@ async function requireValidadorCertificados(
       throw error;
     })
     .finally(() => {
-      validadorPermisoEnCurso.delete(authUser.uid);
+      validadorPermisoEnCurso.delete(clave);
     });
 
-  validadorPermisoEnCurso.set(authUser.uid, resolucion);
+  validadorPermisoEnCurso.set(clave, resolucion);
   return resolucion;
+}
+
+async function requireValidadorCertificados(authUser: AuthenticatedUser) {
+  return requireValidadorModulo(authUser, "certificados");
 }
 
 /**
@@ -2451,6 +2472,7 @@ const mapValidadorAdmin = (doc: FirestoreRecord) => ({
   apellidoNombre: doc.apellidoNombre || buildNombreAfiliado(doc) || "",
   email: doc.email || doc.correo || doc.mail || "",
   validarCertificados: doc.validarCertificados === true,
+  permisos: permisosValidador(doc),
 });
 
 const parseUsuarioDocId = (value: string) => {
@@ -2505,8 +2527,15 @@ async function crearFirebaseAuthValidador(email: string, password: string, displ
   return identityToolkitAdminRequest(`/accounts?key=${encodeURIComponent(apiKey)}`, { email, password, displayName, disabled: false });
 }
 
-async function actualizarFirebaseAuthValidador(uid: string, disableUser: boolean) {
-  return identityToolkitAdminRequest("/accounts:update", { localId: uid, disableUser });
+async function actualizarFirebaseAuthValidador(
+  uid: string,
+  opciones: { disableUser?: boolean; password?: string } = {}
+) {
+  return identityToolkitAdminRequest("/accounts:update", {
+    localId: uid,
+    ...(typeof opciones.disableUser === "boolean" ? { disableUser: opciones.disableUser } : {}),
+    ...(opciones.password ? { password: opciones.password } : {}),
+  });
 }
 
 async function resolverPersonaPorDocId(id: string) {
@@ -2525,12 +2554,14 @@ app.get("/api/certificados/admin/validadores", async (req, res) => {
   try {
     const authUser = await verifyFirebaseIdToken(req.headers.authorization);
     await requireAdministrador(authUser);
-    const [usuarios, nuevos] = await Promise.all([
-      queryFirestoreCollection("usuarios", [{ field: "validarCertificados", value: true }], 500),
-      queryFirestoreCollection("nuevoAfiliado", [{ field: "validarCertificados", value: true }], 500),
+    const consultas = ["usuarios", "nuevoAfiliado"].flatMap((coleccion) => [
+      queryFirestoreCollection(coleccion, [{ field: "validarCertificados", value: true }], 500),
+      queryFirestoreCollection(coleccion, [{ field: "permisos.certificados", value: true }], 500),
+      queryFirestoreCollection(coleccion, [{ field: "permisos.cena", value: true }], 500),
     ]);
+    const documentos = (await Promise.all(consultas)).flat();
     const unicos = new Map<string, FirestoreRecord>();
-    [...usuarios, ...nuevos].forEach((doc) => unicos.set(normalizeDni(doc.dni) || String(doc.path), doc));
+    documentos.filter((doc) => Object.values(permisosValidador(doc)).some(Boolean)).forEach((doc) => unicos.set(normalizeDni(doc.dni) || String(doc.path), doc));
     const validadores = [...unicos.values()].map(mapValidadorAdmin).sort((a, b) => a.apellidoNombre.localeCompare(b.apellidoNombre, "es"));
     return res.json({ ok: true, validadores });
   } catch (error: any) { return sendCertificadosError(res, error); }
@@ -2597,23 +2628,32 @@ app.put("/api/certificados/admin/validadores/:usuarioDocId", async (req, res) =>
     const nombreCompleto = buildNombreAfiliado(actual);
     let cuenta = actual.authUid ? await buscarFirebaseAuthPorUid(String(actual.authUid)) : { existe: false };
     if (!cuenta.existe) cuenta = await buscarFirebaseAuthPorEmail(email);
-    const password = String(req.body?.passwordInicial || "");
+    const permisosSolicitados = req.body?.permisos && typeof req.body.permisos === "object"
+      ? { certificados: req.body.permisos.certificados === true, cena: req.body.permisos.cena === true }
+      : { certificados: true, cena: false };
+    if (!permisosSolicitados.certificados && !permisosSolicitados.cena) throw Object.assign(new Error("Seleccioná al menos un módulo."), { statusCode: 400 });
+    const passwordInicial = String(req.body?.passwordInicial || "");
+    const passwordNueva = String(req.body?.passwordNueva || "");
+    if (passwordNueva && (passwordNueva.length < 8 || passwordNueva.length > 128)) throw Object.assign(new Error("La nueva contraseña debe tener entre 8 y 128 caracteres."), { statusCode: 400 });
     let authGestionada = actual.authCertificadosGestionado === true;
     if (!cuenta.existe) {
-      if (password.length < 8 || password.length > 128) throw Object.assign(new Error("La contraseña inicial debe tener entre 8 y 128 caracteres."), { statusCode: 400 });
-      const creada = await crearFirebaseAuthValidador(email, password, nombreCompleto);
+      if (passwordInicial.length < 8 || passwordInicial.length > 128) throw Object.assign(new Error("La contraseña inicial debe tener entre 8 y 128 caracteres."), { statusCode: 400 });
+      const creada = await crearFirebaseAuthValidador(email, passwordInicial, nombreCompleto);
       cuenta = { existe: true, uid: creada.localId, email, disabled: false, displayName: nombreCompleto };
       authGestionada = true;
     } else if (cuenta.email && cuenta.email !== email) {
       throw Object.assign(new Error("El correo ya está asociado a otra cuenta de acceso."), { statusCode: 409 });
     } else if (cuenta.disabled) {
       if (!authGestionada) throw Object.assign(new Error("La cuenta Firebase existente está deshabilitada y no fue gestionada por este módulo."), { statusCode: 409 });
-      await actualizarFirebaseAuthValidador(cuenta.uid, false);
+      await actualizarFirebaseAuthValidador(cuenta.uid, { disableUser: false, ...(passwordNueva ? { password: passwordNueva } : {}) });
       cuenta = { ...cuenta, disabled: false };
+    } else if (passwordNueva) {
+      await actualizarFirebaseAuthValidador(cuenta.uid, { password: passwordNueva });
     }
-    const cambios = { validarCertificados: true, authUid: cuenta.uid, authEmail: email, authCertificadosGestionado: authGestionada, ...(authGestionada ? { authCertificadosCreadoEn: actual.authCertificadosCreadoEn || new Date().toISOString(), authCertificadosCreadoPor: actual.authCertificadosCreadoPor || authUser.uid } : {}), validarCertificadosActualizadoEn: new Date().toISOString(), validarCertificadosActualizadoPor: authUser.uid };
+    const cambios = { validarCertificados: permisosSolicitados.certificados, permisos: permisosSolicitados, authUid: cuenta.uid, authEmail: email, authCertificadosGestionado: authGestionada, ...(authGestionada ? { authCertificadosCreadoEn: actual.authCertificadosCreadoEn || new Date().toISOString(), authCertificadosCreadoPor: actual.authCertificadosCreadoPor || authUser.uid } : {}), validarCertificadosActualizadoEn: new Date().toISOString(), validarCertificadosActualizadoPor: authUser.uid };
     const actualizados = await Promise.all(documentos.map((doc) => updateFirestoreDoc(getFirestoreRelativePath(doc), cambios)));
-    return res.json({ ok: true, usuario: mapValidadorAdmin(actualizados[0] || { ...actual, ...cambios }), acceso: { existe: true, habilitada: !cuenta.disabled, gestionadaPorModulo: authGestionada, email, tieneUidVinculado: true } });
+    invalidarCachePermisosValidador(cuenta.uid);
+    return res.json({ ok: true, usuario: mapValidadorAdmin(actualizados[0] || { ...actual, ...cambios }), acceso: { existe: true, habilitada: !cuenta.disabled, gestionadaPorModulo: authGestionada, email, tieneUidVinculado: true, permisos: permisosSolicitados } });
   } catch (error: any) { return sendCertificadosError(res, error); }
 });
 
@@ -2628,7 +2668,29 @@ app.get("/api/certificados/admin/validadores/:usuarioDocId/acceso", async (req, 
     const uid = documentos.map((doc) => String(doc.authUid || "").trim()).find(Boolean);
     const emails = [...new Set(documentos.flatMap((doc) => [doc.email, doc.correo, doc.mail]).map((value) => String(value || "").trim().toLowerCase()).filter((value) => value.includes("@")))];
     const cuenta = uid ? await buscarFirebaseAuthPorUid(uid) : emails[0] ? await buscarFirebaseAuthPorEmail(emails[0]) : { existe: false };
-    return res.json({ ok: true, acceso: { existe: cuenta.existe === true, habilitada: cuenta.existe === true && cuenta.disabled !== true, gestionadaPorModulo: gestionada, email: cuenta.email || emails[0] || "", tieneUidVinculado: Boolean(uid && cuenta.existe) } });
+    const fuentePermisos = documentos.find((doc) => doc.permisos && typeof doc.permisos === "object") || persona;
+    return res.json({ ok: true, acceso: { existe: cuenta.existe === true, habilitada: cuenta.existe === true && cuenta.disabled !== true, gestionadaPorModulo: gestionada, email: cuenta.email || emails[0] || "", tieneUidVinculado: Boolean(uid && cuenta.existe), permisos: permisosValidador(fuentePermisos) } });
+  } catch (error: any) { return sendCertificadosError(res, error); }
+});
+
+app.get("/api/certificados/validador/permisos", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    if (certificadosAdminUids.has(authUser.uid)) return res.json({ ok: true, permisos: { certificados: true, cena: true } });
+    const resolverPermiso = async (modulo: ModuloValidador) => {
+      try {
+        await requireValidadorModulo(authUser, modulo);
+        return true;
+      } catch (error: any) {
+        if (Number(error?.statusCode) === 403) return false;
+        throw error;
+      }
+    };
+    const [certificados, cena] = await Promise.all([
+      resolverPermiso("certificados"),
+      resolverPermiso("cena"),
+    ]);
+    return res.json({ ok: true, permisos: { certificados, cena } });
   } catch (error: any) { return sendCertificadosError(res, error); }
 });
 
@@ -2639,7 +2701,7 @@ app.delete("/api/certificados/admin/validadores/:usuarioDocId", async (req, res)
     if (!actual) throw Object.assign(new Error("Usuario no encontrado."), { statusCode: 404 });
     const dni = normalizeDni(actual.dni);
     const documentos = dni ? await registrosPorPersona(dni) : [actual];
-    const cambios = { validarCertificados: false, validarCertificadosActualizadoEn: new Date().toISOString(), validarCertificadosActualizadoPor: authUser.uid };
+    const cambios = { validarCertificados: false, permisos: { certificados: false, cena: false }, validarCertificadosActualizadoEn: new Date().toISOString(), validarCertificadosActualizadoPor: authUser.uid };
     await Promise.all(documentos.map((doc) => updateFirestoreDoc(getFirestoreRelativePath(doc), cambios)));
     const gestionada = documentos.some((doc) => doc.authCertificadosGestionado === true);
     const uid = documentos.map((doc) => String(doc.authUid || "").trim()).find(Boolean);
@@ -2647,13 +2709,14 @@ app.delete("/api/certificados/admin/validadores/:usuarioDocId", async (req, res)
     let advertencia = "";
     if (gestionada && uid) {
       try {
-        await actualizarFirebaseAuthValidador(uid, true);
+        await actualizarFirebaseAuthValidador(uid, { disableUser: true });
         accesoFirebaseActualizado = true;
       } catch (error: any) {
         advertencia = "El permiso fue retirado, pero no se pudo actualizar la cuenta de acceso.";
         console.error(`[sidca-chatbot-backend] quitar validador: fallo secundario Auth dni=${dni || "-"} codigo=${error?.identityCode || error?.statusCode || "desconocido"}`);
       }
     }
+    if (uid) invalidarCachePermisosValidador(uid);
     console.info(`[sidca-chatbot-backend] quitar validador dni=${dni || "-"} registrosUsuarios=${documentos.filter((doc) => String(doc.path || "").startsWith("usuarios/")).length} registrosNuevoAfiliado=${documentos.filter((doc) => String(doc.path || "").startsWith("nuevoAfiliado/")).length} gestionadoAuth=${gestionada} authEncontrado=${Boolean(uid)}`);
     return res.json({ ok: true, usuarioDocId: id, validarCertificados: false, accesoFirebaseActualizado, ...(advertencia ? { advertencia } : {}) });
   } catch (error: any) { return sendCertificadosError(res, error); }
@@ -5645,17 +5708,8 @@ function parseCenaAnioParam(valor: unknown): string {
 }
 
 async function requireAdministradorOValidadorCena(authUser: AuthenticatedUser): Promise<PermisoCertificados> {
-  try {
-    return await requireAdministradorOValidadorCertificados(authUser);
-  } catch (error: any) {
-    if (Number(error?.statusCode) === 403) {
-      throw Object.assign(
-        new Error("No tenés autorización para validar la Cena SIDCA."),
-        { statusCode: 403 }
-      );
-    }
-    throw error;
-  }
+  if (certificadosAdminUids.has(authUser.uid)) return { tipo: "administrador", usuario: null };
+  return { tipo: "validador", usuario: await requireValidadorModulo(authUser, "cena") };
 }
 
 function getUbicacionTarjetaCena(tarjeta: FirestoreRecord) {
