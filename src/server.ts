@@ -5,6 +5,7 @@ import cors from "cors";
 import multer from "multer";
 import OpenAI, { toFile } from "openai";
 import { GoogleAuth } from "google-auth-library";
+import { Storage } from "@google-cloud/storage";
 import { z } from "zod";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import { runChatbotWorkflow } from "./openaiWorkflow.js";
@@ -6927,6 +6928,82 @@ const sanitizarNombreArchivo = (valor: string) =>
     .trim()
     .slice(0, 120) || "certificados";
 
+const storagePdfDescarga = new Storage();
+
+/**
+ * Valida y firma el objeto determinístico de un trabajo PDF.
+ *
+ * La URL es el único dato del PDF que sale de este backend: el binario nunca
+ * se lee ni se transmite por Express. El objeto declarado en Firestore se
+ * compara igualmente para detectar trabajos inconsistentes o manipulados.
+ */
+async function firmarDescargaPdfTrabajo({
+  cursoId,
+  jobId,
+  trabajo,
+  objectNameEsperado,
+}: {
+  cursoId: string;
+  jobId: string;
+  trabajo: FirestoreRecord;
+  objectNameEsperado: string;
+}) {
+  if (!pdfTrabajoCompletado(trabajo)) {
+    throw Object.assign(new Error("El PDF todavía no está listo."), {
+      statusCode: 409,
+    });
+  }
+
+  const objectName = String(trabajo.objectName || trabajo.storagePath || "").trim();
+  if (objectName !== objectNameEsperado) {
+    console.error(
+      `[certificados-pdf] objectName inesperado curso=${cursoId} job=${jobId}`
+    );
+    throw Object.assign(new Error("El archivo del trabajo no es válido."), {
+      statusCode: 409,
+    });
+  }
+
+  const bucketNombre = normalizarBucket(process.env.CERTIFICADOS_PDF_BUCKET);
+  if (!bucketNombre) {
+    throw Object.assign(new Error("La descarga no está configurada."), {
+      statusCode: 500,
+    });
+  }
+
+  const filename = sanitizarNombreArchivo(
+    String(trabajo.nombreArchivo || "certificados.pdf")
+  );
+
+  try {
+    const [url] = await storagePdfDescarga
+      .bucket(bucketNombre)
+      .file(objectName)
+      .getSignedUrl({
+        version: "v4",
+        action: "read",
+        expires: Date.now() + 5 * 60 * 1000,
+        responseDisposition: `attachment; filename="${filename}"`,
+        responseType: "application/pdf",
+      });
+
+    return {
+      url,
+      filename,
+      expiraEn: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+    };
+  } catch (error) {
+    console.error(
+      `[certificados-pdf] no se pudo firmar ${bucketNombre}/${objectName}`,
+      error
+    );
+    throw Object.assign(
+      new Error("No se pudo preparar la descarga del PDF."),
+      { statusCode: 500 }
+    );
+  }
+}
+
 // ============================================================
 // DESCARGA POR SEGMENTOS GEOGRÁFICOS
 //
@@ -7444,6 +7521,31 @@ app.get(
 );
 
 app.get(
+  "/api/certificados/admin/pdf-segmentado/:cursoId/:segmentoId/:jobId/descarga-url",
+  async (req, res) => {
+    try {
+      const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+      await requireAdministrador(authUser);
+
+      const cursoId = parseCursoIdParam(req.params.cursoId);
+      const segmentoId = parseSegmentoIdParam(req.params.segmentoId);
+      const jobId = parseTrabajoPdfIdParam(req.params.jobId);
+      const trabajo = await obtenerTrabajoSegmento(cursoId, segmentoId, jobId);
+      const descarga = await firmarDescargaPdfTrabajo({
+        cursoId,
+        jobId,
+        trabajo,
+        objectNameEsperado: pdfSegmentoObjectName(cursoId, segmentoId, jobId),
+      });
+
+      return res.status(200).json({ ok: true, modulo: "certificados", ...descarga });
+    } catch (error: any) {
+      return sendCertificadosError(res, error);
+    }
+  }
+);
+
+app.get(
   "/api/certificados/admin/pdf-segmentado/:cursoId/:segmentoId/:jobId/descargar",
   async (req, res) => {
     try {
@@ -7823,6 +7925,36 @@ app.get("/api/certificados/admin/pdf-masivo/:cursoId/:jobId", async (req, res) =
         listoParaDescargar: pdfTrabajoCompletado(trabajo),
       },
     });
+  } catch (error: any) {
+    return sendCertificadosError(res, error);
+  }
+});
+
+app.get("/api/certificados/admin/pdf-masivo/:cursoId/:jobId/descarga-url", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    await requireAdministrador(authUser);
+
+    const cursoId = parseCursoIdParam(req.params.cursoId);
+    const jobId = parseTrabajoPdfIdParam(req.params.jobId);
+    const trabajo = await getFirestoreDoc(
+      `certificados/${cursoId}/trabajosPdf/${jobId}`
+    );
+
+    if (!trabajo) {
+      throw Object.assign(new Error("El trabajo indicado no existe."), {
+        statusCode: 404,
+      });
+    }
+
+    const descarga = await firmarDescargaPdfTrabajo({
+      cursoId,
+      jobId,
+      trabajo,
+      objectNameEsperado: pdfObjectName(cursoId, jobId),
+    });
+
+    return res.status(200).json({ ok: true, modulo: "certificados", ...descarga });
   } catch (error: any) {
     return sendCertificadosError(res, error);
   }
