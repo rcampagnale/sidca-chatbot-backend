@@ -5504,6 +5504,17 @@ function proyectarCertificadoValidacionPublica(
   const resultado: Record<string, any> = {
     cursoTitulo: String(fuente.cursoTitulo || ""),
     titulo: String(fuente.titulo || ""),
+    // Los certificados históricos no fueron migrados. Se exponen sólo si el
+    // snapshot ya contiene alguno de estos nombres; tipoActividad queda fuera
+    // porque describe el formato de la actividad, no la condición del alumno.
+    tipoCertificado: String(
+      fuente.tipoCertificado ||
+        fuente.tipo_certificado ||
+        fuente.tipo ||
+        fuente.condicion ||
+        fuente.tipoParticipacion ||
+        ""
+    ),
     resolucion: String(fuente.resolucion || ""),
     cargaHoraria: String(fuente.cargaHoraria || ""),
     dias: String(fuente.dias || ""),
