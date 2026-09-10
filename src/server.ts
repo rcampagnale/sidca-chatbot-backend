@@ -6,6 +6,7 @@ import multer from "multer";
 import OpenAI, { toFile } from "openai";
 import { GoogleAuth } from "google-auth-library";
 import { Storage } from "@google-cloud/storage";
+import { generarCertificadoPdfIndividual } from "./certificados/certificadoPdfIndividual.js";
 import { z } from "zod";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import { runChatbotWorkflow } from "./openaiWorkflow.js";
@@ -1853,6 +1854,14 @@ const chatbotRateLimit = createRateLimit({
   windowMs: 60_000,
   max: 60,
   message: "Demasiadas consultas. Esperá un minuto.",
+});
+// La APP todavía ingresa por DNI y no presenta Firebase Auth. Este límite
+// acota la superficie mientras se incorpora identidad fuerte; no habilita
+// listados ni consultas fuera de un curso concreto.
+const certificadosAppRateLimit = createRateLimit({
+  windowMs: 60_000,
+  max: 30,
+  message: "Demasiadas consultas de certificados. Esperá un minuto.",
 });
 
 app.disable("x-powered-by");
@@ -5589,6 +5598,7 @@ const responderValidacionCertificadoPublica = async (req: express.Request, res: 
         participante: proyectarParticipanteValidacionPublica(emision.participante),
         certificado: proyectarCertificadoValidacionPublica(emision.certificado),
         emitidoEn: emision.emitidoEn || null,
+        registroCurso: metadatosValidacionCertificado(emision),
       },
     });
   } catch (error: any) {
@@ -7014,6 +7024,278 @@ async function firmarDescargaPdfTrabajo({
     );
   }
 }
+
+/**
+ * Resuelve una única emisión vigente dentro del curso indicado.
+ *
+ * La APP aún no utiliza Firebase Auth: por eso recibe el DNI, pero la lectura
+ * queda estrictamente acotada a certificados/{cursoId}/emitidos, sin
+ * collectionGroup ni listados. Cuando la APP incorpore identidad fuerte, este
+ * helper podrá sustituir el DNI recibido por el DNI derivado del token.
+ */
+async function buscarEmisionVigentePorCursoYDni(
+  cursoIdParam: unknown,
+  dniParam: unknown
+): Promise<{ cursoId: string; emision: FirestoreRecord } | null> {
+  const cursoId = parseCursoIdParam(cursoIdParam);
+  const dniNormalizado = assertValidDni(normalizeDni(String(dniParam ?? "")));
+
+  // Fast path para emisiones actuales: consulta el DNI exacto ya normalizado
+  // y evita leer toda la subcolección. La verificación del estado y del curso
+  // se mantiene en código para conservar el comportamiento vigente.
+  const emisionesRapidas = await queryFirestoreChildCollection(
+    `certificados/${cursoId}`,
+    "emitidos",
+    [{ field: "participante.dni", value: dniNormalizado }],
+    20
+  );
+
+  const compatiblesRapidas = emisionesRapidas.filter((emision) => {
+    const cursoGuardado = String(emision.cursoId || cursoId).trim();
+    return (
+      cursoGuardado === cursoId &&
+      String(emision.estado || "") === EMITIDOS_ESTADO_VIGENTE &&
+      normalizeDni(emision.participante?.dni) === dniNormalizado
+    );
+  });
+
+  if (compatiblesRapidas.length > 1) {
+    console.warn(
+      `[certificados-app] múltiples emisiones vigentes curso=${cursoId} cantidad=${compatiblesRapidas.length}`
+    );
+    throw Object.assign(
+      new Error("Hay más de un certificado vigente para este curso y DNI."),
+      { statusCode: 409 }
+    );
+  }
+
+  if (compatiblesRapidas.length === 1) {
+    return { cursoId, emision: compatiblesRapidas[0] };
+  }
+
+  // Fallback legacy: permite encontrar documentos históricos cuyo DNI fue
+  // guardado con puntos, espacios, guiones o como número.
+  const emisiones = await queryFirestoreChildCollection(
+    `certificados/${cursoId}`,
+    "emitidos",
+    [{ field: "estado", value: EMITIDOS_ESTADO_VIGENTE }],
+    APROBADOS_MAX_RESULTADOS
+  );
+
+  const compatibles = emisiones.filter((emision) => {
+    const cursoGuardado = String(emision.cursoId || cursoId).trim();
+    return (
+      cursoGuardado === cursoId &&
+      String(emision.estado || "") === EMITIDOS_ESTADO_VIGENTE &&
+      normalizeDni(emision.participante?.dni) === dniNormalizado
+    );
+  });
+
+  if (compatibles.length > 1) {
+    console.warn(
+      `[certificados-app] múltiples emisiones vigentes curso=${cursoId} cantidad=${compatibles.length}`
+    );
+    throw Object.assign(
+      new Error("Hay más de un certificado vigente para este curso y DNI."),
+      { statusCode: 409 }
+    );
+  }
+
+  if (compatibles.length === 0) return null;
+
+  return { cursoId, emision: compatibles[0] };
+}
+
+function certificadoAppObjectName(cursoId: string, token: string, preview: boolean) {
+  return `certificados-app/${cursoId}/${token}/${preview ? "preview-v2-sin-qr" : "oficial"}.pdf`;
+}
+
+function certificadoAppFilename(emision: FirestoreRecord, preview: boolean) {
+  const participante = String(emision.participante?.apellidoNombre || "certificado").trim();
+  const nombre = sanitizarNombreArchivo(participante).replace(/\.pdf$/i, "");
+  return `${preview ? "Vista-previa-Certificado" : "Certificado-SIDCA"}-${nombre}.pdf`;
+}
+
+function metadatosValidacionCertificado(emision: FirestoreRecord) {
+  const registro = emision.registroCurso;
+  const registrado = registro?.registrado === true;
+  if (!registrado) return { registrado: false };
+
+  const fecha = registro.registradoEn || null;
+  const nombre = String(
+    registro.registradoPorNombre || ""
+  ).trim();
+
+  return {
+    registrado: true,
+    ...(fecha ? { fecha } : {}),
+    ...(nombre ? { validadoPor: nombre } : {}),
+  };
+}
+
+/** Genera (si aún no existe) y firma un PDF individual privado. */
+async function firmarDescargaPdfIndividual(
+  emision: FirestoreRecord,
+  preview: boolean
+) {
+  const cursoId = parseCursoIdParam(emision.cursoId);
+  const token = parseCertificadoTokenParam(emision.token || emision.id);
+  const urlValidacion = String(emision.urlValidacion || "").trim();
+
+  if (!urlValidacion) {
+    throw Object.assign(new Error("La emisión no tiene una URL de validación válida."), { statusCode: 409 });
+  }
+
+  const bucketNombre = normalizarBucket(process.env.CERTIFICADOS_PDF_BUCKET);
+  if (!bucketNombre) {
+    throw Object.assign(new Error("La descarga no está configurada."), { statusCode: 500 });
+  }
+
+  const objectName = certificadoAppObjectName(cursoId, token, preview);
+  const archivo = storagePdfDescarga.bucket(bucketNombre).file(objectName);
+
+  try {
+    const [existe] = await archivo.exists();
+    if (!existe) {
+      const buffer = await generarCertificadoPdfIndividual(emision, {
+        marcaAgua: preview,
+        incluirQr: !preview,
+      });
+      await archivo.save(buffer, {
+        resumable: false,
+        contentType: "application/pdf",
+        metadata: { cacheControl: "private, max-age=0, no-transform" },
+      });
+    }
+
+    const [url] = await archivo.getSignedUrl({
+      version: "v4",
+      action: "read",
+      expires: Date.now() + 5 * 60 * 1000,
+      responseDisposition: `attachment; filename="${certificadoAppFilename(emision, preview)}"`,
+      responseType: "application/pdf",
+    });
+
+    return {
+      url,
+      filename: certificadoAppFilename(emision, preview),
+      expiraEn: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+    };
+  } catch (error: any) {
+    console.error(
+      `[certificados-app] no se pudo preparar PDF curso=${cursoId} preview=${preview} estado=${String(emision.estado || "")}`,
+      error
+    );
+    throw Object.assign(new Error("No se pudo preparar la descarga del PDF."), { statusCode: 500 });
+  }
+}
+
+// Estas rutas son sólo lectura. No requieren Firebase Auth porque el login
+// móvil actual se basa en DNI; el rate limit y el aislamiento por curso+DNI
+// son una mitigación temporal hasta incorporar identidad fuerte.
+app.get("/api/certificados/app/cursos-disponibles", async (_req, res) => {
+  try {
+    const documentos = await queryFirestoreCollection("certificados", [], CONFIGURACIONES_MAX_RESULTADOS);
+    const cursoIds = Array.from(
+      new Set(
+        documentos
+          .map((documento) => String(documento.cursoId || "").trim())
+          .filter(Boolean)
+      )
+    );
+
+    return res.status(200).json({ ok: true, cursoIds });
+  } catch (error: any) {
+    return sendCertificadosError(res, error);
+  }
+});
+
+app.get(
+  "/api/certificados/app/cursos/:cursoId/usuario/:dni",
+  certificadosAppRateLimit,
+  async (req, res) => {
+    try {
+      const resultado = await buscarEmisionVigentePorCursoYDni(
+        req.params.cursoId,
+        req.params.dni
+      );
+
+      if (!resultado) {
+        return res.status(404).json({
+          ok: false,
+          emitido: false,
+          error: "El certificado todavía no fue emitido.",
+        });
+      }
+
+      const { cursoId, emision } = resultado;
+      return res.status(200).json({
+        ok: true,
+        emitido: true,
+        cursoId,
+        certificadoId: emision.certificadoId || emision.id || emision.token,
+        token: emision.token || emision.id,
+        participante: {
+          dni: String(emision.participante?.dni || "").trim(),
+          apellidoNombre: String(emision.participante?.apellidoNombre || "").trim(),
+        },
+        validacion: metadatosValidacionCertificado(emision),
+      });
+    } catch (error: any) {
+      return sendCertificadosError(res, error);
+    }
+  }
+);
+
+app.get(
+  "/api/certificados/app/cursos/:cursoId/usuario/:dni/preview",
+  certificadosAppRateLimit,
+  async (req, res) => {
+    try {
+      const resultado = await buscarEmisionVigentePorCursoYDni(
+        req.params.cursoId,
+        req.params.dni
+      );
+      if (!resultado) {
+        return res.status(404).json({
+          ok: false,
+          emitido: false,
+          error: "El certificado todavía no fue emitido.",
+        });
+      }
+
+      const descarga = await firmarDescargaPdfIndividual(resultado.emision, true);
+      return res.status(200).json({ ok: true, emitido: true, ...descarga });
+    } catch (error: any) {
+      return sendCertificadosError(res, error);
+    }
+  }
+);
+
+app.get(
+  "/api/certificados/app/cursos/:cursoId/usuario/:dni/pdf",
+  certificadosAppRateLimit,
+  async (req, res) => {
+    try {
+      const resultado = await buscarEmisionVigentePorCursoYDni(
+        req.params.cursoId,
+        req.params.dni
+      );
+      if (!resultado) {
+        return res.status(404).json({
+          ok: false,
+          emitido: false,
+          error: "El certificado todavía no fue emitido.",
+        });
+      }
+
+      const descarga = await firmarDescargaPdfIndividual(resultado.emision, false);
+      return res.status(200).json({ ok: true, emitido: true, ...descarga });
+    } catch (error: any) {
+      return sendCertificadosError(res, error);
+    }
+  }
+);
 
 // ============================================================
 // DESCARGA POR SEGMENTOS GEOGRÁFICOS

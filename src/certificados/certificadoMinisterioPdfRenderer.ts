@@ -20,6 +20,7 @@ const firmasCache = new Map<string, Promise<Buffer>>();
 
 export type RecursosPdfMinisterio = {
   cargarFirmaHistorica?: (firmante: any, emision: any) => Promise<Buffer>;
+  incluirQr?: boolean;
 };
 
 const texto = (valor: unknown) => String(valor ?? "").replace(/\s+/g, " ").trim();
@@ -511,5 +512,9 @@ export async function renderCertificadoMinisterioPdfPage(
   }
 
   await dibujarFirmantes(doc, emision, recursos);
-  await dibujarQr(doc, emision);
+  if (recursos.incluirQr === false) {
+    cabecera("QR", QR.x, QR.y + 30, QR.width, 18, true);
+  } else {
+    await dibujarQr(doc, emision);
+  }
 }

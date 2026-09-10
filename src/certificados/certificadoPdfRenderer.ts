@@ -107,11 +107,14 @@ const fontSizeQueEntra = (doc: PDFKit.PDFDocument, value: string, width: number,
 
 export async function renderCertificadoPdfPage(
   doc: PDFKit.PDFDocument,
-  emision: any
+  emision: any,
+  opciones: { incluirQr?: boolean } = {}
 ) {
   const certificado = emision?.certificado || {};
   if (certificado.institucionCertificado === "ministerio") {
-    return renderCertificadoMinisterioPdfPage(doc, emision);
+    return renderCertificadoMinisterioPdfPage(doc, emision, {
+      incluirQr: opciones.incluirQr !== false,
+    });
   }
 
   const { sidcaBuffer, itmBuffer } = await templates();
@@ -398,7 +401,14 @@ export async function renderCertificadoPdfPage(
       cursor += altoFinal;
     });
   });
-  if (emision.urlValidacion) {
+  if (opciones.incluirQr === false) {
+    doc.font("Helvetica-Bold").fontSize(cqw(doc, 2.2)).fillColor("#111827");
+    doc.text("QR", pct(doc.page.width, 77.2), pct(doc.page.height, 76.2), {
+      width: pct(doc.page.width, 14.3),
+      align: "center",
+      lineBreak: false,
+    });
+  } else if (emision.urlValidacion) {
     const qr = await QRCode.toBuffer(String(emision.urlValidacion), { margin: 2, width: 220 });
     doc.image(qr, pct(doc.page.width, 77.2), pct(doc.page.height, 71.4), { width: pct(doc.page.width, 14.3), height: pct(doc.page.width, 14.3) });
   }
