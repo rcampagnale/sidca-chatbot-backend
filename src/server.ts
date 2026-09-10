@@ -23,6 +23,12 @@ import {
   type Departamento,
 } from "./certificados/afiliacion.js";
 import {
+  JUNTA_INICIAL_PRIMARIA_ESPECIAL_ADULTO,
+  JUNTA_MEDIA_TECNICA_ARTISTICA,
+  juntasParaNiveles,
+  normalizarNivelesClasificacion,
+} from "./certificados/juntasClasificacion.js";
+import {
   SEGMENTOS,
   SEGMENTO_SIN_DEPARTAMENTO,
   esSegmentoValido,
@@ -1120,6 +1126,16 @@ async function findRegistrosValidadorByAuth(authUser: AuthenticatedUser): Promis
 
 type ModuloValidador = "certificados" | "cena";
 type PermisosValidador = { certificados: boolean; cena: boolean };
+
+const JUNTAS_CLASIFICACION_CERTIFICADOS = new Set([
+  "media_tecnica_artistica",
+  "inicial_primaria_especial_adulto",
+]);
+
+const ETIQUETAS_JUNTAS_CLASIFICACION_CERTIFICADOS: Record<string, string> = {
+  inicial_primaria_especial_adulto: "JUNTA DE CLASIFICACION DE ENSEÑANZA INICIAL, PRIMARIA, ESPECIAL Y ADULTO",
+  media_tecnica_artistica: "JUNTA DE CLASIFICACION DE ENSEÑANZA MEDIA, TECNICA Y ARTISTICA",
+};
 
 function permisosValidador(doc: FirestoreRecord): PermisosValidador {
   const permisos = doc.permisos && typeof doc.permisos === "object" ? doc.permisos : null;
@@ -2483,6 +2499,7 @@ const mapValidadorAdmin = (doc: FirestoreRecord) => ({
   email: doc.email || doc.correo || doc.mail || "",
   validarCertificados: doc.validarCertificados === true,
   permisos: permisosValidador(doc),
+  juntaClasificacionCertificados: String(doc.juntaClasificacionCertificados || "").trim(),
 });
 
 const parseUsuarioDocId = (value: string) => {
@@ -2642,6 +2659,11 @@ app.put("/api/certificados/admin/validadores/:usuarioDocId", async (req, res) =>
       ? { certificados: req.body.permisos.certificados === true, cena: req.body.permisos.cena === true }
       : { certificados: true, cena: false };
     if (!permisosSolicitados.certificados && !permisosSolicitados.cena) throw Object.assign(new Error("Seleccioná al menos un módulo."), { statusCode: 400 });
+    const juntaSolicitada = String(req.body?.juntaClasificacionCertificados || "").trim();
+    if (permisosSolicitados.certificados && !JUNTAS_CLASIFICACION_CERTIFICADOS.has(juntaSolicitada)) {
+      throw Object.assign(new Error("Seleccioná una Junta de Clasificación válida para el permiso de certificados."), { statusCode: 400 });
+    }
+    const juntaExistente = documentos.map((doc) => String(doc.juntaClasificacionCertificados || "").trim()).find(Boolean) || "";
     const passwordInicial = String(req.body?.passwordInicial || "");
     const passwordNueva = String(req.body?.passwordNueva || "");
     if (passwordNueva && (passwordNueva.length < 8 || passwordNueva.length > 128)) throw Object.assign(new Error("La nueva contraseña debe tener entre 8 y 128 caracteres."), { statusCode: 400 });
@@ -2660,10 +2682,10 @@ app.put("/api/certificados/admin/validadores/:usuarioDocId", async (req, res) =>
     } else if (passwordNueva) {
       await actualizarFirebaseAuthValidador(cuenta.uid, { password: passwordNueva });
     }
-    const cambios = { validarCertificados: permisosSolicitados.certificados, permisos: permisosSolicitados, authUid: cuenta.uid, authEmail: email, authCertificadosGestionado: authGestionada, ...(authGestionada ? { authCertificadosCreadoEn: actual.authCertificadosCreadoEn || new Date().toISOString(), authCertificadosCreadoPor: actual.authCertificadosCreadoPor || authUser.uid } : {}), validarCertificadosActualizadoEn: new Date().toISOString(), validarCertificadosActualizadoPor: authUser.uid };
+    const cambios = { validarCertificados: permisosSolicitados.certificados, permisos: permisosSolicitados, ...(permisosSolicitados.certificados ? { juntaClasificacionCertificados: juntaSolicitada } : juntaExistente ? { juntaClasificacionCertificados: juntaExistente } : {}), authUid: cuenta.uid, authEmail: email, authCertificadosGestionado: authGestionada, ...(authGestionada ? { authCertificadosCreadoEn: actual.authCertificadosCreadoEn || new Date().toISOString(), authCertificadosCreadoPor: actual.authCertificadosCreadoPor || authUser.uid } : {}), validarCertificadosActualizadoEn: new Date().toISOString(), validarCertificadosActualizadoPor: authUser.uid };
     const actualizados = await Promise.all(documentos.map((doc) => updateFirestoreDoc(getFirestoreRelativePath(doc), cambios)));
     invalidarCachePermisosValidador(cuenta.uid);
-    return res.json({ ok: true, usuario: mapValidadorAdmin(actualizados[0] || { ...actual, ...cambios }), acceso: { existe: true, habilitada: !cuenta.disabled, gestionadaPorModulo: authGestionada, email, tieneUidVinculado: true, permisos: permisosSolicitados } });
+    return res.json({ ok: true, usuario: mapValidadorAdmin(actualizados[0] || { ...actual, ...cambios }), acceso: { existe: true, habilitada: !cuenta.disabled, gestionadaPorModulo: authGestionada, email, tieneUidVinculado: true, permisos: permisosSolicitados, juntaClasificacionCertificados: juntaSolicitada || juntaExistente } });
   } catch (error: any) { return sendCertificadosError(res, error); }
 });
 
@@ -2679,7 +2701,8 @@ app.get("/api/certificados/admin/validadores/:usuarioDocId/acceso", async (req, 
     const emails = [...new Set(documentos.flatMap((doc) => [doc.email, doc.correo, doc.mail]).map((value) => String(value || "").trim().toLowerCase()).filter((value) => value.includes("@")))];
     const cuenta = uid ? await buscarFirebaseAuthPorUid(uid) : emails[0] ? await buscarFirebaseAuthPorEmail(emails[0]) : { existe: false };
     const fuentePermisos = documentos.find((doc) => doc.permisos && typeof doc.permisos === "object") || persona;
-    return res.json({ ok: true, acceso: { existe: cuenta.existe === true, habilitada: cuenta.existe === true && cuenta.disabled !== true, gestionadaPorModulo: gestionada, email: cuenta.email || emails[0] || "", tieneUidVinculado: Boolean(uid && cuenta.existe), permisos: permisosValidador(fuentePermisos) } });
+    const juntaClasificacionCertificados = documentos.map((doc) => String(doc.juntaClasificacionCertificados || "").trim()).find(Boolean) || String(persona.juntaClasificacionCertificados || "").trim();
+    return res.json({ ok: true, acceso: { existe: cuenta.existe === true, habilitada: cuenta.existe === true && cuenta.disabled !== true, gestionadaPorModulo: gestionada, email: cuenta.email || emails[0] || "", tieneUidVinculado: Boolean(uid && cuenta.existe), permisos: permisosValidador(fuentePermisos), juntaClasificacionCertificados } });
   } catch (error: any) { return sendCertificadosError(res, error); }
 });
 
@@ -5652,6 +5675,7 @@ const responderValidacionCertificadoInstitucional = async (
         validadoEn,
       }
     );
+    const verificacionJunta = await construirVerificacionJunta(emision, permiso);
 
     return res.status(200).json({
       ok: true,
@@ -5664,7 +5688,7 @@ const responderValidacionCertificadoInstitucional = async (
         participante: proyectarParticipanteValidacionPublica(emision.participante),
         certificado: proyectarCertificadoValidacionPublica(emision.certificado),
         emitidoEn: emision.emitidoEn || null,
-        registroCurso: emision.registroCurso || null,
+        registroCurso: registroCursoParaPermiso(emision, permiso),
       },
       verificacion: {
         validadoEn: verificado.validadoEn || validadoEn,
@@ -5673,6 +5697,7 @@ const responderValidacionCertificadoInstitucional = async (
           email: verificado.validadorEmail || null,
           tipo: verificado.tipoValidador,
         },
+        ...verificacionJunta,
       },
     });
   } catch (error: any) {
@@ -5685,7 +5710,128 @@ const responderValidacionCertificadoInstitucional = async (
 app.get("/api/certificados/publico/validar/:cursoId/:token", responderValidacionCertificadoPublica);
 app.get("/api/certificados/validar/:cursoId/:token", responderValidacionCertificadoInstitucional);
 
-/** Registra una sola vez que un certificado fue presentado y validado. */
+const registrosCursoPorJunta = (emision: FirestoreRecord): Record<string, any> => (
+  emision.registroCursoPorJunta && typeof emision.registroCursoPorJunta === "object" && !Array.isArray(emision.registroCursoPorJunta)
+    ? emision.registroCursoPorJunta
+    : {}
+);
+
+const registroCursoParaPermiso = (emision: FirestoreRecord, permiso: PermisoCertificados) => {
+  if (emision.registroCurso) return emision.registroCurso;
+  if (permiso.tipo !== "validador") return null;
+  const junta = String(permiso.usuario?.juntaClasificacionCertificados || "").trim();
+  return junta ? registrosCursoPorJunta(emision)[junta] || null : null;
+};
+
+const construirVerificacionJunta = async (
+  emision: FirestoreRecord,
+  permiso: PermisoCertificados
+) => {
+  const juntaValidador = permiso.tipo === "validador"
+    ? String(permiso.usuario?.juntaClasificacionCertificados || "").trim()
+    : "";
+  const nivelesCertificado = normalizarNivelesClasificacion(emision.certificado?.niveles);
+  const juntasHabilitadas = juntasParaNiveles(nivelesCertificado);
+  const nivelesQueHabilitanJuntaActual = juntaValidador
+    ? nivelesCertificado.filter((nivel) => juntasParaNiveles([nivel]).includes(juntaValidador))
+    : [];
+  const registroJuntaActual = registroCursoParaPermiso(emision, permiso);
+
+  let motivoNoRegistro = "";
+  if (permiso.tipo === "validador" && !juntaValidador) {
+    motivoNoRegistro = "Tu usuario todavía no tiene una Junta de Clasificación asignada.";
+  } else if (!nivelesCertificado.length) {
+    motivoNoRegistro = "Este certificado no posee niveles educativos registrados para determinar la Junta correspondiente.";
+  } else if (!juntasHabilitadas.includes(juntaValidador)) {
+    motivoNoRegistro = "Este certificado no corresponde a tu Junta de Clasificación.";
+  }
+
+  return {
+    juntaValidador,
+    juntaValidadorEtiqueta: ETIQUETAS_JUNTAS_CLASIFICACION_CERTIFICADOS[juntaValidador] || "Junta no asignada",
+    nivelesCertificado,
+    juntasHabilitadas,
+    nivelesQueHabilitanJuntaActual,
+    puedeRegistrarEnJunta: Boolean(juntaValidador && !motivoNoRegistro && !registroJuntaActual),
+    registroJuntaActual: registroJuntaActual || null,
+    registrosPorJunta: registrosCursoPorJunta(emision),
+    motivoNoRegistro,
+  };
+};
+
+const registrarCursoCertificadoAtomico = async ({
+  path,
+  registro,
+  junta,
+}: {
+  path: string;
+  registro: Record<string, any>;
+  junta?: string;
+}) => {
+  for (let intento = 0; intento < 2; intento += 1) {
+    const transaction = await beginFirestoreTransaction();
+    let confirmar = false;
+    try {
+      const emision = await getFirestoreDocInTransaction(path, transaction);
+      if (!emision || String(emision.estado || "") !== EMITIDOS_ESTADO_VIGENTE) {
+        throw Object.assign(new Error("El certificado no está vigente y no puede registrarse."), { statusCode: 409 });
+      }
+
+      if (emision.registroCurso) {
+        return { yaRegistrado: true, registro: emision.registroCurso, registroCursoPorJunta: registrosCursoPorJunta(emision) };
+      }
+
+      if (junta) {
+        const registros = registrosCursoPorJunta(emision);
+        if (registros[junta]) {
+          return { yaRegistrado: true, registro: registros[junta], registroCursoPorJunta: registros };
+        }
+        const actualizado = { ...registros, [junta]: registro };
+        await firestoreRequest(`${firestoreBaseUrl}:commit`, {
+          method: "POST",
+          body: JSON.stringify({
+            transaction,
+            writes: [{
+              update: {
+                name: rutaDocumentoFirestore(path),
+                fields: jsToFirestoreFields({ registroCursoPorJunta: actualizado }),
+              },
+              updateMask: { fieldPaths: ["registroCursoPorJunta"] },
+            }],
+          }),
+        });
+        confirmar = true;
+        return { yaRegistrado: false, registro, registroCursoPorJunta: actualizado };
+      }
+
+      const registroCurso = registro;
+      await firestoreRequest(`${firestoreBaseUrl}:commit`, {
+        method: "POST",
+        body: JSON.stringify({
+          transaction,
+          writes: [{
+            update: {
+              name: rutaDocumentoFirestore(path),
+              fields: jsToFirestoreFields({ registroCurso }),
+            },
+            updateMask: { fieldPaths: ["registroCurso"] },
+          }],
+        }),
+      });
+      confirmar = true;
+      return { yaRegistrado: false, registro: registroCurso, registroCursoPorJunta: registrosCursoPorJunta(emision) };
+    } catch (error: any) {
+      if (esConflictoTransaccionFirestore(error) && intento === 0) continue;
+      throw error;
+    } finally {
+      if (!confirmar) await rollbackFirestoreTransaction(transaction);
+    }
+  }
+
+  throw new Error("No se pudo registrar el certificado.");
+};
+
+/** Registra una sola vez por junta que un certificado fue presentado y validado. */
 app.post("/api/certificados/validar/:cursoId/:token/registrar", async (req, res) => {
   try {
     const authUser = await verifyFirebaseIdToken(req.headers.authorization);
@@ -5700,9 +5846,25 @@ app.post("/api/certificados/validar/:cursoId/:token/registrar", async (req, res)
     if (String(emision.cursoId || cursoId) !== cursoId || (emision.token && String(emision.token) !== token)) {
       throw Object.assign(new Error("El certificado no coincide con el código escaneado."), { statusCode: 404 });
     }
-    if (emision.registroCurso) {
-      return res.status(200).json({ ok: true, yaRegistrado: true, registro: emision.registroCurso });
+    const esValidador = permiso.tipo === "validador";
+    const juntaValidador = esValidador ? String(permiso.usuario?.juntaClasificacionCertificados || "").trim() : "";
+    if (esValidador && ![JUNTA_INICIAL_PRIMARIA_ESPECIAL_ADULTO, JUNTA_MEDIA_TECNICA_ARTISTICA].includes(juntaValidador)) {
+      throw Object.assign(new Error("El validador no tiene una Junta de Clasificación asignada."), { statusCode: 403 });
     }
+
+    let nivelesQueHabilitanJuntaActual: string[] = [];
+    if (esValidador) {
+      const nivelesCertificado = normalizarNivelesClasificacion(emision.certificado?.niveles);
+      if (!nivelesCertificado.length) {
+        throw Object.assign(new Error("Este certificado no posee niveles educativos registrados para determinar la Junta correspondiente."), { statusCode: 409 });
+      }
+      const juntasHabilitadas = juntasParaNiveles(nivelesCertificado);
+      if (!juntasHabilitadas.includes(juntaValidador)) {
+        throw Object.assign(new Error("La Junta del validador no está habilitada para este certificado según sus niveles educativos."), { statusCode: 409 });
+      }
+      nivelesQueHabilitanJuntaActual = nivelesCertificado.filter((nivel) => juntasParaNiveles([nivel]).includes(juntaValidador));
+    }
+
     const registradoEn = new Date().toISOString();
     const registro = {
       registrado: true,
@@ -5711,9 +5873,10 @@ app.post("/api/certificados/validar/:cursoId/:token/registrar", async (req, res)
       registradoPorEmail: authUser.email || "",
       registradoPorNombre: permiso.tipo === "validador" ? buildNombreAfiliado(permiso.usuario) : "Administrador SIDCA",
       tipoValidador: permiso.tipo,
+      ...(esValidador ? { juntaClasificacionCertificados: juntaValidador, nivelesQueHabilitanJuntaActual } : {}),
     };
-    await updateFirestoreDoc(path, { registroCurso: registro });
-    return res.status(200).json({ ok: true, registro });
+    const resultado = await registrarCursoCertificadoAtomico({ path, registro, junta: juntaValidador || undefined });
+    return res.status(200).json({ ok: true, yaRegistrado: resultado.yaRegistrado, registro: resultado.registro, registroCursoPorJunta: resultado.registroCursoPorJunta });
   } catch (error: any) {
     return sendCertificadosError(res, error);
   }
