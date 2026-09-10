@@ -6278,6 +6278,7 @@ async function registrarTarjetaCenaAtomica({
                 codigoVisible: tarjeta.codigoVisible || null,
                 afiliadoDni: tarjeta.afiliadoDni || reserva.afiliado?.dni || null,
                 tipo: tarjeta.tipo || null,
+                metodoValidacion: "qr",
                 validadoPor,
                 validadoPorUid,
                 validadoPorEmail,
@@ -6309,6 +6310,119 @@ async function registrarTarjetaCenaAtomica({
   }
 
   throw new Error("No se pudo registrar la tarjeta de Cena.");
+}
+
+const registrarTarjetasCenaManualSchema = z.strictObject({
+  tarjetaIds: z.array(z.string().trim().min(1).max(128)).min(1).max(50),
+});
+
+async function registrarTarjetasCenaManualAtomica({
+  anio,
+  reservaId,
+  tarjetaIds,
+  authUser,
+  permiso,
+}: {
+  anio: string;
+  reservaId: string;
+  tarjetaIds: string[];
+  authUser: AuthenticatedUser;
+  permiso: PermisoCertificados;
+}) {
+  const idsUnicos = [...new Set(tarjetaIds)];
+  const reservaPath = `gestion_cena/${anio}/reservas/${reservaId}`;
+  const tarjetaPaths = idsUnicos.map((tarjetaId) => `gestion_cena/${anio}/tarjetas/${tarjetaId}`);
+
+  for (let intento = 0; intento < 2; intento += 1) {
+    const transaction = await beginFirestoreTransaction();
+    let confirmar = false;
+    try {
+      const [reserva, ...tarjetas] = await Promise.all([
+        getFirestoreDocInTransaction(reservaPath, transaction),
+        ...tarjetaPaths.map((path) => getFirestoreDocInTransaction(path, transaction)),
+      ]);
+      if (!reserva || !reservaCenaActiva(reserva)) {
+        throw Object.assign(new Error("La reserva no está disponible para registrar ingresos."), { statusCode: 409 });
+      }
+      if (reserva.anio !== undefined && Number(reserva.anio) !== Number(anio)) {
+        throw Object.assign(new Error("La reserva no pertenece a la edición indicada."), { statusCode: 409 });
+      }
+      if (tarjetas.some((tarjeta) => !tarjeta)) {
+        throw Object.assign(new Error("Una o más tarjetas seleccionadas ya no están disponibles."), { statusCode: 404 });
+      }
+
+      const tarjetasReales = tarjetas as FirestoreRecord[];
+      tarjetasReales.forEach((tarjeta) => {
+        if (String(tarjeta.reservaId || "") !== String(reservaId) || !esTarjetaVigenteCena(tarjeta)) {
+          throw Object.assign(new Error("Una o más tarjetas seleccionadas ya no pertenecen a esta reserva."), { statusCode: 409 });
+        }
+        if (tarjetaCenaAcreditada(tarjeta)) {
+          throw Object.assign(new Error("Una o más tarjetas seleccionadas ya fueron acreditadas o cambiaron de estado. Actualizá la reserva antes de continuar."), { statusCode: 409 });
+        }
+      });
+
+      const validadoPor = {
+        uid: authUser.uid,
+        email: authUser.email || "",
+        nombre: permiso.tipo === "validador" ? buildNombreAfiliado(permiso.usuario) : "Administrador SIDCA",
+        tipo: permiso.tipo,
+      };
+      const writes = tarjetasReales.flatMap((tarjeta) => {
+        const token = String(tarjeta.token || tarjeta.id || "");
+        const validacionPath = `gestion_cena/${anio}/validaciones/${token}`;
+        return [
+          {
+            update: {
+              name: rutaDocumentoFirestore(`gestion_cena/${anio}/tarjetas/${tarjeta.id}`),
+              fields: jsToFirestoreFields({
+                estado: "validada",
+                validada: true,
+                validadoPor,
+                validadoPorUid: authUser.uid,
+                validadoPorEmail: authUser.email || "",
+                validadoPorNombre: validadoPor.nombre || "",
+              }),
+            },
+            updateMask: { fieldPaths: ["validada", "estado", "fechaValidacion", "validadoPor", "validadoPorUid", "validadoPorEmail", "validadoPorNombre"] },
+            updateTransforms: [{ fieldPath: "fechaValidacion", setToServerValue: "REQUEST_TIME" }],
+          },
+          {
+            update: {
+              name: rutaDocumentoFirestore(validacionPath),
+              fields: jsToFirestoreFields({
+                anio: Number(anio),
+                tarjetaId: tarjeta.id,
+                reservaId: reserva.id,
+                token,
+                codigoVisible: tarjeta.codigoVisible || null,
+                afiliadoDni: tarjeta.afiliadoDni || reserva.afiliado?.dni || null,
+                tipo: tarjeta.tipo || null,
+                metodoValidacion: "manual_dni",
+                validadoPor,
+                validadoPorUid: authUser.uid,
+                validadoPorEmail: authUser.email || "",
+                validadoPorNombre: validadoPor.nombre || "",
+              }),
+            },
+            updateTransforms: [{ fieldPath: "fechaValidacion", setToServerValue: "REQUEST_TIME" }],
+          },
+        ];
+      });
+
+      await firestoreRequest(`${firestoreBaseUrl}:commit`, {
+        method: "POST",
+        body: JSON.stringify({ transaction, writes }),
+      });
+      confirmar = true;
+      return { reserva, tarjetas: tarjetasReales.map((tarjeta) => ({ ...tarjeta, estado: "validada", validada: true, validadoPor })) };
+    } catch (error: any) {
+      if (esConflictoTransaccionFirestore(error) && intento === 0) continue;
+      throw error;
+    } finally {
+      if (!confirmar) await rollbackFirestoreTransaction(transaction);
+    }
+  }
+  throw Object.assign(new Error("No se pudo registrar el ingreso manual."), { statusCode: 409 });
 }
 
 function sendCenaError(res: express.Response, error: any) {
@@ -6391,6 +6505,27 @@ app.post("/api/cena/validar/:token/registrar", async (req, res) => {
       validacion: snapshot,
     });
   } catch (error: any) {
+    return sendCenaError(res, error);
+  }
+});
+
+app.post("/api/cena/reserva/:anio/:reservaId/registrar-manual", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    const permiso = await requireAdministradorOValidadorCena(authUser);
+    const anio = parseCenaAnioParam(req.params.anio);
+    const reservaId = String(req.params.reservaId || "").trim();
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(reservaId)) {
+      throw Object.assign(new Error("La reserva de Cena es inválida."), { statusCode: 400 });
+    }
+    const { tarjetaIds } = registrarTarjetasCenaManualSchema.parse(req.body);
+    const registro = await registrarTarjetasCenaManualAtomica({ anio, reservaId, tarjetaIds, authUser, permiso });
+    const snapshot = await construirSnapshotReservaCena(null, registro.reserva, anio);
+    return res.status(200).json({ ok: true, modulo: "cena", resultado: "registradas", cantidad: registro.tarjetas.length, validacion: snapshot });
+  } catch (error: any) {
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({ ok: false, modulo: "cena", error: "Seleccioná al menos una tarjeta para registrar." });
+    }
     return sendCenaError(res, error);
   }
 });
