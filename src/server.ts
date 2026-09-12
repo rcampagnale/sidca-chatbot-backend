@@ -6,6 +6,7 @@ import multer from "multer";
 import OpenAI, { toFile } from "openai";
 import { GoogleAuth } from "google-auth-library";
 import { Storage } from "@google-cloud/storage";
+import QRCode from "qrcode";
 import { generarCertificadoPdfIndividual } from "./certificados/certificadoPdfIndividual.js";
 import { z } from "zod";
 import { createRemoteJWKSet, jwtVerify } from "jose";
@@ -1893,7 +1894,7 @@ app.use(
       callback(new Error("Origen no permitido por CORS."));
     },
     credentials: true,
-    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: [
       "Content-Type",
       "Authorization",
@@ -2222,6 +2223,7 @@ const configuracionCertificadoSchema = z.strictObject({
   textoEvaluacion: z.string().trim().max(500).optional().default(""),
   textoAuspicio: z.string().trim().max(700).optional().default(""),
   firmantesMinisterio: z.array(firmanteMinisterioSchema).max(3).optional().default([]),
+  descargaAppHabilitada: z.boolean().optional().default(true),
 }).superRefine((valor, contexto) => {
   if (valor.institucionCertificado === "ministerio") return;
 
@@ -2239,6 +2241,10 @@ const configuracionCertificadoSchema = z.strictObject({
       contexto.addIssue({ code: z.ZodIssueCode.custom, path: [campo], message: mensaje });
     }
   });
+});
+
+const descargaAppCertificadoSchema = z.strictObject({
+  habilitada: z.boolean(),
 });
 
 const ESTADOS_CONFIGURACION_CERTIFICADO = new Set(["borrador", "lista"]);
@@ -2343,6 +2349,7 @@ function mapConfiguracionCertificado(
     niveles: Array.isArray(record.niveles) ? record.niveles : [],
     textoEvaluacion: record.textoEvaluacion || "",
     textoAuspicio: record.textoAuspicio || "",
+    descargaAppHabilitada: record.descargaAppHabilitada !== false,
     firmantesMinisterio:
       normalizarInstitucionCertificado(record) === "ministerio"
         ? obtenerFirmantesMinisterioConfiguracion(record)
@@ -2954,6 +2961,33 @@ app.get("/api/certificados/registro-inscriptos/:cursoId/:archivoId/descargar", a
   } catch (error: any) { return sendCertificadosError(res, error); }
 });
 
+app.patch("/api/certificados/admin/configuracion/:cursoId/descarga-app", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    await requireAdministrador(authUser);
+    const cursoId = parseCursoIdParam(req.params.cursoId);
+    const { habilitada } = descargaAppCertificadoSchema.parse(req.body);
+    const existente = await getFirestoreDoc(`certificados/${cursoId}`);
+    if (!existente) {
+      throw Object.assign(new Error("Todavía no hay una configuración de certificado para este curso."), { statusCode: 404 });
+    }
+
+    const guardado = await updateFirestoreDoc(`certificados/${cursoId}`, {
+      descargaAppHabilitada: habilitada,
+    });
+    return res.status(200).json({
+      ok: true,
+      modulo: "certificados",
+      descargaAppHabilitada: guardado?.descargaAppHabilitada !== false,
+    });
+  } catch (error: any) {
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({ ok: false, error: "El estado de descarga enviado no es válido." });
+    }
+    return sendCertificadosError(res, error);
+  }
+});
+
 app.get("/api/certificados/admin/configuracion/:cursoId", async (req, res) => {
   try {
     const authUser = await verifyFirebaseIdToken(req.headers.authorization);
@@ -3039,6 +3073,7 @@ app.put("/api/certificados/admin/configuracion/:cursoId", async (req, res) => {
       modalidad: datosValidados.modalidad,
 
       institucionCertificado: datosValidados.institucionCertificado,
+      descargaAppHabilitada: datosValidados.descargaAppHabilitada !== false,
 
       estadoConfiguracion,
 
@@ -7405,7 +7440,7 @@ async function buscarEmisionVigentePorCursoYDni(
 }
 
 function certificadoAppObjectName(cursoId: string, token: string, preview: boolean) {
-  return `certificados-app/${cursoId}/${token}/${preview ? "preview-v2-sin-qr" : "oficial"}.pdf`;
+  return `certificados-app/${cursoId}/${token}/${preview ? "preview-v3-app" : "oficial"}.pdf`;
 }
 
 function certificadoAppFilename(emision: FirestoreRecord, preview: boolean) {
@@ -7414,21 +7449,104 @@ function certificadoAppFilename(emision: FirestoreRecord, preview: boolean) {
   return `${preview ? "Vista-previa-Certificado" : "Certificado-SIDCA"}-${nombre}.pdf`;
 }
 
+function formatearFechaValidacionApp(valor: unknown) {
+  const fecha = new Date(String(valor || ""));
+  if (Number.isNaN(fecha.getTime())) return String(valor || "").trim();
+
+  const partes = new Intl.DateTimeFormat("es-AR", {
+    timeZone: "America/Argentina/Buenos_Aires",
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(fecha);
+  const parte = (tipo: Intl.DateTimeFormatPartTypes) =>
+    partes.find((item) => item.type === tipo)?.value || "";
+
+  return `${parte("day")}/${parte("month")}/${parte("year")} · ${parte("hour")}:${parte("minute")} hs`;
+}
+
 function metadatosValidacionCertificado(emision: FirestoreRecord) {
   const registro = emision.registroCurso;
   const registrado = registro?.registrado === true;
   if (!registrado) return { registrado: false };
 
   const fecha = registro.registradoEn || null;
-  const nombre = String(
-    registro.registradoPorNombre || ""
-  ).trim();
-
+  const nombre = String(registro.registradoPorNombre || "").trim();
   return {
     registrado: true,
     ...(fecha ? { fecha } : {}),
     ...(nombre ? { validadoPor: nombre } : {}),
+    ...(registro.juntaClasificacionCertificados
+      ? {
+          junta: String(registro.juntaClasificacionCertificados).trim(),
+          juntaEtiqueta:
+            ETIQUETAS_JUNTAS_CLASIFICACION_CERTIFICADOS[
+              String(registro.juntaClasificacionCertificados).trim()
+            ] || String(registro.juntaClasificacionCertificados).trim(),
+        }
+      : {}),
   };
+}
+
+function registrosValidacionCertificado(emision: FirestoreRecord) {
+  // La APP recibe una proyección genérica: en el futuro pueden sumarse
+  // campos adicionales sin cambiar esta interfaz ni el cliente móvil.
+  const registros: Array<{
+    id: string;
+    titulo: string;
+    campos: Array<{ etiqueta: string; valor: string }>;
+  }> = [];
+  const claves = new Set<string>();
+  let indice = 0;
+
+  const agregar = (registro: any, juntaFallback = "") => {
+    if (!registro || typeof registro !== "object" || registro.registrado !== true) return;
+
+    const junta = String(
+      registro.juntaClasificacionCertificados || juntaFallback || ""
+    ).trim();
+    const juntaEtiqueta = junta
+      ? ETIQUETAS_JUNTAS_CLASIFICACION_CERTIFICADOS[junta] || junta
+      : "";
+    const vocal = String(registro.registradoPorNombre || "").trim();
+    const fechaOriginal = String(registro.registradoEn || "").trim();
+    const clave = [junta, vocal, fechaOriginal].join("\u0000");
+    if (claves.has(clave)) return;
+
+    claves.add(clave);
+    indice += 1;
+    registros.push({
+      id: `registro-${junta || "legacy"}-${indice}`,
+      titulo: juntaEtiqueta,
+      campos: [
+        { etiqueta: "Vocal", valor: vocal },
+        { etiqueta: "Fecha y hora", valor: formatearFechaValidacionApp(fechaOriginal) },
+      ],
+    });
+  };
+
+  Object.entries(registrosCursoPorJunta(emision)).forEach(([junta, registro]) => {
+    agregar(registro, junta);
+  });
+  agregar(emision.registroCurso);
+
+  return registros;
+}
+
+function metadatosValidacionCertificadoApp(emision: FirestoreRecord) {
+  const registros = registrosValidacionCertificado(emision);
+  return {
+    registrado: registros.length > 0,
+    registros,
+  };
+}
+
+async function resolverDescargaAppHabilitada(cursoId: string): Promise<boolean> {
+  const configuracion = await getFirestoreDoc(`certificados/${cursoId}`);
+  return configuracion?.descargaAppHabilitada !== false;
 }
 
 /** Genera (si aún no existe) y firma un PDF individual privado. */
@@ -7456,7 +7574,7 @@ async function firmarDescargaPdfIndividual(
     const [existe] = await archivo.exists();
     if (!existe) {
       const buffer = await generarCertificadoPdfIndividual(emision, {
-        marcaAgua: preview,
+        marcaAgua: false,
         incluirQr: !preview,
       });
       await archivo.save(buffer, {
@@ -7527,18 +7645,57 @@ app.get(
       }
 
       const { cursoId, emision } = resultado;
+      const descargaHabilitada = await resolverDescargaAppHabilitada(cursoId);
       return res.status(200).json({
         ok: true,
         emitido: true,
         cursoId,
+        descargaHabilitada,
         certificadoId: emision.certificadoId || emision.id || emision.token,
         token: emision.token || emision.id,
         participante: {
           dni: String(emision.participante?.dni || "").trim(),
           apellidoNombre: String(emision.participante?.apellidoNombre || "").trim(),
         },
-        validacion: metadatosValidacionCertificado(emision),
+        validacion: metadatosValidacionCertificadoApp(emision),
       });
+    } catch (error: any) {
+      return sendCertificadosError(res, error);
+    }
+  }
+);
+
+app.get(
+  "/api/certificados/app/cursos/:cursoId/usuario/:dni/qr",
+  certificadosAppRateLimit,
+  async (req, res) => {
+    try {
+      const resultado = await buscarEmisionVigentePorCursoYDni(
+        req.params.cursoId,
+        req.params.dni
+      );
+      if (!resultado) {
+        return res.status(404).json({
+          ok: false,
+          emitido: false,
+          error: "El certificado todavía no fue emitido.",
+        });
+      }
+
+      const urlValidacion = String(resultado.emision.urlValidacion || "").trim();
+      if (!urlValidacion) {
+        throw Object.assign(new Error("La emisión no tiene una URL de validación válida."), {
+          statusCode: 409,
+        });
+      }
+
+      const qrDataUri = await QRCode.toDataURL(urlValidacion, {
+        errorCorrectionLevel: "M",
+        margin: 2,
+        width: 480,
+      });
+
+      return res.status(200).json({ ok: true, emitido: true, qrDataUri });
     } catch (error: any) {
       return sendCertificadosError(res, error);
     }
@@ -7585,6 +7742,14 @@ app.get(
           emitido: false,
           error: "El certificado todavía no fue emitido.",
         });
+      }
+
+      const descargaHabilitada = await resolverDescargaAppHabilitada(resultado.cursoId);
+      if (!descargaHabilitada) {
+        throw Object.assign(
+          new Error("La descarga desde la APP está deshabilitada para este curso."),
+          { statusCode: 403 }
+        );
       }
 
       const descarga = await firmarDescargaPdfIndividual(resultado.emision, false);
