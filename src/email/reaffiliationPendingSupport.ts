@@ -1,5 +1,6 @@
 export type PendingEmailDecision = "procesar" | "omitido" | "ya_enviado" | "procesando";
 export type ApprovedEmailDecision = "procesar" | "omitido" | "ya_enviado" | "procesando";
+export type RejectedEmailDecision = "procesar" | "omitido" | "ya_enviado" | "procesando";
 
 export type PendingEmailState = Record<string, any> & {
   estadoReafiliacion?: unknown;
@@ -14,6 +15,10 @@ export type PendingEmailState = Record<string, any> & {
   correoReafiliacionAprobadaEstado?: unknown;
   correoReafiliacionAprobadaSolicitudId?: unknown;
   correoReafiliacionAprobadaProcesandoAt?: unknown;
+  observacionResolucion?: unknown;
+  correoReafiliacionRechazadaEstado?: unknown;
+  correoReafiliacionRechazadaSolicitudId?: unknown;
+  correoReafiliacionRechazadaProcesandoAt?: unknown;
 };
 
 export function normalizarEstadoReafiliacion(value: unknown): string {
@@ -81,6 +86,35 @@ export function decidirCorreoAprobada(
 
   if (mismaSolicitud && estadoCorreo === "procesando") {
     const procesandoEn = Date.parse(String(state.correoReafiliacionAprobadaProcesandoAt ?? ""));
+    if (Number.isFinite(procesandoEn) && ahora - procesandoEn < 15 * 60 * 1000) {
+      return "procesando";
+    }
+  }
+
+  return "procesar";
+}
+
+export function esSolicitudRechazadaValida(state: PendingEmailState): boolean {
+  return (
+    normalizarEstadoReafiliacion(state.estadoReafiliacion) === "rechazada" &&
+    solicitudIdDesdeFecha(state.fechaSolicitudReafiliacion) !== null &&
+    String(state.usuarioIdHistorico ?? "").trim().length > 0
+  );
+}
+
+export function decidirCorreoRechazada(
+  state: PendingEmailState,
+  solicitudId: string,
+  ahora = Date.now(),
+): RejectedEmailDecision {
+  if (!esSolicitudRechazadaValida(state)) return "omitido";
+
+  const mismaSolicitud = String(state.correoReafiliacionRechazadaSolicitudId ?? "") === solicitudId;
+  const estadoCorreo = String(state.correoReafiliacionRechazadaEstado ?? "");
+  if (mismaSolicitud && estadoCorreo === "enviado") return "ya_enviado";
+
+  if (mismaSolicitud && estadoCorreo === "procesando") {
+    const procesandoEn = Date.parse(String(state.correoReafiliacionRechazadaProcesandoAt ?? ""));
     if (Number.isFinite(procesandoEn) && ahora - procesandoEn < 15 * 60 * 1000) {
       return "procesando";
     }

@@ -135,11 +135,24 @@ de `fechaSolicitudReafiliacion`. Las actualizaciones que marcan `procesando`,
 misma solicitud. Una nueva fecha de solicitud permite un nuevo correo para el
 mismo DNI.
 
-El mismo receptor distingue los estados `pendiente` y `aprobada`; no se
-necesita un segundo trigger Eventarc. El correo aprobado mantiene sus propios
-campos de estado (`correoReafiliacionAprobada*`) y la misma solicitud lógica,
-por lo que las actualizaciones de correo también se omiten de forma
-idempotente.
+El mismo receptor distingue los estados `pendiente`, `aprobada` y `rechazada`;
+no se necesita un segundo trigger Eventarc. El correo aprobado mantiene sus
+propios campos de estado (`correoReafiliacionAprobada*`) y el correo rechazado
+usa `correoReafiliacionRechazadaEstado`,
+`correoReafiliacionRechazadaProcesandoAt`,
+`correoReafiliacionRechazadaEnviadoAt`,
+`correoReafiliacionRechazadaUltimoErrorAt`,
+`correoReafiliacionRechazadaIdProveedor`,
+`correoReafiliacionRechazadaUltimoError` y
+`correoReafiliacionRechazadaSolicitudId`. Todos reutilizan la misma solicitud
+lógica basada en `fechaSolicitudReafiliacion`, por lo que las actualizaciones
+de correo también se omiten de forma idempotente y no generan loops.
+
+Cuando el estado es `rechazada`, el receptor usa la fecha real de
+`fechaResolucionReafiliacion` y el motivo real de `observacionResolucion`.
+Si no existe motivo, no agrega un bloque vacío ni inventa una causa. El correo
+rechazado no incluye teléfonos: sólo muestra los canales oficiales web,
+Facebook, YouTube e Instagram.
 
 Comando propuesto (no ejecutar todavía):
 

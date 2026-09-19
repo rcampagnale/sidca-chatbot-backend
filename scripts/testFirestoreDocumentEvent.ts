@@ -12,12 +12,15 @@ import {
 import {
   decidirCorreoAprobada,
   decidirCorreoPendiente,
+  decidirCorreoRechazada,
   emailValidoReafiliacion,
   esSolicitudAprobadaValida,
   esSolicitudPendienteValida,
+  esSolicitudRechazadaValida,
 } from "../src/email/reaffiliationPendingSupport.js";
 import { buildReaffiliationPendingEmailHtml } from "../src/email/reaffiliationPendingEmail.js";
 import { buildReaffiliationApprovedEmailHtml } from "../src/email/reaffiliationApprovedEmail.js";
+import { buildReaffiliationRejectedEmailHtml } from "../src/email/reaffiliationRejectedEmail.js";
 import { resolverNumeroAfiliacionHistorico } from "../src/reafiliacion/historicAffiliationNumber.js";
 
 const validName = "projects/sidca-a33f0/databases/(default)/documents/usuarios/ABC123";
@@ -136,6 +139,55 @@ const approvedHtml = buildReaffiliationApprovedEmailHtml({
 });
 assert.equal(approvedHtml.includes("&lt;script&gt;"), true);
 assert.equal(approvedHtml.includes("<script>alert(1)</script>"), false);
+
+const rejected = {
+  ...pending,
+  estadoReafiliacion: "rechazada",
+  requiereRevisionComision: false,
+  fechaResolucionReafiliacion: "2026-09-17T14:00:00.000Z",
+  observacionResolucion: "Falta documentación <script>alert(1)</script>",
+};
+assert.equal(esSolicitudRechazadaValida(rejected), true);
+assert.equal(decidirCorreoRechazada(rejected, pending.fechaSolicitudReafiliacion), "procesar");
+assert.equal(decidirCorreoRechazada({ ...rejected, estadoReafiliacion: "pendiente" }, pending.fechaSolicitudReafiliacion), "omitido");
+assert.equal(decidirCorreoRechazada({ ...rejected, estadoReafiliacion: "aprobada" }, pending.fechaSolicitudReafiliacion), "omitido");
+assert.equal(
+  decidirCorreoRechazada(
+    { ...rejected, correoReafiliacionRechazadaEstado: "enviado", correoReafiliacionRechazadaSolicitudId: pending.fechaSolicitudReafiliacion },
+    pending.fechaSolicitudReafiliacion,
+  ),
+  "ya_enviado",
+);
+assert.equal(
+  decidirCorreoRechazada(
+    { ...rejected, correoReafiliacionRechazadaEstado: "procesando", correoReafiliacionRechazadaSolicitudId: pending.fechaSolicitudReafiliacion, correoReafiliacionRechazadaProcesandoAt: "2026-09-17T13:55:00.000Z" },
+    pending.fechaSolicitudReafiliacion,
+    Date.parse("2026-09-17T14:00:00.000Z"),
+  ),
+  "procesando",
+);
+assert.equal(
+  decidirCorreoRechazada(
+    { ...rejected, correoReafiliacionRechazadaEstado: "enviado", correoReafiliacionRechazadaSolicitudId: pending.fechaSolicitudReafiliacion },
+    "2026-10-17T12:00:00.000Z",
+  ),
+  "procesar",
+);
+const rejectedHtml = buildReaffiliationRejectedEmailHtml({
+  dni: "1234567",
+  nombre: "<script>alert(1)</script>",
+  fechaResolucion: "17/09/2026 11:00 hs",
+  nroAfiliacion: null,
+  motivo: "Falta <b>documentación</b>",
+});
+assert.equal(rejectedHtml.includes("&lt;script&gt;"), true);
+assert.equal(rejectedHtml.includes("&lt;b&gt;documentación&lt;/b&gt;"), true);
+const rejectedWithoutReasonHtml = buildReaffiliationRejectedEmailHtml({
+  dni: "1234567",
+  nombre: "Persona",
+  fechaResolucion: "17/09/2026 11:00 hs",
+});
+assert.equal(rejectedWithoutReasonHtml.includes("MOTIVO INFORMADO"), false);
 
 validarTipoCloudEventEsperado(FIRESTORE_UPDATED_EVENT_TYPE, FIRESTORE_UPDATED_EVENT_TYPE);
 assert.throws(

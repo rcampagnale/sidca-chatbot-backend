@@ -7,12 +7,15 @@ import OpenAI, { toFile } from "openai";
 import { sendWelcomeEmail } from "./email/welcomeEmail.js";
 import { sendReaffiliationPendingEmail } from "./email/reaffiliationPendingEmail.js";
 import { sendReaffiliationApprovedEmail } from "./email/reaffiliationApprovedEmail.js";
+import { sendReaffiliationRejectedEmail } from "./email/reaffiliationRejectedEmail.js";
 import {
   decidirCorreoAprobada,
   decidirCorreoPendiente,
+  decidirCorreoRechazada,
   emailValidoReafiliacion,
   esSolicitudPendienteValida,
   esSolicitudAprobadaValida,
+  esSolicitudRechazadaValida,
   normalizarEstadoReafiliacion,
   solicitudIdDesdeFecha,
 } from "./email/reaffiliationPendingSupport.js";
@@ -5443,6 +5446,155 @@ async function procesarCorreoReafiliacionAprobada(
   }
 }
 
+type ResultadoCorreoReafiliacionRechazada =
+  | { estado: "enviado" }
+  | { estado: "ya_enviado" }
+  | { estado: "procesando" }
+  | { estado: "omitido"; motivo: string }
+  | { estado: "reintentar"; motivo: string };
+
+type ReservaCorreoReafiliacionRechazada =
+  | { estado: "reservado"; datos: ReaffiliationRejectedData }
+  | { estado: "ya_enviado" }
+  | { estado: "procesando" }
+  | { estado: "omitido"; motivo: string }
+  | { estado: "reintentar"; motivo: string };
+
+type ReaffiliationRejectedData = {
+  dni: string;
+  nombre: string;
+  email: string;
+  fechaResolucion: string;
+  nroAfiliacion?: string | number | null;
+  motivo?: string | null;
+  solicitudId: string;
+};
+
+async function reservarCorreoReafiliacionRechazada(
+  dni: string,
+): Promise<ReservaCorreoReafiliacionRechazada> {
+  const counterPath = `nuevoAfiliado_counters/${dni}`;
+
+  for (let intento = 0; intento < 2; intento += 1) {
+    const transaction = await beginFirestoreTransaction();
+    let confirmar = false;
+
+    try {
+      const counter = await getFirestoreDocInTransaction(counterPath, transaction);
+      if (!counter || !esSolicitudRechazadaValida(counter)) {
+        return { estado: "omitido", motivo: "solicitud_no_rechazada" };
+      }
+
+      const solicitudId = solicitudIdDesdeFecha(counter.fechaSolicitudReafiliacion);
+      if (!solicitudId) return { estado: "omitido", motivo: "fecha_solicitud_invalida" };
+
+      const decision = decidirCorreoRechazada(counter, solicitudId);
+      if (decision === "ya_enviado") return { estado: "ya_enviado" };
+      if (decision === "procesando") return { estado: "procesando" };
+
+      const fechaResolucion = fechaSolicitudArgentina(counter.fechaResolucionReafiliacion);
+      if (!fechaResolucion) {
+        return { estado: "reintentar", motivo: "fecha_resolucion_no_disponible" };
+      }
+
+      const usuarioIdHistorico = String(counter.usuarioIdHistorico || "").trim();
+      const usuario = await getFirestoreDocInTransaction(`usuarios/${usuarioIdHistorico}`, transaction);
+      const snapshot = counter.datosSolicitudReafiliacion && typeof counter.datosSolicitudReafiliacion === "object"
+        ? counter.datosSolicitudReafiliacion
+        : {};
+      const emailSnapshot = String(snapshot.email || "").trim();
+      const emailUsuario = String(usuario?.email || usuario?.correo || "").trim();
+      const email = emailValidoReafiliacion(emailSnapshot)
+        ? emailSnapshot
+        : emailValidoReafiliacion(emailUsuario)
+        ? emailUsuario
+        : "";
+      if (!email) return { estado: "omitido", motivo: "email_invalido" };
+
+      const datos: ReaffiliationRejectedData = {
+        dni,
+        nombre: nombreReafiliacionPendiente(snapshot, usuario),
+        email,
+        fechaResolucion,
+        nroAfiliacion: counter.nroAfiliacionHistorico ?? counter.nroAfiliacionReafiliacion ?? usuario?.nroAfiliacion ?? null,
+        motivo: String(counter.observacionResolucion || "").trim() || null,
+        solicitudId,
+      };
+
+      await firestoreRequest(`${firestoreBaseUrl}:commit`, {
+        method: "POST",
+        body: JSON.stringify({
+          transaction,
+          writes: [
+            actualizarConTransformaciones(
+              counterPath,
+              {
+                correoReafiliacionRechazadaEstado: "procesando",
+                correoReafiliacionRechazadaSolicitudId: solicitudId,
+                correoReafiliacionRechazadaUltimoError: null,
+              },
+              ["correoReafiliacionRechazadaProcesandoAt", "updatedAt"],
+            ),
+          ],
+        }),
+      });
+      confirmar = true;
+      return { estado: "reservado", datos };
+    } catch (error: any) {
+      if (esConflictoTransaccionFirestore(error) && intento === 0) continue;
+      throw error;
+    } finally {
+      if (!confirmar) await rollbackFirestoreTransaction(transaction);
+    }
+  }
+
+  throw new Error("No se pudo reservar el correo de reafiliación rechazada.");
+}
+
+async function procesarCorreoReafiliacionRechazada(
+  dni: string,
+): Promise<ResultadoCorreoReafiliacionRechazada> {
+  const reserva = await reservarCorreoReafiliacionRechazada(dni);
+  if (reserva.estado === "omitido" || reserva.estado === "ya_enviado" || reserva.estado === "procesando") {
+    return reserva;
+  }
+  if (reserva.estado === "reintentar") return reserva;
+
+  const counterPath = `nuevoAfiliado_counters/${dni}`;
+  try {
+    const proveedorId = await sendReaffiliationRejectedEmail(reserva.datos);
+    await actualizarDocumentoConTransformaciones(
+      counterPath,
+      {
+        correoReafiliacionRechazadaEstado: "enviado",
+        correoReafiliacionRechazadaSolicitudId: reserva.datos.solicitudId,
+        correoReafiliacionRechazadaIdProveedor: proveedorId,
+        correoReafiliacionRechazadaUltimoError: null,
+      },
+      ["correoReafiliacionRechazadaEnviadoAt", "updatedAt"],
+    );
+    return { estado: "enviado" };
+  } catch (error: any) {
+    const mensaje = errorBienvenidaCorto(error);
+    try {
+      await actualizarDocumentoConTransformaciones(
+        counterPath,
+        {
+          correoReafiliacionRechazadaEstado: "error",
+          correoReafiliacionRechazadaSolicitudId: reserva.datos.solicitudId,
+          correoReafiliacionRechazadaUltimoError: mensaje,
+        },
+        ["correoReafiliacionRechazadaUltimoErrorAt", "updatedAt"],
+      );
+    } catch (persistError: any) {
+      console.error("[sidca-email] No se pudo guardar el estado de error de reafiliación rechazada:", {
+        message: errorBienvenidaCorto(persistError),
+      });
+    }
+    return { estado: "reintentar", motivo: "envio_reafiliacion_rechazada_fallido" };
+  }
+}
+
 async function procesarCorreoReafiliacionActualizacion(dni: string) {
   const counter = await getFirestoreDoc(`nuevoAfiliado_counters/${dni}`);
   if (!counter) return { estado: "omitido" as const, motivo: "solicitud_inexistente" };
@@ -5450,6 +5602,7 @@ async function procesarCorreoReafiliacionActualizacion(dni: string) {
   const estado = normalizarEstadoReafiliacion(counter.estadoReafiliacion);
   if (estado === "aprobada") return procesarCorreoReafiliacionAprobada(dni);
   if (estado === "pendiente") return procesarCorreoReafiliacionPendiente(dni);
+  if (estado === "rechazada") return procesarCorreoReafiliacionRechazada(dni);
   return { estado: "omitido" as const, motivo: "solicitud_no_procesable" };
 }
 
