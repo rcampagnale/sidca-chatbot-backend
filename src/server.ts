@@ -4,6 +4,18 @@ import express from "express";
 import cors from "cors";
 import multer from "multer";
 import OpenAI, { toFile } from "openai";
+import { sendWelcomeEmail } from "./email/welcomeEmail.js";
+import { sendReaffiliationPendingEmail } from "./email/reaffiliationPendingEmail.js";
+import { sendReaffiliationApprovedEmail } from "./email/reaffiliationApprovedEmail.js";
+import {
+  decidirCorreoAprobada,
+  decidirCorreoPendiente,
+  emailValidoReafiliacion,
+  esSolicitudPendienteValida,
+  esSolicitudAprobadaValida,
+  normalizarEstadoReafiliacion,
+  solicitudIdDesdeFecha,
+} from "./email/reaffiliationPendingSupport.js";
 import { GoogleAuth } from "google-auth-library";
 import { Storage } from "@google-cloud/storage";
 import QRCode from "qrcode";
@@ -35,11 +47,20 @@ import {
   esSegmentoValido,
   obtenerSegmento,
 } from "./certificados/segmentos.js";
+import {
+  decodificarUsuarioIdDesdeDocumentEvent,
+  decodificarDniDesdeCounterEvent,
+  FIRESTORE_UPDATED_EVENT_TYPE,
+  validarTipoCloudEvent,
+  validarTipoCloudEventEsperado,
+} from "./events/firestoreDocumentEvent.js";
+import { resolverNumeroAfiliacionHistorico } from "./reafiliacion/historicAffiliationNumber.js";
 
 const app = express();
 const PORT = Number(process.env.PORT || 8080);
 const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 15000);
 const WEBHOOK_MAX_AGE_MS = Number(process.env.MP_WEBHOOK_MAX_AGE_MS || 5 * 60 * 1000);
+const ENABLE_WELCOME_EVENTARC = process.env.ENABLE_WELCOME_EVENTARC === "true";
 
 type MercadoPagoEnvironment = "test" | "production";
 type PagoTipo = "cuota_adherente" | "orden_administrativa";
@@ -177,6 +198,23 @@ const firebaseBootstrapSchema = z.object({
       /^[A-Za-z0-9:_-]{1,128}$/,
       "El identificador del usuario es inválido."
     ),
+});
+
+const solicitudReafiliacionSchema = z.strictObject({
+  dni: z.string().trim().min(5).max(20),
+  nombre: z.string().trim().min(1).max(120),
+  apellido: z.string().trim().min(1).max(120),
+  email: z.string().trim().email().max(180),
+  celular: z.string().trim().min(5).max(40),
+  tituloGrado: z.string().trim().min(1).max(180),
+  departamento: z.string().trim().min(1).max(120),
+  establecimientos: z.string().trim().min(1).max(500),
+  descuento: z.string().trim().min(1).max(20),
+});
+type SolicitudReafiliacion = z.infer<typeof solicitudReafiliacionSchema>;
+
+const rechazarReafiliacionSchema = z.strictObject({
+  observacion: z.string().trim().min(3).max(1000),
 });
 
 type FirestoreDocument = {
@@ -1364,6 +1402,48 @@ async function findDocsByDni(collectionId: "usuarios" | "nuevoAfiliado", dni: st
   return [...merged.values()];
 }
 
+async function findUsuariosEquivalentesPorDni(dni: string): Promise<FirestoreRecord[]> {
+  const encontrados = new Map<string, FirestoreRecord>();
+  for (const usuario of await findDocsByDni("usuarios", dni)) {
+    encontrados.set(String(usuario.path || usuario.id || ""), usuario);
+  }
+
+  const usuarioPorId = await getFirestoreDoc(`usuarios/${dni}`);
+  if (usuarioPorId) {
+    encontrados.set(String(usuarioPorId.path || usuarioPorId.id || ""), usuarioPorId);
+  }
+
+  return [...encontrados.values()];
+}
+
+function normalizarEstadoAfiliacion(valor: unknown): string {
+  return String(valor ?? "")
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+}
+
+function tieneBajaHistorica(counter: FirestoreRecord | null): boolean {
+  return (
+    counter?.tieneBajaHistorica === true ||
+    Boolean(counter?.fechaUltimaBaja) ||
+    (Array.isArray(counter?.fechasBaja) && counter.fechasBaja.length > 0)
+  );
+}
+
+function clasificarEstadoSindicalParaReafiliacion(
+  usuario: FirestoreRecord
+): "activo" | "exafiliado" | "legacy" {
+  if (usuario.afiliadoActivo === true) return "activo";
+  if (usuario.afiliadoActivo === false) return "exafiliado";
+
+  const estado = normalizarEstadoAfiliacion(usuario.estadoAfiliacion);
+  if (estado === "activo" || estado === "alta") return "activo";
+  if (estado === "baja" || estado === "inactivo") return "exafiliado";
+  return "legacy";
+}
+
 function buildNombreAfiliado(doc: FirestoreRecord): string {
   const apellidoNombre = String(
     doc.apellidoNombre || doc.apellido_y_nombre || doc.apellidoYNombre || ""
@@ -1422,6 +1502,641 @@ async function getAfiliadoDocs(dni: string) {
     nuevoAfiliado,
     afiliadoNombre: buildNombreAfiliado(source),
   };
+}
+
+function errorReafiliacion(
+  code: string,
+  message: string,
+  statusCode = 409
+): Error {
+  return Object.assign(new Error(message), { code, statusCode });
+}
+
+async function registrarSolicitudReafiliacion(
+  solicitud: SolicitudReafiliacion
+): Promise<{ code: "REAFILIACION_CREADA" }> {
+  const dni = assertValidDni(normalizeDni(solicitud.dni));
+  const usuarios = await findUsuariosEquivalentesPorDni(dni);
+
+  if (usuarios.length === 0) {
+    throw errorReafiliacion(
+      "AFILIADO_NO_ENCONTRADO",
+      "No se encontró una persona histórica para el DNI indicado."
+    );
+  }
+
+  if (usuarios.length > 1) {
+    throw errorReafiliacion(
+      "DNI_USUARIOS_DUPLICADOS",
+      "No pudimos validar tu situación de afiliación. Comunicate con SiDCa para continuar."
+    );
+  }
+
+  const usuario = usuarios[0];
+  const clasificacion = clasificarEstadoSindicalParaReafiliacion(usuario);
+  if (clasificacion !== "exafiliado") {
+    throw errorReafiliacion(
+      "AFILIADO_ACTIVO",
+      "Ya existe un afiliado con este DNI."
+    );
+  }
+
+  const counterPath = `nuevoAfiliado_counters/${dni}`;
+  const counterInicial = await getFirestoreDoc(counterPath);
+  if (!tieneBajaHistorica(counterInicial)) {
+    throw errorReafiliacion(
+      "ESTADO_AFILIACION_INCONSISTENTE",
+      "No pudimos validar tu situación de afiliación. Comunicate con SiDCa para continuar."
+    );
+  }
+
+  const usuarioPath = getFirestoreRelativePath(usuario);
+  const datosSolicitud = {
+    nombre: solicitud.nombre,
+    apellido: solicitud.apellido,
+    email: solicitud.email,
+    celular: solicitud.celular,
+    tituloGrado: solicitud.tituloGrado,
+    departamento: solicitud.departamento,
+    establecimientos: solicitud.establecimientos,
+    descuento: solicitud.descuento,
+  };
+
+  for (let intento = 0; intento < 2; intento += 1) {
+    const transaction = await beginFirestoreTransaction();
+    let confirmar = false;
+
+    try {
+      const [usuarioTx, counterTx] = await Promise.all([
+        getFirestoreDocInTransaction(usuarioPath, transaction),
+        getFirestoreDocInTransaction(counterPath, transaction),
+      ]);
+
+      if (!usuarioTx || !counterTx) {
+        throw errorReafiliacion(
+          "ESTADO_AFILIACION_INCONSISTENTE",
+          "No pudimos validar tu situación de afiliación. Comunicate con SiDCa para continuar."
+        );
+      }
+
+      const clasificacionTx = clasificarEstadoSindicalParaReafiliacion(usuarioTx);
+      if (clasificacionTx === "activo" || clasificacionTx === "legacy") {
+        throw errorReafiliacion(
+          "AFILIADO_ACTIVO",
+          "Ya existe un afiliado con este DNI."
+        );
+      }
+
+      if (!tieneBajaHistorica(counterTx)) {
+        throw errorReafiliacion(
+          "ESTADO_AFILIACION_INCONSISTENTE",
+          "No pudimos validar tu situación de afiliación. Comunicate con SiDCa para continuar."
+        );
+      }
+
+      if (normalizarEstadoAfiliacion(counterTx.estadoReafiliacion) === "pendiente") {
+        throw errorReafiliacion(
+          "REAFILIACION_PENDIENTE",
+          "Ya contamos con una solicitud de reafiliación pendiente para este DNI."
+        );
+      }
+
+      await firestoreRequest(`${firestoreBaseUrl}:commit`, {
+        method: "POST",
+        body: JSON.stringify({
+          transaction,
+          writes: [
+            {
+              update: {
+                name: rutaDocumentoFirestore(counterPath),
+                fields: jsToFirestoreFields({
+                  estadoReafiliacion: "pendiente",
+                  requiereRevisionComision: true,
+                  usuarioIdHistorico: getDocumentoId(usuarioPath),
+                  datosSolicitudReafiliacion: datosSolicitud,
+                }),
+              },
+              updateMask: {
+                fieldPaths: [
+                  "estadoReafiliacion",
+                  "requiereRevisionComision",
+                  "usuarioIdHistorico",
+                  "datosSolicitudReafiliacion",
+                  "updatedAt",
+                  "fechaSolicitudReafiliacion",
+                ],
+              },
+              updateTransforms: [
+                { fieldPath: "fechaSolicitudReafiliacion", setToServerValue: "REQUEST_TIME" },
+                { fieldPath: "updatedAt", setToServerValue: "REQUEST_TIME" },
+              ],
+            },
+          ],
+        }),
+      });
+      confirmar = true;
+      return { code: "REAFILIACION_CREADA" };
+    } catch (error: any) {
+      if (esConflictoTransaccionFirestore(error) && intento === 0) continue;
+      throw error;
+    } finally {
+      if (!confirmar) await rollbackFirestoreTransaction(transaction);
+    }
+  }
+
+  throw errorReafiliacion(
+    "ESTADO_AFILIACION_INCONSISTENTE",
+    "No pudimos validar tu situación de afiliación. Comunicate con SiDCa para continuar."
+  );
+}
+
+const CAMPOS_SOLICITUD_REAFILIACION = [
+  "nombre",
+  "apellido",
+  "email",
+  "celular",
+  "departamento",
+  "establecimientos",
+  "tituloGrado",
+  "descuento",
+] as const;
+
+function datosSolicitudReafiliacionValidos(
+  solicitud: FirestoreRecord
+): Record<string, string> {
+  return Object.fromEntries(
+    CAMPOS_SOLICITUD_REAFILIACION.flatMap((campo) => {
+      const valor = String(solicitud?.[campo] ?? "").trim();
+      return valor ? [[campo, valor]] : [];
+    })
+  );
+}
+
+function nombreFechaAfiliacion(): string {
+  const ahora = new Date();
+  const fecha = ahora.toLocaleDateString();
+  const hora = ahora.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return `${fecha} ${hora}`;
+}
+
+function generarIdDocumentoFirestore(): string {
+  const caracteres = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  return Array.from(crypto.randomBytes(20), (byte) => caracteres[byte % caracteres.length]).join("");
+}
+
+async function queryFirestoreCollectionInTransaction(
+  collectionId: string,
+  filters: Array<{ field: string; op?: string; value: any }>,
+  transaction: string,
+  limit = 50
+): Promise<FirestoreRecord[]> {
+  const where =
+    filters.length === 0
+      ? undefined
+      : filters.length === 1
+      ? makeFieldFilter(filters[0].field, filters[0].op || "EQUAL", filters[0].value)
+      : {
+          compositeFilter: {
+            op: "AND",
+            filters: filters.map((filter) =>
+              makeFieldFilter(filter.field, filter.op || "EQUAL", filter.value)
+            ),
+          },
+        };
+
+  const result = await firestoreRequest<Array<{ document?: FirestoreDocument }>>(
+    `${firestoreBaseUrl}:runQuery`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        structuredQuery: {
+          from: [{ collectionId }],
+          ...(where ? { where } : {}),
+          limit,
+        },
+        transaction,
+      }),
+    }
+  );
+
+  return (result || [])
+    .map((row) => row.document)
+    .filter((doc): doc is FirestoreDocument => Boolean(doc))
+    .map((doc) => firestoreDocToJs(doc));
+}
+
+async function findNuevoAfiliadosByDniInTransaction(
+  dni: string,
+  transaction: string
+): Promise<FirestoreRecord[]> {
+  const numericDni = Number(dni);
+  const consultas = [
+    queryFirestoreCollectionInTransaction(
+      "nuevoAfiliado",
+      [{ field: "dni", value: dni }],
+      transaction,
+      1000
+    ),
+  ];
+  if (Number.isFinite(numericDni)) {
+    consultas.push(
+      queryFirestoreCollectionInTransaction(
+        "nuevoAfiliado",
+        [{ field: "dni", value: numericDni }],
+        transaction,
+        1000
+      )
+    );
+  }
+
+  const encontrados = new Map<string, FirestoreRecord>();
+  for (const documento of (await Promise.all(consultas)).flat()) {
+    if (normalizeDni(documento.dni) === dni) {
+      encontrados.set(String(documento.path || documento.id), documento);
+    }
+  }
+  return [...encontrados.values()];
+}
+
+async function findNuevoAfiliadosByUsuarioIdInTransaction(
+  usuarioId: string,
+  transaction: string
+): Promise<FirestoreRecord[]> {
+  const encontrados = await queryFirestoreCollectionInTransaction(
+    "nuevoAfiliado",
+    [{ field: "usuarioId", value: usuarioId }],
+    transaction,
+    1000
+  );
+  return encontrados.filter((documento) => String(documento.usuarioId || "").trim() === usuarioId);
+}
+
+function actualizarConTransformaciones(
+  path: string,
+  data: Record<string, any>,
+  transformFields: string[]
+) {
+  return {
+    update: {
+      name: rutaDocumentoFirestore(path),
+      fields: jsToFirestoreFields(data),
+    },
+    updateMask: {
+      fieldPaths: [...Object.keys(data), ...transformFields],
+    },
+    ...(transformFields.length
+      ? {
+          updateTransforms: transformFields.map((fieldPath) => ({
+            fieldPath,
+            setToServerValue: "REQUEST_TIME",
+          })),
+        }
+      : {}),
+  };
+}
+
+async function aprobarReafiliacionAtomica(
+  dni: string,
+  authUser: AuthenticatedUser
+) {
+  const counterPath = `nuevoAfiliado_counters/${dni}`;
+  const lockPath = `usuarios_dni/${dni}`;
+
+  for (let intento = 0; intento < 2; intento += 1) {
+    const transaction = await beginFirestoreTransaction();
+    let confirmar = false;
+
+    try {
+      const counter = await getFirestoreDocInTransaction(counterPath, transaction);
+      if (!counter) {
+        throw Object.assign(new Error("No existe la solicitud de reafiliación."), { statusCode: 404 });
+      }
+
+      const estado = normalizarEstadoAfiliacion(counter.estadoReafiliacion);
+      if (estado === "aprobada") {
+        return {
+          alreadyProcessed: true,
+          estadoReafiliacion: "aprobada",
+          usuarioIdHistorico: String(counter.usuarioIdHistorico || ""),
+          nroAfiliacion: counter.nroAfiliacionReafiliacion ?? null,
+          nuevoAfiliadoId: counter.nuevoAfiliadoIdReafiliacion ?? null,
+        };
+      }
+
+      if (estado === "rechazada") {
+        throw Object.assign(
+          new Error("La solicitud fue rechazada. Debe existir una nueva solicitud antes de aprobarla."),
+          { statusCode: 409 }
+        );
+      }
+
+      if (estado !== "pendiente" || counter.requiereRevisionComision !== true) {
+        throw Object.assign(new Error("La solicitud de reafiliación no está pendiente de revisión."), { statusCode: 409 });
+      }
+
+      const usuarioIdHistorico = String(counter.usuarioIdHistorico || "").trim();
+      if (!usuarioIdHistorico) {
+        throw Object.assign(new Error("La solicitud no tiene usuario histórico asociado."), { statusCode: 409 });
+      }
+
+      const usuarioPath = `usuarios/${usuarioIdHistorico}`;
+      const [usuario, lock] = await Promise.all([
+        getFirestoreDocInTransaction(usuarioPath, transaction),
+        getFirestoreDocInTransaction(lockPath, transaction),
+      ]);
+
+      if (!usuario) {
+        throw Object.assign(new Error("No existe el usuario histórico de la solicitud."), { statusCode: 404 });
+      }
+
+      if (normalizeDni(usuario.dni) !== dni) {
+        throw Object.assign(new Error("El DNI del usuario histórico no coincide con la solicitud."), { statusCode: 409 });
+      }
+
+      if (usuario.afiliadoActivo === true || normalizarEstadoAfiliacion(usuario.estadoAfiliacion) === "activo") {
+        throw Object.assign(new Error("El usuario histórico ya figura como afiliado activo."), { statusCode: 409 });
+      }
+
+      if (lock) {
+        const lockUsuarioId = String(lock.usuarioId || "").trim();
+        if (lockUsuarioId && lockUsuarioId !== usuarioIdHistorico) {
+          throw Object.assign(new Error("El DNI ya está vinculado a otro usuario."), { statusCode: 409 });
+        }
+      }
+
+      const datosSolicitud = datosSolicitudReafiliacionValidos(counter.datosSolicitudReafiliacion || {});
+      const [nuevoAfiliadosPorUsuarioId, nuevoAfiliadosPorDni] = await Promise.all([
+        findNuevoAfiliadosByUsuarioIdInTransaction(usuarioIdHistorico, transaction),
+        findNuevoAfiliadosByDniInTransaction(dni, transaction),
+      ]);
+      const resolucionNumero = resolverNumeroAfiliacionHistorico({
+        usuario,
+        counter,
+        usuarioIdHistorico,
+        dni,
+        nuevoAfiliadosPorUsuarioId,
+        nuevoAfiliadosPorDni,
+      });
+      const nroAfiliacionHistorico = resolucionNumero.nroAfiliacion;
+      const nuevoAfiliadoExistente = resolucionNumero.documento;
+
+      const usuarioActualizado: FirestoreRecord = {
+        ...Object.fromEntries(
+          Object.entries(usuario).filter(([campo]) => !["id", "path", "_name"].includes(campo))
+        ),
+        ...datosSolicitud,
+        afiliadoActivo: true,
+        estadoAfiliacion: "activo",
+        esReafiliado: true,
+        nroAfiliacion: nroAfiliacionHistorico,
+        usuarioId: usuarioIdHistorico,
+      };
+      const usuarioPatch = {
+        ...datosSolicitud,
+        afiliadoActivo: true,
+        estadoAfiliacion: "activo",
+        esReafiliado: true,
+        nroAfiliacion: nroAfiliacionHistorico,
+        usuarioId: usuarioIdHistorico,
+      };
+      const fecha = nombreFechaAfiliacion();
+      const nuevoAfiliadoRef = nuevoAfiliadoExistente?.path
+        ? getFirestoreRelativePath(nuevoAfiliadoExistente.path)
+        : `nuevoAfiliado/${generarIdDocumentoFirestore()}`;
+      const nuevoAfiliadoId = nuevoAfiliadoRef.split("/").pop() as string;
+      const nuevoAfiliado = {
+        nombre: String(usuarioActualizado.nombre || "").trim(),
+        apellido: String(usuarioActualizado.apellido || "").trim(),
+        dni,
+        email: String(usuarioActualizado.email || "").trim(),
+        celular: String(usuarioActualizado.celular || "").trim(),
+        tituloGrado: String(usuarioActualizado.tituloGrado || "").trim(),
+        departamento: String(usuarioActualizado.departamento || "").trim(),
+        establecimientos: String(usuarioActualizado.establecimientos || "").trim(),
+        descuento: String(usuarioActualizado.descuento || "").trim(),
+        fecha,
+        usuarioId: usuarioIdHistorico,
+        nroAfiliacion: nroAfiliacionHistorico,
+        esReafiliacion: true,
+      };
+      const writes: any[] = [
+        actualizarConTransformaciones(
+          usuarioPath,
+          usuarioPatch,
+          ["fechaUltimaReafiliacion", "updatedAt"]
+        ),
+        {
+          update: {
+            name: rutaDocumentoFirestore(nuevoAfiliadoRef),
+            fields: jsToFirestoreFields(nuevoAfiliado),
+          },
+          ...(nuevoAfiliadoExistente
+            ? {
+                updateMask: {
+                  fieldPaths: Object.keys(nuevoAfiliado),
+                },
+              }
+            : {
+                currentDocument: { exists: false },
+                updateTransforms: [
+                  { fieldPath: "fechaServer", setToServerValue: "REQUEST_TIME" },
+                ],
+              }),
+        },
+        actualizarConTransformaciones(
+          counterPath,
+          {
+            estadoReafiliacion: "aprobada",
+            requiereRevisionComision: false,
+            nroAfiliacionHistorico: nroAfiliacionHistorico,
+            nroAfiliacionReafiliacion: nroAfiliacionHistorico,
+            nuevoAfiliadoIdReafiliacion: nuevoAfiliadoId,
+            resueltoPorUid: authUser.uid,
+            ...(authUser.email ? { resueltoPorEmail: authUser.email } : {}),
+          },
+          ["fechaResolucionReafiliacion", "updatedAt"]
+        ),
+      ];
+
+      if (lock) {
+        writes.push({
+          update: {
+            name: rutaDocumentoFirestore(lockPath),
+            fields: jsToFirestoreFields({ dni, usuarioId: usuarioIdHistorico }),
+          },
+          updateMask: { fieldPaths: ["dni", "usuarioId"] },
+        });
+      } else {
+        writes.push({
+          update: {
+            name: rutaDocumentoFirestore(lockPath),
+            fields: jsToFirestoreFields({ dni, usuarioId: usuarioIdHistorico }),
+          },
+          updateTransforms: [{ fieldPath: "createdAt", setToServerValue: "REQUEST_TIME" }],
+        });
+      }
+
+      if (usuario.adherente === true) {
+        const numericDni = Number(dni);
+        const consultasAdherentes = [
+          queryFirestoreCollectionInTransaction(
+            "adherentes",
+            [{ field: "dni", value: dni }],
+            transaction,
+            1000
+          ),
+        ];
+        if (Number.isFinite(numericDni)) {
+          consultasAdherentes.push(
+            queryFirestoreCollectionInTransaction(
+              "adherentes",
+              [{ field: "dni", value: numericDni }],
+              transaction,
+              1000
+            )
+          );
+        }
+        const adherenteCanonico = await getFirestoreDocInTransaction(
+          `adherentes/${usuarioIdHistorico}`,
+          transaction
+        );
+        const adherentesPorDni = (await Promise.all(consultasAdherentes)).flat();
+        const adherentes = new Map<string, FirestoreRecord>();
+        for (const documento of [adherenteCanonico, ...adherentesPorDni]) {
+          if (documento && (documento === adherenteCanonico || normalizeDni(documento.dni) === dni)) {
+            adherentes.set(String(documento.path || documento.id), documento);
+          }
+        }
+        const adherentesEncontrados = [...adherentes.values()];
+        const adherentesConOtraIdentidad = adherentesEncontrados.filter((documento) => {
+          const referencias = [documento.usuarioId, documento.userId, documento.uid]
+            .map((valor) => String(valor || "").trim())
+            .filter(Boolean);
+          return referencias.length > 0
+            ? !referencias.includes(usuarioIdHistorico)
+            : String(documento.id || "").trim() !== usuarioIdHistorico;
+        });
+        if (adherentesConOtraIdentidad.length > 0) {
+          throw Object.assign(
+            new Error("La representación adherente pertenece a otra persona."),
+            { statusCode: 409 }
+          );
+        }
+
+        const adherenteExistente = adherentesEncontrados.find(
+          (documento) => String(documento.id || "").trim() === usuarioIdHistorico
+        ) || adherentesEncontrados[0] || null;
+        const adherenteId = usuarioIdHistorico;
+        const adherentePath = adherenteExistente?.path
+          ? getFirestoreRelativePath(adherenteExistente.path)
+          : `adherentes/${adherenteId}`;
+        const espejo = {
+          apellido: nuevoAfiliado.apellido,
+          nombre: nuevoAfiliado.nombre,
+          dni,
+          nroAfiliacion: nroAfiliacionHistorico,
+          tituloGrado: nuevoAfiliado.tituloGrado,
+          descuento: nuevoAfiliado.descuento,
+          departamento: nuevoAfiliado.departamento,
+          establecimientos: nuevoAfiliado.establecimientos,
+          celular: nuevoAfiliado.celular,
+          email: nuevoAfiliado.email,
+          observaciones: String(usuarioActualizado.observaciones || ""),
+          adherente: true,
+        };
+        writes.push({
+          update: {
+            name: rutaDocumentoFirestore(adherentePath),
+            fields: jsToFirestoreFields(espejo),
+          },
+          ...(adherenteExistente
+            ? { updateMask: { fieldPaths: Object.keys(espejo) } }
+            : { currentDocument: { exists: false } }),
+        });
+        adherentesEncontrados
+          .filter((doc) => {
+            const ruta = doc.path ? getFirestoreRelativePath(doc.path) : "";
+            return ruta && ruta !== adherentePath && !adherentesConOtraIdentidad.includes(doc);
+          })
+          .forEach((doc) => writes.push({ delete: rutaDocumentoFirestore(String(doc.path)) }));
+      }
+
+      await firestoreRequest(`${firestoreBaseUrl}:commit`, {
+        method: "POST",
+        body: JSON.stringify({ transaction, writes }),
+      });
+      confirmar = true;
+      return {
+        alreadyProcessed: false,
+        estadoReafiliacion: "aprobada",
+        usuarioIdHistorico,
+        nroAfiliacion: nroAfiliacionHistorico,
+        nuevoAfiliadoId,
+      };
+    } catch (error: any) {
+      if (esConflictoTransaccionFirestore(error) && intento === 0) continue;
+      throw error;
+    } finally {
+      if (!confirmar) await rollbackFirestoreTransaction(transaction);
+    }
+  }
+
+  throw new Error("No se pudo aprobar la reafiliación.");
+}
+
+async function rechazarReafiliacionAtomica(
+  dni: string,
+  observacion: string,
+  authUser: AuthenticatedUser
+) {
+  const counterPath = `nuevoAfiliado_counters/${dni}`;
+
+  for (let intento = 0; intento < 2; intento += 1) {
+    const transaction = await beginFirestoreTransaction();
+    let confirmar = false;
+
+    try {
+      const counter = await getFirestoreDocInTransaction(counterPath, transaction);
+      if (!counter) {
+        throw Object.assign(new Error("No existe la solicitud de reafiliación."), { statusCode: 404 });
+      }
+
+      const estado = normalizarEstadoAfiliacion(counter.estadoReafiliacion);
+      if (estado === "rechazada") {
+        return { alreadyProcessed: true, estadoReafiliacion: "rechazada" };
+      }
+      if (estado === "aprobada") {
+        throw Object.assign(new Error("La reafiliación ya fue aprobada y no puede revertirse desde este endpoint."), { statusCode: 409 });
+      }
+      if (estado !== "pendiente" || counter.requiereRevisionComision !== true) {
+        throw Object.assign(new Error("La solicitud de reafiliación no está pendiente de revisión."), { statusCode: 409 });
+      }
+
+      const cambios = {
+        estadoReafiliacion: "rechazada",
+        requiereRevisionComision: false,
+        observacionResolucion: observacion,
+        resueltoPorUid: authUser.uid,
+        ...(authUser.email ? { resueltoPorEmail: authUser.email } : {}),
+      };
+      await firestoreRequest(`${firestoreBaseUrl}:commit`, {
+        method: "POST",
+        body: JSON.stringify({
+          transaction,
+          writes: [actualizarConTransformaciones(counterPath, cambios, ["fechaResolucionReafiliacion", "updatedAt"])],
+        }),
+      });
+      confirmar = true;
+      return { alreadyProcessed: false, estadoReafiliacion: "rechazada" };
+    } catch (error: any) {
+      if (esConflictoTransaccionFirestore(error) && intento === 0) continue;
+      throw error;
+    } finally {
+      if (!confirmar) await rollbackFirestoreTransaction(transaction);
+    }
+  }
+
+  throw new Error("No se pudo rechazar la reafiliación.");
 }
 
 async function getCuotaAdherenteConfig(): Promise<CuotaAdherenteConfig> {
@@ -1879,6 +2594,11 @@ const certificadosAppRateLimit = createRateLimit({
   windowMs: 60_000,
   max: 30,
   message: "Demasiadas consultas de certificados. Esperá un minuto.",
+});
+const reafiliacionRateLimit = createRateLimit({
+  windowMs: 60_000,
+  max: 5,
+  message: "Demasiadas solicitudes de reafiliación. Esperá un minuto.",
 });
 
 app.disable("x-powered-by");
@@ -4149,6 +4869,590 @@ function esAprobadoDisponibleParaRegistro(participante: ParticipanteAprobado) {
   );
 }
 
+const BIENVENIDA_PROCESANDO_MAX_AGE_MS = 15 * 60 * 1000;
+
+function emailValidoParaBienvenida(value: unknown): value is string {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || "").trim());
+}
+
+function errorBienvenidaCorto(error: unknown): string {
+  return String((error as any)?.message || "No se pudo enviar el correo de bienvenida.")
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 240) || "No se pudo enviar el correo de bienvenida.";
+}
+
+function afiliacionValidaParaBienvenida(usuario: FirestoreRecord): boolean {
+  if (usuario.esReafiliado === true) return false;
+  if (usuario.afiliadoActivo === false) return false;
+  const estado = normalizarEstadoAfiliacion(usuario.estadoAfiliacion);
+  return estado !== "baja" && estado !== "inactivo";
+}
+
+async function actualizarDocumentoConTransformaciones(
+  path: string,
+  data: Record<string, any>,
+  transformFields: string[]
+): Promise<void> {
+  await firestoreRequest(`${firestoreBaseUrl}:commit`, {
+    method: "POST",
+    body: JSON.stringify({
+      writes: [actualizarConTransformaciones(path, data, transformFields)],
+    }),
+  });
+}
+
+type ReservaCorreoBienvenida =
+  | { estado: "reservado"; usuario: FirestoreRecord }
+  | { estado: "enviado" }
+  | { estado: "procesando" };
+
+type VerificacionPrimeraAfiliacion =
+  | { ok: true; usuario: FirestoreRecord; dni: string }
+  | { ok: false; motivo: string; reintentar: boolean };
+
+async function esperarReintentoBienvenida(milisegundos: number): Promise<void> {
+  await new Promise<void>((resolve) => setTimeout(resolve, milisegundos));
+}
+
+/**
+ * Confirma que el documento creado corresponde a un alta nueva y no a una
+ * reafiliación. La APP escribe los tres documentos en una misma transacción;
+ * los reintentos breves cubren únicamente una eventual lectura demasiado
+ * temprana del evento. Si no se puede probar la relación positiva, no se envía.
+ */
+async function verificarPrimeraAfiliacion(
+  usuarioId: string
+): Promise<VerificacionPrimeraAfiliacion> {
+  const esperas = [0, 250, 750];
+
+  for (let intento = 0; intento < esperas.length; intento += 1) {
+    if (esperas[intento] > 0) await esperarReintentoBienvenida(esperas[intento]);
+
+    const usuario = await getFirestoreDoc(`usuarios/${usuarioId}`);
+    if (!usuario) continue;
+
+    if (!afiliacionValidaParaBienvenida(usuario)) {
+      return { ok: false, motivo: "afiliacion_no_corresponde", reintentar: false };
+    }
+
+    const dni = normalizeDni(usuario.dni || usuario.DNI || usuario.documento);
+    if (!/^\d{6,9}$/.test(dni)) {
+      return { ok: false, motivo: "dni_no_valido", reintentar: false };
+    }
+
+    const [lock, eventos] = await Promise.all([
+      getFirestoreDoc(`usuarios_dni/${dni}`),
+      queryFirestoreCollection("nuevoAfiliado", [{ field: "usuarioId", value: usuarioId }], 20),
+    ]);
+
+    const lockUsuarioId = String(lock?.usuarioId || "").trim();
+    if (lockUsuarioId && lockUsuarioId !== usuarioId) {
+      return { ok: false, motivo: "lock_usuario_diferente", reintentar: false };
+    }
+
+    const eventosUsuario = eventos.filter(
+      (evento) => String(evento.usuarioId || "").trim() === usuarioId
+    );
+    if (eventosUsuario.some((evento) => evento.esReafiliacion === true)) {
+      return { ok: false, motivo: "reafiliacion", reintentar: false };
+    }
+
+    const eventoCompatible = eventosUsuario.find(
+      (evento) =>
+        normalizeDni(evento.dni) === dni &&
+        evento.esReafiliacion !== true
+    );
+
+    if (lockUsuarioId === usuarioId && eventoCompatible) {
+      return { ok: true, usuario, dni };
+    }
+
+    if (lockUsuarioId === usuarioId && eventosUsuario.length > 0) {
+      return { ok: false, motivo: "evento_nuevo_afiliado_incompatible", reintentar: false };
+    }
+  }
+
+  return {
+    ok: false,
+    motivo: "dependencias_primera_afiliacion_no_confirmadas",
+    reintentar: true,
+  };
+}
+
+async function reservarCorreoBienvenida(usuarioId: string): Promise<ReservaCorreoBienvenida> {
+  const usuarioPath = `usuarios/${usuarioId}`;
+
+  for (let intento = 0; intento < 2; intento += 1) {
+    const transaction = await beginFirestoreTransaction();
+    let confirmar = false;
+
+    try {
+      const usuario = await getFirestoreDocInTransaction(usuarioPath, transaction);
+      if (!usuario) {
+        throw Object.assign(new Error("No existe el usuario indicado."), { statusCode: 404 });
+      }
+
+      if (usuario.correoBienvenidaEstado === "enviado") {
+        return { estado: "enviado" };
+      }
+
+      if (usuario.correoBienvenidaEstado === "procesando") {
+        const reservadoEn = new Date(String(usuario.correoBienvenidaProcesandoAt || "")).getTime();
+        if (Number.isFinite(reservadoEn) && Date.now() - reservadoEn < BIENVENIDA_PROCESANDO_MAX_AGE_MS) {
+          return { estado: "procesando" };
+        }
+      }
+
+      if (!afiliacionValidaParaBienvenida(usuario)) {
+        throw Object.assign(new Error("La bienvenida sólo corresponde a una primera afiliación activa."), {
+          statusCode: 409,
+          code: "AFILIACION_NO_VALIDA_BIENVENIDA",
+        });
+      }
+
+      const email = String(usuario.email || usuario.correo || "").trim();
+      if (!emailValidoParaBienvenida(email)) {
+        throw Object.assign(new Error("El usuario no tiene un correo electrónico válido."), {
+          statusCode: 422,
+          code: "EMAIL_NO_VALIDO",
+        });
+      }
+
+      const dni = normalizeDni(usuario.dni || usuario.DNI || usuario.documento);
+      if (!/^\d{6,9}$/.test(dni)) {
+        throw Object.assign(new Error("El usuario no tiene un DNI válido."), {
+          statusCode: 422,
+          code: "DNI_NO_VALIDO",
+        });
+      }
+
+      await firestoreRequest(`${firestoreBaseUrl}:commit`, {
+        method: "POST",
+        body: JSON.stringify({
+          transaction,
+          writes: [
+            actualizarConTransformaciones(
+              usuarioPath,
+              {
+                correoBienvenidaEstado: "procesando",
+                correoBienvenidaUltimoError: null,
+              },
+              ["correoBienvenidaProcesandoAt", "updatedAt"]
+            ),
+          ],
+        }),
+      });
+      confirmar = true;
+      return { estado: "reservado", usuario: { ...usuario, email, dni } };
+    } catch (error: any) {
+      if (esConflictoTransaccionFirestore(error) && intento === 0) continue;
+      throw error;
+    } finally {
+      if (!confirmar) await rollbackFirestoreTransaction(transaction);
+    }
+  }
+
+  throw new Error("No se pudo reservar el correo de bienvenida.");
+}
+
+type ResultadoCorreoBienvenida =
+  | { estado: "enviado" }
+  | { estado: "ya_enviado" }
+  | { estado: "procesando" }
+  | { estado: "omitido"; motivo: string }
+  | { estado: "reintentar"; motivo: string };
+
+/** Punto único de dominio para eventos de alta y pruebas internas. */
+async function procesarCorreoBienvenida(usuarioId: string): Promise<ResultadoCorreoBienvenida> {
+  const verificacion = await verificarPrimeraAfiliacion(usuarioId);
+  if (!verificacion.ok) {
+    return verificacion.reintentar
+      ? { estado: "reintentar", motivo: verificacion.motivo }
+      : { estado: "omitido", motivo: verificacion.motivo };
+  }
+
+  const reserva = await reservarCorreoBienvenida(usuarioId);
+  if (reserva.estado === "enviado") return { estado: "ya_enviado" };
+  if (reserva.estado === "procesando") return { estado: "procesando" };
+
+  try {
+    const proveedorId = await sendWelcomeEmail({
+      usuarioId,
+      email: String(reserva.usuario.email),
+      nombre: buildNombreAfiliado(reserva.usuario),
+      dni: String(reserva.usuario.dni),
+    });
+
+    await actualizarDocumentoConTransformaciones(
+      `usuarios/${usuarioId}`,
+      {
+        correoBienvenidaEstado: "enviado",
+        correoBienvenidaIdProveedor: proveedorId,
+        correoBienvenidaUltimoError: null,
+      },
+      ["correoBienvenidaEnviadoAt", "updatedAt"]
+    );
+
+    return { estado: "enviado" };
+  } catch (error: any) {
+    const mensaje = errorBienvenidaCorto(error);
+    try {
+      await actualizarDocumentoConTransformaciones(
+        `usuarios/${usuarioId}`,
+        {
+          correoBienvenidaEstado: "error",
+          correoBienvenidaUltimoError: mensaje,
+        },
+        ["correoBienvenidaUltimoErrorAt", "updatedAt"]
+      );
+    } catch (persistError: any) {
+      console.error("[sidca-email] No se pudo guardar el estado de error:", {
+        usuarioId,
+        message: errorBienvenidaCorto(persistError),
+      });
+    }
+
+    throw Object.assign(new Error("No se pudo enviar el correo de bienvenida."), {
+      statusCode: 503,
+      code: "WELCOME_EMAIL_TRANSIENT",
+      cause: error,
+    });
+  }
+}
+
+type ResultadoCorreoReafiliacionPendiente =
+  | { estado: "enviado" }
+  | { estado: "ya_enviado" }
+  | { estado: "procesando" }
+  | { estado: "omitido"; motivo: string }
+  | { estado: "reintentar"; motivo: string };
+
+type ReservaCorreoReafiliacionPendiente =
+  | { estado: "reservado"; datos: ReaffiliationPendingData }
+  | { estado: "ya_enviado" }
+  | { estado: "procesando" }
+  | { estado: "omitido"; motivo: string };
+
+type ReaffiliationPendingData = {
+  dni: string;
+  nombre: string;
+  email: string;
+  fechaSolicitud: string;
+  nroAfiliacion?: string | number | null;
+  solicitudId: string;
+};
+
+function fechaSolicitudArgentina(value: unknown): string | null {
+  const fecha = new Date(String(value ?? ""));
+  if (!Number.isFinite(fecha.getTime())) return null;
+  const parts = new Intl.DateTimeFormat("es-AR", {
+    timeZone: "America/Argentina/Buenos_Aires",
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(fecha);
+  const part = (type: string) => parts.find((item) => item.type === type)?.value || "";
+  return `${part("day")}/${part("month")}/${part("year")} ${part("hour")}:${part("minute")} hs`;
+}
+
+function nombreReafiliacionPendiente(
+  snapshot: FirestoreRecord,
+  usuario: FirestoreRecord | null,
+): string {
+  const snapshotNombre = [snapshot.nombre, snapshot.apellido]
+    .map((value) => String(value ?? "").trim())
+    .filter(Boolean)
+    .join(" ");
+  if (snapshotNombre) return snapshotNombre;
+  if (usuario) return buildNombreAfiliado(usuario);
+  return "Afiliado/a SIDCA";
+}
+
+async function reservarCorreoReafiliacionPendiente(
+  dni: string,
+): Promise<ReservaCorreoReafiliacionPendiente> {
+  const counterPath = `nuevoAfiliado_counters/${dni}`;
+
+  for (let intento = 0; intento < 2; intento += 1) {
+    const transaction = await beginFirestoreTransaction();
+    let confirmar = false;
+
+    try {
+      const counter = await getFirestoreDocInTransaction(counterPath, transaction);
+      if (!counter || !esSolicitudPendienteValida(counter)) {
+        return { estado: "omitido", motivo: "solicitud_no_pendiente" };
+      }
+
+      const solicitudId = solicitudIdDesdeFecha(counter.fechaSolicitudReafiliacion);
+      if (!solicitudId) return { estado: "omitido", motivo: "fecha_solicitud_invalida" };
+
+      const decision = decidirCorreoPendiente(counter, solicitudId);
+      if (decision === "ya_enviado") return { estado: "ya_enviado" };
+      if (decision === "procesando") return { estado: "procesando" };
+
+      const usuarioIdHistorico = String(counter.usuarioIdHistorico || "").trim();
+      const usuario = await getFirestoreDocInTransaction(`usuarios/${usuarioIdHistorico}`, transaction);
+      const snapshot = counter.datosSolicitudReafiliacion && typeof counter.datosSolicitudReafiliacion === "object"
+        ? counter.datosSolicitudReafiliacion
+        : {};
+      const emailSnapshot = String(snapshot.email || "").trim();
+      const emailUsuario = String(usuario?.email || usuario?.correo || "").trim();
+      const email = emailValidoReafiliacion(emailSnapshot)
+        ? emailSnapshot
+        : emailValidoReafiliacion(emailUsuario)
+        ? emailUsuario
+        : "";
+      if (!email) return { estado: "omitido", motivo: "email_invalido" };
+
+      const fechaSolicitud = fechaSolicitudArgentina(counter.fechaSolicitudReafiliacion);
+      if (!fechaSolicitud) return { estado: "omitido", motivo: "fecha_solicitud_invalida" };
+
+      const datos: ReaffiliationPendingData = {
+        dni,
+        nombre: nombreReafiliacionPendiente(snapshot, usuario),
+        email,
+        fechaSolicitud,
+        nroAfiliacion: counter.nroAfiliacionReafiliacion ?? usuario?.nroAfiliacion ?? null,
+        solicitudId,
+      };
+
+      await firestoreRequest(`${firestoreBaseUrl}:commit`, {
+        method: "POST",
+        body: JSON.stringify({
+          transaction,
+          writes: [
+            actualizarConTransformaciones(
+              counterPath,
+              {
+                correoReafiliacionPendienteEstado: "procesando",
+                correoReafiliacionPendienteSolicitudId: solicitudId,
+                correoReafiliacionPendienteUltimoError: null,
+              },
+              ["correoReafiliacionPendienteProcesandoAt", "updatedAt"],
+            ),
+          ],
+        }),
+      });
+      confirmar = true;
+      return { estado: "reservado", datos };
+    } catch (error: any) {
+      if (esConflictoTransaccionFirestore(error) && intento === 0) continue;
+      throw error;
+    } finally {
+      if (!confirmar) await rollbackFirestoreTransaction(transaction);
+    }
+  }
+
+  throw new Error("No se pudo reservar el correo de reafiliación pendiente.");
+}
+
+async function procesarCorreoReafiliacionPendiente(
+  dni: string,
+): Promise<ResultadoCorreoReafiliacionPendiente> {
+  const reserva = await reservarCorreoReafiliacionPendiente(dni);
+  if (reserva.estado === "omitido") return reserva;
+  if (reserva.estado === "ya_enviado") return { estado: "ya_enviado" };
+  if (reserva.estado === "procesando") return { estado: "procesando" };
+
+  const counterPath = `nuevoAfiliado_counters/${dni}`;
+  try {
+    const proveedorId = await sendReaffiliationPendingEmail(reserva.datos);
+    await actualizarDocumentoConTransformaciones(
+      counterPath,
+      {
+        correoReafiliacionPendienteEstado: "enviado",
+        correoReafiliacionPendienteSolicitudId: reserva.datos.solicitudId,
+        correoReafiliacionPendienteIdProveedor: proveedorId,
+        correoReafiliacionPendienteUltimoError: null,
+      },
+      ["correoReafiliacionPendienteEnviadoAt", "updatedAt"],
+    );
+    return { estado: "enviado" };
+  } catch (error: any) {
+    const mensaje = errorBienvenidaCorto(error);
+    try {
+      await actualizarDocumentoConTransformaciones(
+        counterPath,
+        {
+          correoReafiliacionPendienteEstado: "error",
+          correoReafiliacionPendienteSolicitudId: reserva.datos.solicitudId,
+          correoReafiliacionPendienteUltimoError: mensaje,
+        },
+        ["correoReafiliacionPendienteUltimoErrorAt", "updatedAt"],
+      );
+    } catch (persistError: any) {
+      console.error("[sidca-email] No se pudo guardar el estado de error de reafiliación:", {
+        message: errorBienvenidaCorto(persistError),
+      });
+    }
+    return { estado: "reintentar", motivo: "envio_reafiliacion_pendiente_fallido" };
+  }
+}
+
+type ResultadoCorreoReafiliacionAprobada =
+  | { estado: "enviado" }
+  | { estado: "ya_enviado" }
+  | { estado: "procesando" }
+  | { estado: "omitido"; motivo: string }
+  | { estado: "reintentar"; motivo: string };
+
+type ReservaCorreoReafiliacionAprobada =
+  | { estado: "reservado"; datos: ReaffiliationApprovedData }
+  | { estado: "ya_enviado" }
+  | { estado: "procesando" }
+  | { estado: "omitido"; motivo: string }
+  | { estado: "reintentar"; motivo: string };
+
+type ReaffiliationApprovedData = {
+  dni: string;
+  nombre: string;
+  email: string;
+  fechaAprobacion: string;
+  nroAfiliacion?: string | number | null;
+  solicitudId: string;
+};
+
+async function reservarCorreoReafiliacionAprobada(
+  dni: string,
+): Promise<ReservaCorreoReafiliacionAprobada> {
+  const counterPath = `nuevoAfiliado_counters/${dni}`;
+
+  for (let intento = 0; intento < 2; intento += 1) {
+    const transaction = await beginFirestoreTransaction();
+    let confirmar = false;
+
+    try {
+      const counter = await getFirestoreDocInTransaction(counterPath, transaction);
+      if (!counter || !esSolicitudAprobadaValida(counter)) {
+        return { estado: "omitido", motivo: "solicitud_no_aprobada" };
+      }
+
+      const solicitudId = solicitudIdDesdeFecha(counter.fechaSolicitudReafiliacion);
+      if (!solicitudId) return { estado: "omitido", motivo: "fecha_solicitud_invalida" };
+
+      const decision = decidirCorreoAprobada(counter, solicitudId);
+      if (decision === "ya_enviado") return { estado: "ya_enviado" };
+      if (decision === "procesando") return { estado: "procesando" };
+
+      const fechaAprobacion = fechaSolicitudArgentina(
+        counter.fechaResolucionReafiliacion ?? counter.fechaAprobacion,
+      );
+      if (!fechaAprobacion) {
+        return { estado: "reintentar", motivo: "fecha_aprobacion_no_disponible" };
+      }
+
+      const usuarioIdHistorico = String(counter.usuarioIdHistorico || "").trim();
+      const usuario = await getFirestoreDocInTransaction(`usuarios/${usuarioIdHistorico}`, transaction);
+      const snapshot = counter.datosSolicitudReafiliacion && typeof counter.datosSolicitudReafiliacion === "object"
+        ? counter.datosSolicitudReafiliacion
+        : {};
+      const emailSnapshot = String(snapshot.email || "").trim();
+      const emailUsuario = String(usuario?.email || usuario?.correo || "").trim();
+      const email = emailValidoReafiliacion(emailSnapshot)
+        ? emailSnapshot
+        : emailValidoReafiliacion(emailUsuario)
+        ? emailUsuario
+        : "";
+      if (!email) return { estado: "omitido", motivo: "email_invalido" };
+
+      const datos: ReaffiliationApprovedData = {
+        dni,
+        nombre: nombreReafiliacionPendiente(snapshot, usuario),
+        email,
+        fechaAprobacion,
+        nroAfiliacion: counter.nroAfiliacionReafiliacion ?? usuario?.nroAfiliacion ?? null,
+        solicitudId,
+      };
+
+      await firestoreRequest(`${firestoreBaseUrl}:commit`, {
+        method: "POST",
+        body: JSON.stringify({
+          transaction,
+          writes: [
+            actualizarConTransformaciones(
+              counterPath,
+              {
+                correoReafiliacionAprobadaEstado: "procesando",
+                correoReafiliacionAprobadaSolicitudId: solicitudId,
+                correoReafiliacionAprobadaUltimoError: null,
+              },
+              ["correoReafiliacionAprobadaProcesandoAt", "updatedAt"],
+            ),
+          ],
+        }),
+      });
+      confirmar = true;
+      return { estado: "reservado", datos };
+    } catch (error: any) {
+      if (esConflictoTransaccionFirestore(error) && intento === 0) continue;
+      throw error;
+    } finally {
+      if (!confirmar) await rollbackFirestoreTransaction(transaction);
+    }
+  }
+
+  throw new Error("No se pudo reservar el correo de reafiliación aprobada.");
+}
+
+async function procesarCorreoReafiliacionAprobada(
+  dni: string,
+): Promise<ResultadoCorreoReafiliacionAprobada> {
+  const reserva = await reservarCorreoReafiliacionAprobada(dni);
+  if (reserva.estado === "omitido" || reserva.estado === "ya_enviado" || reserva.estado === "procesando") {
+    return reserva;
+  }
+  if (reserva.estado === "reintentar") return reserva;
+
+  const counterPath = `nuevoAfiliado_counters/${dni}`;
+  try {
+    const proveedorId = await sendReaffiliationApprovedEmail(reserva.datos);
+    await actualizarDocumentoConTransformaciones(
+      counterPath,
+      {
+        correoReafiliacionAprobadaEstado: "enviado",
+        correoReafiliacionAprobadaSolicitudId: reserva.datos.solicitudId,
+        correoReafiliacionAprobadaIdProveedor: proveedorId,
+        correoReafiliacionAprobadaUltimoError: null,
+      },
+      ["correoReafiliacionAprobadaEnviadoAt", "updatedAt"],
+    );
+    return { estado: "enviado" };
+  } catch (error: any) {
+    const mensaje = errorBienvenidaCorto(error);
+    try {
+      await actualizarDocumentoConTransformaciones(
+        counterPath,
+        {
+          correoReafiliacionAprobadaEstado: "error",
+          correoReafiliacionAprobadaSolicitudId: reserva.datos.solicitudId,
+          correoReafiliacionAprobadaUltimoError: mensaje,
+        },
+        ["correoReafiliacionAprobadaUltimoErrorAt", "updatedAt"],
+      );
+    } catch (persistError: any) {
+      console.error("[sidca-email] No se pudo guardar el estado de error de reafiliación aprobada:", {
+        message: errorBienvenidaCorto(persistError),
+      });
+    }
+    return { estado: "reintentar", motivo: "envio_reafiliacion_aprobada_fallido" };
+  }
+}
+
+async function procesarCorreoReafiliacionActualizacion(dni: string) {
+  const counter = await getFirestoreDoc(`nuevoAfiliado_counters/${dni}`);
+  if (!counter) return { estado: "omitido" as const, motivo: "solicitud_inexistente" };
+
+  const estado = normalizarEstadoReafiliacion(counter.estadoReafiliacion);
+  if (estado === "aprobada") return procesarCorreoReafiliacionAprobada(dni);
+  if (estado === "pendiente") return procesarCorreoReafiliacionPendiente(dni);
+  return { estado: "omitido" as const, motivo: "solicitud_no_procesable" };
+}
+
 function proyectarRegistroAprobado(participante: ParticipanteAprobado) {
   return {
     usuarioDocId: participante.usuarioDocId,
@@ -5835,6 +7139,7 @@ const registrarCursoCertificadoAtomico = async ({
             }],
           }),
         });
+
         confirmar = true;
         return { yaRegistrado: false, registro, registroCursoPorJunta: actualizado };
       }
@@ -6651,6 +7956,209 @@ app.post("/api/auth/firebase/bootstrap", bootstrapRateLimit, async (req, res) =>
     });
   }
 });
+
+/**
+ * Destino exclusivo de Eventarc. En producción el servicio Cloud Run debe
+ * aceptar esta ruta únicamente mediante IAM desde la service account de
+ * Eventarc; no se usa API key ni datos de correo provenientes del request.
+ */
+app.post(
+  "/internal/events/firestore/usuario-created",
+  express.raw({ type: "application/protobuf", limit: "1mb" }),
+  async (req, res) => {
+  if (!ENABLE_WELCOME_EVENTARC) {
+    res.status(404).end();
+    return;
+  }
+
+  let usuarioId = "";
+  try {
+    const ceType = req.header("ce-type") || "";
+    validarTipoCloudEvent(ceType);
+    console.info("[sidca-eventarc] cloud_event_received", {
+      ceId: req.header("ce-id") || undefined,
+      ceSource: req.header("ce-source") || undefined,
+      ceType,
+      ceTime: req.header("ce-time") || undefined,
+      contentType: req.header("content-type") || undefined,
+    });
+
+    usuarioId = decodificarUsuarioIdDesdeDocumentEvent(req.body);
+    console.info("[sidca-eventarc] protobuf_decoded", { hasDocumentValue: true });
+    console.info("[sidca-eventarc] usuarioId_extracted", { extracted: true });
+
+    const resultado = await procesarCorreoBienvenida(usuarioId);
+
+    if (resultado.estado === "omitido") {
+      console.info("[sidca-eventarc] welcome_skipped", { motivo: resultado.motivo });
+      res.status(204).end();
+      return;
+    }
+    if (resultado.estado === "reintentar") {
+      console.warn("[sidca-eventarc] welcome_error", { retryable: true });
+      res.status(503).json({ ok: false, retryable: true, motivo: resultado.motivo });
+      return;
+    }
+
+    console.info("[sidca-eventarc] welcome_processed", { estado: resultado.estado });
+
+    res.status(200).json({
+      ok: true,
+      usuarioId,
+      estado: resultado.estado,
+    });
+  } catch (error: any) {
+    const statusCode = Number(error?.statusCode || 500);
+
+    // La reafiliación, un email inválido o una relación positiva ausente no
+    // son errores de Eventarc: no se debe generar un ciclo de reintentos.
+    if (statusCode === 409 || statusCode === 422) {
+      console.info("[sidca-eventarc] welcome_skipped", { statusCode });
+      res.status(204).end();
+      return;
+    }
+
+    if (statusCode === 404 || statusCode === 503) {
+      console.error("[sidca-eventarc] welcome_error", { retryable: true });
+      res.status(503).json({ ok: false, retryable: true });
+      return;
+    }
+
+    if (statusCode === 400) {
+      res.status(400).json({ ok: false, error: error?.message || "CloudEvent inválido." });
+      return;
+    }
+
+    console.error("[sidca-eventarc] welcome_error", { retryable: true });
+    res.status(500).json({ ok: false, retryable: true });
+  }
+  },
+);
+
+app.post(
+  "/internal/events/firestore/reafiliacion-pendiente",
+  express.raw({ type: "application/protobuf", limit: "1mb" }),
+  async (req, res) => {
+    if (!ENABLE_WELCOME_EVENTARC) {
+      res.status(404).end();
+      return;
+    }
+
+    try {
+      const ceType = req.header("ce-type") || "";
+      validarTipoCloudEventEsperado(ceType, FIRESTORE_UPDATED_EVENT_TYPE);
+      console.info("[sidca-eventarc] cloud_event_received", {
+        ceId: req.header("ce-id") || undefined,
+        ceSource: req.header("ce-source") || undefined,
+        ceType,
+        ceTime: req.header("ce-time") || undefined,
+        contentType: req.header("content-type") || undefined,
+      });
+
+      const dni = decodificarDniDesdeCounterEvent(req.body);
+      console.info("[sidca-eventarc] protobuf_decoded", { hasDocumentValue: true });
+      console.info("[sidca-eventarc] recurso_extracted", { extracted: true });
+
+      const resultado = await procesarCorreoReafiliacionActualizacion(dni);
+      if (resultado.estado === "omitido" || resultado.estado === "ya_enviado" || resultado.estado === "procesando") {
+        console.info("[sidca-eventarc] welcome_skipped", { estado: resultado.estado });
+        res.status(204).end();
+        return;
+      }
+      if (resultado.estado === "reintentar") {
+        console.warn("[sidca-eventarc] welcome_error", { retryable: true });
+        res.status(503).json({ ok: false, retryable: true });
+        return;
+      }
+
+      console.info("[sidca-eventarc] welcome_processed", { estado: resultado.estado });
+      res.status(200).json({ ok: true, estado: resultado.estado });
+    } catch (error: any) {
+      const statusCode = Number(error?.statusCode || 500);
+      if (statusCode === 400) {
+        res.status(400).json({ ok: false, error: error?.message || "CloudEvent inválido." });
+        return;
+      }
+      console.error("[sidca-eventarc] welcome_error", { retryable: true });
+      res.status(503).json({ ok: false, retryable: true });
+    }
+  },
+);
+
+app.post("/api/reafiliaciones/solicitar", reafiliacionRateLimit, async (req, res) => {
+  try {
+    const solicitud = solicitudReafiliacionSchema.parse(req.body);
+    const resultado = await registrarSolicitudReafiliacion(solicitud);
+    return res.status(201).json({ ok: true, ...resultado });
+  } catch (error: any) {
+    const statusCode = Number(error?.statusCode || (error?.name === "ZodError" ? 400 : 500));
+    const code = String(error?.code || "");
+
+    if (statusCode === 400 || statusCode === 409) {
+      return res.status(statusCode).json({
+        ok: false,
+        ...(code ? { code } : {}),
+        error: String(error?.message || "No se pudo procesar la solicitud de reafiliación."),
+      });
+    }
+
+    console.error("[sidca-chatbot-backend] Error solicitud reafiliación:", error);
+    return res.status(500).json({
+      ok: false,
+      code: "REAFILIACION_ERROR",
+      error: "No se pudo procesar la solicitud de reafiliación.",
+    });
+  }
+});
+
+app.post("/api/reafiliaciones/:dni/aprobar", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    await requireAdministrador(authUser);
+    const dni = assertValidDni(normalizeDni(req.params.dni));
+    const resultado = await aprobarReafiliacionAtomica(dni, authUser);
+
+    console.info(
+      `[reafiliacion] aprobada dni=${dni} usuarioId=${resultado.usuarioIdHistorico || "-"} adminUid=${authUser.uid} alreadyProcessed=${resultado.alreadyProcessed}`
+    );
+    return res.status(200).json({
+      ok: true,
+      ...(resultado.alreadyProcessed ? { alreadyProcessed: true } : {}),
+      estadoReafiliacion: resultado.estadoReafiliacion,
+      dni,
+      usuarioId: resultado.usuarioIdHistorico,
+      nroAfiliacion: resultado.nroAfiliacion,
+      nuevoAfiliadoId: resultado.nuevoAfiliadoId,
+    });
+  } catch (error: any) {
+    return sendCertificadosError(res, error);
+  }
+});
+
+app.post("/api/reafiliaciones/:dni/rechazar", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    await requireAdministrador(authUser);
+    const dni = assertValidDni(normalizeDni(req.params.dni));
+    const { observacion } = rechazarReafiliacionSchema.parse(req.body);
+    const resultado = await rechazarReafiliacionAtomica(dni, observacion, authUser);
+
+    console.info(
+      `[reafiliacion] rechazada dni=${dni} adminUid=${authUser.uid} alreadyProcessed=${resultado.alreadyProcessed}`
+    );
+    return res.status(200).json({
+      ok: true,
+      ...(resultado.alreadyProcessed ? { alreadyProcessed: true } : {}),
+      estadoReafiliacion: resultado.estadoReafiliacion,
+    });
+  } catch (error: any) {
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({ ok: false, error: "La observación debe tener entre 3 y 1000 caracteres." });
+    }
+    return sendCertificadosError(res, error);
+  }
+});
+
 app.post("/api/pagos/mercadopago/preference", paymentRateLimit, async (req, res) => {
   try {
     const authUser = await verifyFirebaseIdToken(req.headers.authorization);
