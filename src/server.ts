@@ -58,6 +58,7 @@ import {
   validarTipoCloudEventEsperado,
 } from "./events/firestoreDocumentEvent.js";
 import { resolverNumeroAfiliacionHistorico } from "./reafiliacion/historicAffiliationNumber.js";
+import { sendExpoPushNotifications } from "./push/expoPush.js";
 
 const app = express();
 const PORT = Number(process.env.PORT || 8080);
@@ -219,6 +220,24 @@ type SolicitudReafiliacion = z.infer<typeof solicitudReafiliacionSchema>;
 const rechazarReafiliacionSchema = z.strictObject({
   observacion: z.string().trim().min(3).max(1000),
 });
+
+const expoPushTokenSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(200)
+  .regex(/^Expo(nent)?PushToken\[[^\]]+\]$/, "El token Expo no es válido.");
+
+const pushTestSchema = z
+  .strictObject({
+    token: z.union([
+      expoPushTokenSchema,
+      z.array(expoPushTokenSchema).min(1).max(100),
+    ]),
+    title: z.string().trim().min(1).max(120),
+    body: z.string().trim().min(1).max(1000),
+    data: z.record(z.string(), z.unknown()).optional().default({}),
+  });
 
 type FirestoreDocument = {
   name: string;
@@ -2635,6 +2654,32 @@ app.get("/health", (_req, res) => {
     status: "running",
     timestamp: new Date().toISOString(),
   });
+});
+
+app.post("/api/push/test", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    await requireAdministrador(authUser);
+    const payload = pushTestSchema.parse(req.body);
+    const resultado = await sendExpoPushNotifications(payload);
+    return res.status(200).json({
+      ok: true,
+      status: resultado.status,
+      tickets: resultado.tickets,
+      deviceNotRegistered: resultado.tickets.some(
+        (ticket) => ticket.details?.error === "DeviceNotRegistered",
+      ),
+    });
+  } catch (error: any) {
+    const statusCode = Number(error?.statusCode || 0);
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({ ok: false, error: "Payload inválido.", issues: error.issues });
+    }
+    return res.status(statusCode >= 400 && statusCode < 500 ? statusCode : 500).json({
+      ok: false,
+      error: statusCode >= 500 ? "No se pudo enviar la notificación." : String(error?.message || "No autorizado."),
+    });
+  }
 });
 
 // ============================================================
