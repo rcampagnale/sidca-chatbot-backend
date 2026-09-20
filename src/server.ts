@@ -283,6 +283,53 @@ const pushBroadcastSchema = z.strictObject({
   data: pushBroadcastDataSchema,
 });
 
+const scheduledCreateSchema = z.strictObject({
+  title: z.string().trim().min(1, "El título es obligatorio.").max(120),
+  body: z.string().trim().min(1, "El mensaje es obligatorio.").max(1000),
+  data: pushBroadcastDataSchema,
+  programadaParaIso: z.string().trim().min(1, "La fecha programada es obligatoria."),
+  tipoOrigen: z.enum(["push", "modal"]),
+  origenId: z.string().trim().max(200).nullable().optional().default(null),
+}).superRefine((payload, context) => {
+  if (payload.data.type === "news_modal" && (payload.tipoOrigen !== "modal" || !payload.origenId)) {
+    context.addIssue({ code: "custom", path: ["origenId"], message: "news_modal requiere un modal guardado." });
+  }
+});
+
+const scheduledUpdateSchema = z.strictObject({
+  title: z.string().trim().min(1).max(120).optional(),
+  body: z.string().trim().min(1).max(1000).optional(),
+  data: pushBroadcastDataSchema.optional(),
+  programadaParaIso: z.string().trim().min(1).optional(),
+}).refine((payload) => Object.keys(payload).length > 0, "Debe enviarse al menos un campo para actualizar.");
+
+const SCHEDULED_COLLECTION = "notificaciones_programadas";
+const SCHEDULED_TIME_ZONE = "America/Argentina/Buenos_Aires";
+const SCHEDULED_ID_PATTERN = /^[A-Za-z0-9_-]{1,200}$/;
+const SCHEDULED_TOLERANCE_MS = 10_000;
+
+function fechaProgramadaDesdeIso(programadaParaIso: string): Date {
+  if (!/T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/i.test(programadaParaIso)) {
+    throw Object.assign(new Error("La fecha programada debe ser un ISO UTC válido."), { statusCode: 400 });
+  }
+  const fecha = new Date(programadaParaIso);
+  if (Number.isNaN(fecha.getTime())) {
+    throw Object.assign(new Error("La fecha programada no es válida."), { statusCode: 400 });
+  }
+  if (fecha.getTime() <= Date.now() - SCHEDULED_TOLERANCE_MS) {
+    throw Object.assign(new Error("La fecha programada debe ser futura."), { statusCode: 400 });
+  }
+  return fecha;
+}
+
+function exigirScheduledId(id: string): string {
+  const valor = String(id || "").trim();
+  if (!SCHEDULED_ID_PATTERN.test(valor)) {
+    throw Object.assign(new Error("El identificador de la notificación es inválido."), { statusCode: 400 });
+  }
+  return valor;
+}
+
 type FirestoreDocument = {
   name: string;
   fields?: Record<string, FirestoreValue>;
@@ -2726,11 +2773,25 @@ app.post("/api/push/test", async (req, res) => {
   }
 });
 
-app.post("/api/push/broadcast", async (req, res) => {
-  try {
-    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
-    await requireAdministrador(authUser);
-    const payload = pushBroadcastSchema.parse(req.body);
+type BroadcastStatistics = {
+  usuariosConsultados: number;
+  usuariosConTokens: number;
+  tokensEncontrados: number;
+  tokensDuplicados: number;
+  tokensInvalidos: number;
+  tokensValidos: number;
+  enviados: number;
+  fallidos: number;
+  deviceNotRegistered: number;
+  receiptsDisponibles: number;
+  receiptsNoDisponibles?: boolean;
+};
+
+async function broadcastPushToUsuarios(payload: {
+  title: string;
+  body: string;
+  data: Record<string, unknown>;
+}): Promise<BroadcastStatistics> {
     const usuarios = await queryFirestoreCollection("usuarios", [], 0);
     const tokens = new Set<string>();
     let usuariosConTokens = 0;
@@ -2770,16 +2831,13 @@ app.post("/api/push/broadcast", async (req, res) => {
     };
 
     if (tokens.size === 0) {
-      return res.status(200).json({
-        ok: true,
-        estadisticas: {
-          ...estadisticasBase,
-          enviados: 0,
-          fallidos: 0,
-          deviceNotRegistered: 0,
-          receiptsDisponibles: 0,
-        },
-      });
+      return {
+        ...estadisticasBase,
+        enviados: 0,
+        fallidos: 0,
+        deviceNotRegistered: 0,
+        receiptsDisponibles: 0,
+      };
     }
 
     const resultado = await sendExpoPushNotifications({
@@ -2804,17 +2862,23 @@ app.post("/api/push/broadcast", async (req, res) => {
         .filter((id): id is string => Boolean(id)),
     ).size;
 
-    return res.status(200).json({
-      ok: true,
-      estadisticas: {
-        ...estadisticasBase,
-        enviados: resultado.tickets.filter((ticket) => ticket.status === "ok").length,
-        fallidos: erroresPorId.size + fallidosSinId,
-        deviceNotRegistered,
-        receiptsDisponibles: resultado.receipts.length,
-        receiptsNoDisponibles: resultado.receiptsUnavailable,
-      },
-    });
+    return {
+      ...estadisticasBase,
+      enviados: resultado.tickets.filter((ticket) => ticket.status === "ok").length,
+      fallidos: erroresPorId.size + fallidosSinId,
+      deviceNotRegistered,
+      receiptsDisponibles: resultado.receipts.length,
+      receiptsNoDisponibles: resultado.receiptsUnavailable,
+    };
+}
+
+app.post("/api/push/broadcast", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    await requireAdministrador(authUser);
+    const payload = pushBroadcastSchema.parse(req.body);
+    const estadisticas = await broadcastPushToUsuarios(payload);
+    return res.status(200).json({ ok: true, estadisticas });
   } catch (error: any) {
     console.error("[push-broadcast] Error controlado:", error instanceof Error ? error.message : error);
     const statusCode = Number(error?.statusCode || 0);
@@ -2828,6 +2892,293 @@ app.post("/api/push/broadcast", async (req, res) => {
       ok: false,
       error: statusCode === 403 ? "No tenés autorización para enviar notificaciones." : "No se pudo enviar la notificación masiva.",
     });
+  }
+});
+
+function construirActualizacionProgramada(
+  path: string,
+  data: Record<string, unknown>,
+  deleteFields: string[] = [],
+  transformFields: string[] = ["actualizadoEn"],
+): any {
+  const fieldPaths = [...new Set([...Object.keys(data), ...deleteFields, ...transformFields])];
+  return {
+    update: {
+      name: rutaDocumentoFirestore(path),
+      fields: jsToFirestoreFields(data),
+    },
+    updateMask: { fieldPaths },
+    updateTransforms: transformFields.map((fieldPath) => ({
+      fieldPath,
+      setToServerValue: "REQUEST_TIME",
+    })),
+  };
+}
+
+async function actualizarNotificacionProgramada(
+  id: string,
+  data: Record<string, unknown>,
+  deleteFields: string[] = [],
+  transformFields: string[] = ["actualizadoEn"],
+) {
+  await firestoreRequest(`${firestoreBaseUrl}:commit`, {
+    method: "POST",
+    body: JSON.stringify({ writes: [construirActualizacionProgramada(`${SCHEDULED_COLLECTION}/${id}`, data, deleteFields, transformFields)] }),
+  });
+}
+
+async function obtenerNotificacionProgramada(id: string): Promise<FirestoreRecord | null> {
+  return getFirestoreDoc(`${SCHEDULED_COLLECTION}/${exigirScheduledId(id)}`);
+}
+
+async function modalInformativoActivo(id: string): Promise<boolean> {
+  const modal = await getFirestoreDoc(`modal_informativos/${String(id || "").trim()}`);
+  return Boolean(modal && modal.estado === "activo");
+}
+
+function errorProgramacionSeguro(error: unknown): string {
+  const mensaje = String(error instanceof Error ? error.message : error || "Error interno al procesar la notificación.");
+  return mensaje.slice(0, 300);
+}
+
+async function reclamarNotificacionProgramada(id: string, permitirFutura: boolean): Promise<FirestoreRecord | null> {
+  for (let intento = 0; intento < 2; intento += 1) {
+    const transaction = await beginFirestoreTransaction();
+    try {
+      const actual = await getFirestoreDocInTransaction(`${SCHEDULED_COLLECTION}/${id}`, transaction);
+      if (!actual || actual.estado !== "pendiente") {
+        await rollbackFirestoreTransaction(transaction);
+        return null;
+      }
+      const programada = new Date(String(actual.programadaPara || ""));
+      if (!permitirFutura && (Number.isNaN(programada.getTime()) || programada.getTime() > Date.now())) {
+        await rollbackFirestoreTransaction(transaction);
+        return null;
+      }
+
+      const claimWrite = construirActualizacionProgramada(
+        `${SCHEDULED_COLLECTION}/${id}`,
+        { estado: "procesando" },
+        ["pendienteHasta"],
+        [],
+      );
+      claimWrite.updateTransforms = [
+        { fieldPath: "procesandoDesde", setToServerValue: "REQUEST_TIME" },
+        { fieldPath: "actualizadoEn", setToServerValue: "REQUEST_TIME" },
+        { fieldPath: "intentos", increment: { integerValue: "1" } },
+      ];
+      claimWrite.updateMask.fieldPaths.push("procesandoDesde", "actualizadoEn", "intentos");
+      await firestoreRequest(`${firestoreBaseUrl}:commit`, {
+        method: "POST",
+        body: JSON.stringify({
+          transaction,
+          writes: [claimWrite],
+        }),
+      });
+      return { ...actual, estado: "procesando" };
+    } catch (error) {
+      await rollbackFirestoreTransaction(transaction);
+      if (esConflictoTransaccionFirestore(error) && intento === 0) continue;
+      throw error;
+    }
+  }
+  return null;
+}
+
+async function ejecutarNotificacionProgramada(notificacion: FirestoreRecord): Promise<BroadcastStatistics> {
+  const data = (notificacion.data && typeof notificacion.data === "object")
+    ? notificacion.data as Record<string, unknown>
+    : {};
+  if (data.type === "news_modal" && notificacion.tipoOrigen === "modal" && notificacion.origenId) {
+    if (!(await modalInformativoActivo(String(notificacion.origenId)))) {
+      throw new Error("El modal informativo ya no se encuentra activo.");
+    }
+  }
+  return broadcastPushToUsuarios({
+    title: String(notificacion.title || ""),
+    body: String(notificacion.body || ""),
+    data,
+  });
+}
+
+async function procesarNotificacionProgramada(id: string, permitirFutura: boolean) {
+  const reclamada = await reclamarNotificacionProgramada(id, permitirFutura);
+  if (!reclamada) return { procesada: false, estadisticas: null };
+  try {
+    const estadisticas = await ejecutarNotificacionProgramada(reclamada);
+    await actualizarNotificacionProgramada(id, {
+      estado: "enviada",
+      enviadaEn: new Date(),
+      estadisticas,
+    }, ["pendienteHasta"]);
+    return { procesada: true, estadisticas };
+  } catch (error) {
+    const ultimoError = errorProgramacionSeguro(error);
+    await actualizarNotificacionProgramada(id, {
+      estado: "error",
+      errorEn: new Date(),
+      ultimoError,
+    }, ["pendienteHasta"]);
+    throw error;
+  }
+}
+
+function validarSecretScheduler(request: express.Request): boolean {
+  const esperado = String(process.env.PUSH_SCHEDULER_SECRET || "");
+  const recibido = String(request.header("X-Scheduler-Secret") || "");
+  if (!esperado || !recibido) return false;
+  const esperadoBuffer = Buffer.from(esperado);
+  const recibidoBuffer = Buffer.from(recibido);
+  return esperadoBuffer.length === recibidoBuffer.length && crypto.timingSafeEqual(esperadoBuffer, recibidoBuffer);
+}
+
+app.post("/api/push/scheduled", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    await requireAdministrador(authUser);
+    const payload = scheduledCreateSchema.parse(req.body);
+    const programadaPara = fechaProgramadaDesdeIso(payload.programadaParaIso);
+    if (payload.data.type === "news_modal" && !(await modalInformativoActivo(String(payload.origenId)))) {
+      throw Object.assign(new Error("El modal informativo debe estar activo para programarlo."), { statusCode: 400 });
+    }
+    const creado = await addFirestoreDoc(SCHEDULED_COLLECTION, {
+      title: payload.title,
+      body: payload.body,
+      data: payload.data,
+      tipoOrigen: payload.tipoOrigen,
+      origenId: payload.origenId || null,
+      estado: "pendiente",
+      programadaPara,
+      zonaHoraria: SCHEDULED_TIME_ZONE,
+      creadoEn: new Date(),
+      actualizadoEn: new Date(),
+      creadoPorUid: authUser.uid,
+      intentos: 0,
+      procesandoDesde: null,
+      enviadaEn: null,
+      canceladaEn: null,
+      errorEn: null,
+      ultimoError: null,
+      estadisticas: null,
+      pendienteHasta: programadaPara,
+    });
+    return res.status(201).json({ ok: true, notificacion: { ...creado, path: undefined, _name: undefined } });
+  } catch (error: any) {
+    if (error instanceof z.ZodError) return res.status(400).json({ ok: false, error: "Payload inválido.", issues: error.issues });
+    console.error("[push-scheduled] Error:", error instanceof Error ? error.message : error);
+    return res.status(Number(error?.statusCode) === 403 ? 403 : Number(error?.statusCode) === 401 ? 401 : Number(error?.statusCode) === 400 ? 400 : 500).json({ ok: false, error: Number(error?.statusCode) === 400 ? error.message : "No se pudo programar la notificación." });
+  }
+});
+
+app.get("/api/push/scheduled", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    await requireAdministrador(authUser);
+    const estado = typeof req.query.estado === "string" ? req.query.estado.trim() : "";
+    const notificaciones = await queryFirestoreCollection(
+      SCHEDULED_COLLECTION,
+      estado ? [{ field: "estado", value: estado }] : [],
+      100,
+    );
+    notificaciones.sort((a, b) => String(b.creadoEn || "").localeCompare(String(a.creadoEn || "")));
+    return res.status(200).json({ ok: true, notificaciones: notificaciones.map(({ path, _name, pendienteHasta, ...publica }) => publica) });
+  } catch (error: any) {
+    console.error("[push-scheduled-list] Error:", error instanceof Error ? error.message : error);
+    return res.status(Number(error?.statusCode) === 403 ? 403 : Number(error?.statusCode) === 401 ? 401 : 500).json({ ok: false, error: "No se pudieron cargar las notificaciones programadas." });
+  }
+});
+
+app.patch("/api/push/scheduled/:id", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    await requireAdministrador(authUser);
+    const id = exigirScheduledId(req.params.id);
+    const actual = await obtenerNotificacionProgramada(id);
+    if (!actual) return res.status(404).json({ ok: false, error: "No se encontró la notificación programada." });
+    if (actual.estado !== "pendiente") return res.status(409).json({ ok: false, error: "Sólo se pueden editar notificaciones pendientes." });
+    const cambios = scheduledUpdateSchema.parse(req.body);
+    const datos: Record<string, unknown> = {};
+    if (cambios.title !== undefined) datos.title = cambios.title;
+    if (cambios.body !== undefined) datos.body = cambios.body;
+    if (cambios.data !== undefined) datos.data = cambios.data;
+    const dataFinal = (cambios.data || actual.data) as Record<string, unknown>;
+    if (dataFinal.type === "news_modal" && (actual.tipoOrigen !== "modal" || !actual.origenId)) {
+      throw Object.assign(new Error("news_modal sólo puede pertenecer a un modal guardado."), { statusCode: 400 });
+    }
+    if (dataFinal.type === "news_modal" && !(await modalInformativoActivo(String(actual.origenId)))) {
+      throw Object.assign(new Error("El modal informativo debe estar activo para actualizar la programación."), { statusCode: 400 });
+    }
+    if (cambios.programadaParaIso !== undefined) {
+      const fecha = fechaProgramadaDesdeIso(cambios.programadaParaIso);
+      datos.programadaPara = fecha;
+      datos.pendienteHasta = fecha;
+    }
+    await actualizarNotificacionProgramada(id, datos);
+    return res.status(200).json({ ok: true, notificacion: await obtenerNotificacionProgramada(id) });
+  } catch (error: any) {
+    if (error instanceof z.ZodError) return res.status(400).json({ ok: false, error: "Payload inválido.", issues: error.issues });
+    console.error("[push-scheduled-edit] Error:", error instanceof Error ? error.message : error);
+    return res.status(Number(error?.statusCode) === 409 ? 409 : Number(error?.statusCode) === 400 ? 400 : 500).json({ ok: false, error: Number(error?.statusCode) === 400 || Number(error?.statusCode) === 409 ? error.message : "No se pudo editar la notificación." });
+  }
+});
+
+app.post("/api/push/scheduled/:id/cancel", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    await requireAdministrador(authUser);
+    const id = exigirScheduledId(req.params.id);
+    const actual = await obtenerNotificacionProgramada(id);
+    if (!actual) return res.status(404).json({ ok: false, error: "No se encontró la notificación programada." });
+    if (actual.estado !== "pendiente") return res.status(409).json({ ok: false, error: "La notificación ya no está pendiente." });
+    await actualizarNotificacionProgramada(id, { estado: "cancelada", canceladaEn: new Date() }, ["pendienteHasta"]);
+    return res.status(200).json({ ok: true, notificacion: await obtenerNotificacionProgramada(id) });
+  } catch (error: any) {
+    console.error("[push-scheduled-cancel] Error:", error instanceof Error ? error.message : error);
+    return res.status(Number(error?.statusCode) === 409 ? 409 : Number(error?.statusCode) === 401 ? 401 : Number(error?.statusCode) === 403 ? 403 : 500).json({ ok: false, error: Number(error?.statusCode) === 409 ? error.message : "No se pudo cancelar la notificación." });
+  }
+});
+
+app.post("/api/push/scheduled/:id/send-now", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    await requireAdministrador(authUser);
+    const id = exigirScheduledId(req.params.id);
+    const resultado = await procesarNotificacionProgramada(id, true);
+    if (!resultado.procesada) return res.status(409).json({ ok: false, error: "La notificación ya no está pendiente." });
+    return res.status(200).json({ ok: true, estadisticas: resultado.estadisticas, notificacion: await obtenerNotificacionProgramada(id) });
+  } catch (error: any) {
+    console.error("[push-scheduled-send-now] Error:", error instanceof Error ? error.message : error);
+    return res.status(500).json({ ok: false, error: "No se pudo enviar la notificación programada." });
+  }
+});
+
+app.post("/api/push/scheduled/process", async (req, res) => {
+  if (!validarSecretScheduler(req)) return res.status(403).json({ ok: false, error: "No autorizado." });
+  try {
+    const vencidas = await queryFirestoreCollection(
+      SCHEDULED_COLLECTION,
+      [{ field: "pendienteHasta", op: "LESS_THAN_OR_EQUAL", value: new Date() }],
+      25,
+    );
+    vencidas.sort((a, b) => String(a.pendienteHasta || "").localeCompare(String(b.pendienteHasta || "")));
+    let procesados = 0;
+    let enviados = 0;
+    let errores = 0;
+    for (const notificacion of vencidas) {
+      try {
+        const resultado = await procesarNotificacionProgramada(String(notificacion.id), false);
+        if (!resultado.procesada) continue;
+        procesados += 1;
+        enviados += 1;
+      } catch {
+        procesados += 1;
+        errores += 1;
+      }
+    }
+    return res.status(200).json({ ok: true, encontrados: vencidas.length, procesados, enviados, errores });
+  } catch (error) {
+    console.error("[push-scheduled-process] Error:", error instanceof Error ? error.message : error);
+    return res.status(500).json({ ok: false, error: "No se pudo procesar la cola programada." });
   }
 });
 
