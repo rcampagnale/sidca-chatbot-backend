@@ -58,7 +58,7 @@ import {
   validarTipoCloudEventEsperado,
 } from "./events/firestoreDocumentEvent.js";
 import { resolverNumeroAfiliacionHistorico } from "./reafiliacion/historicAffiliationNumber.js";
-import { sendExpoPushNotifications } from "./push/expoPush.js";
+import { expoTicketHasDeviceNotRegistered, isExpoPushToken, sendExpoPushNotifications } from "./push/expoPush.js";
 
 const app = express();
 const PORT = Number(process.env.PORT || 8080);
@@ -238,6 +238,50 @@ const pushTestSchema = z
     body: z.string().trim().min(1).max(1000),
     data: z.record(z.string(), z.unknown()).optional().default({}),
   });
+
+const pushBroadcastTypes = [
+  "open_app",
+  "training",
+  "course_registration",
+  "approved_courses",
+  "tourism",
+  "agreements",
+  "office_management",
+  "external_url",
+  "news_modal",
+] as const;
+
+const pushBroadcastDataSchema = z.record(z.string(), z.unknown()).superRefine((data, context) => {
+  if (typeof data.type !== "string" || !pushBroadcastTypes.includes(data.type as (typeof pushBroadcastTypes)[number])) {
+    context.addIssue({ code: "custom", path: ["type"], message: "El tipo de notificación no está permitido." });
+    return;
+  }
+
+  if (data.type === "external_url") {
+    if (typeof data.url !== "string" || !/^https?:\/\/\S+$/i.test(data.url.trim())) {
+      context.addIssue({ code: "custom", path: ["url"], message: "La URL externa debe comenzar con http:// o https://." });
+    }
+  }
+
+  if (data.type === "news_modal") {
+    ["newsId", "titulo", "descripcion"].forEach((field) => {
+      if (typeof data[field] !== "string" || !data[field].trim()) {
+        context.addIssue({ code: "custom", path: [field], message: `${field} es obligatorio.` });
+      }
+    });
+    ["imagen", "link"].forEach((field) => {
+      if (data[field] !== undefined && typeof data[field] !== "string") {
+        context.addIssue({ code: "custom", path: [field], message: `${field} debe ser texto.` });
+      }
+    });
+  }
+});
+
+const pushBroadcastSchema = z.strictObject({
+  title: z.string().trim().min(1, "El título es obligatorio.").max(120),
+  body: z.string().trim().min(1, "El mensaje es obligatorio.").max(1000),
+  data: pushBroadcastDataSchema,
+});
 
 type FirestoreDocument = {
   name: string;
@@ -742,7 +786,7 @@ async function queryFirestoreCollection(
         structuredQuery: {
           from: [{ collectionId }],
           ...(where ? { where } : {}),
-          limit,
+          ...(limit > 0 ? { limit } : {}),
         },
       }),
     }
@@ -2678,6 +2722,111 @@ app.post("/api/push/test", async (req, res) => {
     return res.status(statusCode >= 400 && statusCode < 500 ? statusCode : 500).json({
       ok: false,
       error: statusCode >= 500 ? "No se pudo enviar la notificación." : String(error?.message || "No autorizado."),
+    });
+  }
+});
+
+app.post("/api/push/broadcast", async (req, res) => {
+  try {
+    const authUser = await verifyFirebaseIdToken(req.headers.authorization);
+    await requireAdministrador(authUser);
+    const payload = pushBroadcastSchema.parse(req.body);
+    const usuarios = await queryFirestoreCollection("usuarios", [], 0);
+    const tokens = new Set<string>();
+    let usuariosConTokens = 0;
+    let tokensEncontrados = 0;
+    let tokensDuplicados = 0;
+    let tokensInvalidos = 0;
+
+    usuarios.forEach((usuario) => {
+      if (!Array.isArray(usuario.pushTokens)) return;
+      const tieneTokenTexto = usuario.pushTokens.some(
+        (token) => typeof token === "string" && token.trim(),
+      );
+      if (tieneTokenTexto) usuariosConTokens += 1;
+
+      usuario.pushTokens.forEach((token) => {
+        tokensEncontrados += 1;
+        if (!isExpoPushToken(token)) {
+          tokensInvalidos += 1;
+          return;
+        }
+        const tokenNormalizado = token.trim();
+        if (tokens.has(tokenNormalizado)) {
+          tokensDuplicados += 1;
+          return;
+        }
+        tokens.add(tokenNormalizado);
+      });
+    });
+
+    const estadisticasBase = {
+      usuariosConsultados: usuarios.length,
+      usuariosConTokens,
+      tokensEncontrados,
+      tokensDuplicados,
+      tokensInvalidos,
+      tokensValidos: tokens.size,
+    };
+
+    if (tokens.size === 0) {
+      return res.status(200).json({
+        ok: true,
+        estadisticas: {
+          ...estadisticasBase,
+          enviados: 0,
+          fallidos: 0,
+          deviceNotRegistered: 0,
+          receiptsDisponibles: 0,
+        },
+      });
+    }
+
+    const resultado = await sendExpoPushNotifications({
+      token: [...tokens],
+      title: payload.title,
+      body: payload.body,
+      data: payload.data,
+      includeReceipts: true,
+    });
+    const ticketsConError = resultado.tickets.filter((ticket) => ticket.status === "error");
+    const receiptsConError = resultado.receipts.filter((receipt) => receipt.status === "error");
+    const erroresPorId = new Set(
+      [...ticketsConError, ...receiptsConError]
+        .map((item) => item.id)
+        .filter((id): id is string => Boolean(id)),
+    );
+    const fallidosSinId = [...ticketsConError, ...receiptsConError].filter((item) => !item.id).length;
+    const deviceNotRegistered = new Set(
+      [...resultado.tickets, ...resultado.receipts]
+        .filter(expoTicketHasDeviceNotRegistered)
+        .map((item) => item.id)
+        .filter((id): id is string => Boolean(id)),
+    ).size;
+
+    return res.status(200).json({
+      ok: true,
+      estadisticas: {
+        ...estadisticasBase,
+        enviados: resultado.tickets.filter((ticket) => ticket.status === "ok").length,
+        fallidos: erroresPorId.size + fallidosSinId,
+        deviceNotRegistered,
+        receiptsDisponibles: resultado.receipts.length,
+        receiptsNoDisponibles: resultado.receiptsUnavailable,
+      },
+    });
+  } catch (error: any) {
+    console.error("[push-broadcast] Error controlado:", error instanceof Error ? error.message : error);
+    const statusCode = Number(error?.statusCode || 0);
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({ ok: false, error: "Payload inválido.", issues: error.issues });
+    }
+    if (JOSE_UNAUTHORIZED_CODES.has(String(error?.code || ""))) {
+      return res.status(401).json({ ok: false, error: "Token de autenticación inválido o vencido." });
+    }
+    return res.status(statusCode === 403 ? 403 : statusCode === 401 ? 401 : 500).json({
+      ok: false,
+      error: statusCode === 403 ? "No tenés autorización para enviar notificaciones." : "No se pudo enviar la notificación masiva.",
     });
   }
 });

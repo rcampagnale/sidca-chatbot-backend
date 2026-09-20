@@ -1,5 +1,7 @@
 const EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send";
+const EXPO_RECEIPTS_URL = "https://exp.host/--/api/v2/push/getReceipts";
 const EXPO_BATCH_SIZE = 100;
+const EXPO_RECEIPTS_BATCH_SIZE = 300;
 
 export type ExpoPushMessage = {
   to: string;
@@ -17,9 +19,19 @@ export type ExpoPushTicket = {
   [key: string]: unknown;
 };
 
+export type ExpoPushReceipt = {
+  id?: string;
+  status?: string;
+  message?: string;
+  details?: { error?: string; [key: string]: unknown };
+  [key: string]: unknown;
+};
+
 export type ExpoPushResult = {
   status: number;
   tickets: ExpoPushTicket[];
+  receipts: ExpoPushReceipt[];
+  receiptsUnavailable: boolean;
 };
 
 function chunks<T>(items: T[], size: number): T[][] {
@@ -35,11 +47,36 @@ function normalizeTokens(tokenOrTokens: string | string[]): string[] {
   return [...new Set(tokens.map((token) => String(token || "").trim()).filter(Boolean))];
 }
 
+export function isExpoPushToken(token: unknown): token is string {
+  return typeof token === "string" && /^Expo(nent)?PushToken\[[^\]]+\]$/.test(token.trim());
+}
+
+async function getExpoPushReceipts(ticketIds: string[]): Promise<ExpoPushReceipt[]> {
+  const receipts: ExpoPushReceipt[] = [];
+  for (let index = 0; index < ticketIds.length; index += EXPO_RECEIPTS_BATCH_SIZE) {
+    const batch = ticketIds.slice(index, index + EXPO_RECEIPTS_BATCH_SIZE);
+    const response = await fetch(EXPO_RECEIPTS_URL, {
+      method: "POST",
+      headers: { Accept: "application/json", "Content-Type": "application/json" },
+      body: JSON.stringify({ ids: batch }),
+    });
+    const responseBody = (await response.json().catch(() => ({}))) as {
+      data?: Record<string, ExpoPushReceipt>;
+    };
+    if (!response.ok) throw new Error("Expo Push Receipts API rechazó la consulta.");
+    Object.entries(responseBody.data || {}).forEach(([id, receipt]) => {
+      receipts.push({ id, ...receipt });
+    });
+  }
+  return receipts;
+}
+
 export async function sendExpoPushNotifications(input: {
   token: string | string[];
   title: string;
   body: string;
   data?: Record<string, unknown>;
+  includeReceipts?: boolean;
 }): Promise<ExpoPushResult> {
   const tokens = normalizeTokens(input.token);
   if (tokens.length === 0) {
@@ -77,7 +114,21 @@ export async function sendExpoPushNotifications(input: {
     if (Array.isArray(responseBody.data)) tickets.push(...responseBody.data);
   }
 
-  return { status: lastStatus, tickets };
+  let receipts: ExpoPushReceipt[] = [];
+  let receiptsUnavailable = false;
+  if (input.includeReceipts && tickets.some((ticket) => Boolean(ticket.id))) {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    try {
+      receipts = await getExpoPushReceipts(
+        tickets.map((ticket) => ticket.id).filter((id): id is string => Boolean(id)),
+      );
+    } catch (error) {
+      receiptsUnavailable = true;
+      console.warn("[expo-push] No se pudieron consultar receipts:", error instanceof Error ? error.message : error);
+    }
+  }
+
+  return { status: lastStatus, tickets, receipts, receiptsUnavailable };
 }
 
 export function expoTicketHasDeviceNotRegistered(ticket: ExpoPushTicket): boolean {
