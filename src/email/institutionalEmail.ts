@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import path from "node:path";
 import type { Attachment } from "resend";
 
@@ -162,6 +163,28 @@ const STATE_PRESENTATION: Record<InstitutionalEmailState, {
 
 const ASSET_DIRECTORY = path.resolve(process.cwd(), "src/email/assets");
 
+function crearAttachmentInline(options: {
+  filename: string;
+  assetPath: string;
+  contentId: string;
+}): Attachment {
+  if (!fs.existsSync(options.assetPath)) {
+    throw new Error(`No existe el asset de email: ${options.assetPath}`);
+  }
+
+  const content = fs.readFileSync(options.assetPath);
+  if (content.length === 0) {
+    throw new Error(`El asset de email está vacío: ${options.assetPath}`);
+  }
+
+  return {
+    filename: options.filename,
+    content,
+    contentType: "image/png",
+    contentId: options.contentId,
+  };
+}
+
 export function escapeHtml(value: unknown): string {
   return String(value ?? "")
     .replace(/&/g, "&amp;")
@@ -179,15 +202,33 @@ export function primerNombre(nombre: unknown): string {
 
 export function institutionalEmailAttachments(): Attachment[] {
   return [
-    { filename: "sidca.png", path: path.join(ASSET_DIRECTORY, "sidca.png"), contentId: "sidca-logo" },
-    { filename: "cea.png", path: path.join(ASSET_DIRECTORY, "cea.png"), contentId: "cea-logo" },
-    { filename: "internacional-educacion.png", path: path.join(ASSET_DIRECTORY, "internacional-educacion.png"), contentId: "ie-logo" },
-    { filename: "cgt.png", path: path.join(ASSET_DIRECTORY, "cgt.png"), contentId: "cgt-logo" },
+    crearAttachmentInline({
+      filename: "sidca.png",
+      assetPath: path.join(ASSET_DIRECTORY, "sidca.png"),
+      contentId: "sidca-logo",
+    }),
+    crearAttachmentInline({
+      filename: "cea.png",
+      assetPath: path.join(ASSET_DIRECTORY, "cea.png"),
+      contentId: "cea-logo",
+    }),
+    crearAttachmentInline({
+      filename: "internacional-educacion.png",
+      assetPath: path.join(ASSET_DIRECTORY, "internacional-educacion.png"),
+      contentId: "ie-logo",
+    }),
+    crearAttachmentInline({
+      filename: "cgt.png",
+      assetPath: path.join(ASSET_DIRECTORY, "cgt.png"),
+      contentId: "cgt-logo",
+    }),
     // Iconos de los canales oficiales. Pesan ~1-2 KB cada uno.
     ...REDES.filter((red) => red.url.trim()).map((red) => ({
-      filename: red.archivo,
-      path: path.join(ASSET_DIRECTORY, red.archivo),
-      contentId: red.contentId,
+      ...crearAttachmentInline({
+        filename: red.archivo,
+        assetPath: path.join(ASSET_DIRECTORY, red.archivo),
+        contentId: red.contentId,
+      }),
     })),
   ];
 }
