@@ -203,24 +203,9 @@ export function primerNombre(nombre: unknown): string {
 export function institutionalEmailAttachments(): Attachment[] {
   return [
     crearAttachmentInline({
-      filename: "sidca.png",
-      assetPath: path.join(ASSET_DIRECTORY, "sidca.png"),
-      contentId: "sidca-logo",
-    }),
-    crearAttachmentInline({
-      filename: "cea.png",
-      assetPath: path.join(ASSET_DIRECTORY, "cea.png"),
-      contentId: "cea-logo",
-    }),
-    crearAttachmentInline({
-      filename: "internacional-educacion.png",
-      assetPath: path.join(ASSET_DIRECTORY, "internacional-educacion.png"),
-      contentId: "ie-logo",
-    }),
-    crearAttachmentInline({
-      filename: "cgt.png",
-      assetPath: path.join(ASSET_DIRECTORY, "cgt.png"),
-      contentId: "cgt-logo",
+      filename: "logos-institucionales.png",
+      assetPath: path.join(ASSET_DIRECTORY, "logos-institucionales.png"),
+      contentId: "logos-institucionales",
     }),
     // Iconos de los canales oficiales. Pesan ~1-2 KB cada uno.
     ...REDES.filter((red) => red.url.trim()).map((red) => ({
@@ -246,42 +231,8 @@ export function institutionalEmailAttachments(): Attachment[] {
  * Antes convivían width y max-height, y esa combinación es la que deformaba
  * los logos institucionales.
  */
-const LOGOS_ENCABEZADO = [
-  {
-    contentId: "sidca-logo",
-    alt: `${MARCA.nombre} - ${MARCA.razon}`,
-    clase: "logo-sidca",
-    ancho: 132, // remitente: se muestra algo mayor que las adherentes
-  },
-  {
-    contentId: "cea-logo",
-    alt: "Confederación de Educadores Argentinos",
-    clase: "logo-cea",
-    ancho: 80,
-  },
-  {
-    contentId: "ie-logo",
-    alt: "Internacional de la Educación",
-    clase: "logo-ie",
-    ancho: 60,
-  },
-  {
-    contentId: "cgt-logo",
-    alt: "Confederación General del Trabajo",
-    clase: "logo-cgt",
-    ancho: 40,
-  },
-] as const;
-
 function renderLogoRow(): string {
-  const celdas = LOGOS_ENCABEZADO.map(
-    (logo) =>
-      `<td align="center" valign="middle" style="padding:0 9px;"><img src="cid:${logo.contentId}" alt="${escapeHtml(logo.alt)}" width="${logo.ancho}" class="${logo.clase}" style="display:block;width:${logo.ancho}px;height:auto;margin:0 auto;border:0;" /></td>`
-  ).join("");
-
-  // La tabla se centra y las celdas se ajustan al contenido: ninguna celda
-  // con ancho porcentual fuerza a un logo a estirarse.
-  return `<table role="presentation" align="center" cellpadding="0" cellspacing="0" border="0" style="margin:0 auto;"><tr>${celdas}</tr></table>`;
+  return `<img src="cid:logos-institucionales" alt="SiDCA, Confederación de Educadores Argentinos, Internacional de la Educación y Confederación General del Trabajo" width="384" class="logos-institucionales" style="display:block;width:100%;max-width:384px;height:auto;margin:0 auto;border:0;" />`;
 }
 
 /**
@@ -528,15 +479,9 @@ export function buildInstitutionalEmail(options: InstitutionalEmailOptions): Ins
     .sidca-pad { padding-left:18px !important; padding-right:18px !important; }
     .sidca-pad-top { padding-top:20px !important; }
     .sidca-titulo { font-size:19px !important; }
-    /* El encabezado achica su padding para que los cuatro logos conserven
-       el mayor ancho posible dentro de la misma línea. */
+    /* El encabezado achica su padding para conservar el bloque completo. */
     .sidca-header { padding-left:8px !important; padding-right:8px !important; }
-    /* Reducción proporcional: cada logo baja ~25 % manteniendo su relación
-       de aspecto, porque sólo se toca el ancho y el alto sigue en auto. */
-    .logo-sidca { width:100px !important; }
-    .logo-cea   { width:60px !important; }
-    .logo-ie    { width:45px !important; }
-    .logo-cgt   { width:30px !important; }
+    .logos-institucionales { width:100% !important; height:auto !important; }
   }
 </style>
 </head>
