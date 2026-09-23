@@ -58,7 +58,7 @@ import {
   validarTipoCloudEventEsperado,
 } from "./events/firestoreDocumentEvent.js";
 import { resolverNumeroAfiliacionHistorico } from "./reafiliacion/historicAffiliationNumber.js";
-import { expoTicketHasDeviceNotRegistered, isExpoPushToken, sendExpoPushNotifications } from "./push/expoPush.js";
+import { isExpoPushToken, sendExpoPushNotifications } from "./push/expoPush.js";
 
 const app = express();
 const PORT = Number(process.env.PORT || 8080);
@@ -2783,9 +2783,73 @@ type BroadcastStatistics = {
   enviados: number;
   fallidos: number;
   deviceNotRegistered: number;
+  tokensDepurados: number;
+  erroresDepuracion: number;
   receiptsDisponibles: number;
   receiptsNoDisponibles?: boolean;
 };
+
+const PUSH_TOKEN_CLEANUP_BATCH_SIZE = 400;
+
+async function depurarPushTokensNoRegistrados(
+  deviceNotRegisteredTokens: string[],
+  tokenUsuarios: Map<string, Set<string>>,
+): Promise<{ tokensDepurados: number; erroresDepuracion: number }> {
+  const tokensPorUsuario = new Map<string, Set<string>>();
+  for (const token of new Set(deviceNotRegisteredTokens)) {
+    const usuarios = tokenUsuarios.get(token) || new Set<string>();
+    for (const usuarioPath of usuarios) {
+      const tokens = tokensPorUsuario.get(usuarioPath) || new Set<string>();
+      tokens.add(token);
+      tokensPorUsuario.set(usuarioPath, tokens);
+    }
+  }
+
+  const writes = [...tokensPorUsuario.entries()].map(([usuarioPath, tokens]) => ({
+    usuarioPath,
+    transform: {
+      document: rutaDocumentoFirestore(usuarioPath),
+      fieldTransforms: [{
+        fieldPath: "pushTokens",
+        removeAllFromArray: {
+          values: [...tokens].map((token) => ({ stringValue: token })),
+        },
+      }],
+    },
+    tokenCount: tokens.size,
+  }));
+
+  let erroresDepuracion = 0;
+  const usuariosDepurados = new Set<string>();
+  for (let index = 0; index < writes.length; index += PUSH_TOKEN_CLEANUP_BATCH_SIZE) {
+    const batch = writes.slice(index, index + PUSH_TOKEN_CLEANUP_BATCH_SIZE);
+    try {
+      await firestoreRequest(`${firestoreBaseUrl}:commit`, {
+        method: "POST",
+        body: JSON.stringify({
+          writes: batch.map(({ tokenCount: _tokenCount, usuarioPath: _usuarioPath, ...write }) => write),
+        }),
+      });
+      batch.forEach((write) => usuariosDepurados.add(write.usuarioPath));
+    } catch (error) {
+      erroresDepuracion += batch.length;
+      console.warn(
+        "[push-broadcast] No se pudieron depurar tokens DeviceNotRegistered:",
+        error instanceof Error ? error.message : error,
+      );
+    }
+  }
+
+  let tokensDepurados = 0;
+  for (const token of new Set(deviceNotRegisteredTokens)) {
+    const usuarios = tokenUsuarios.get(token) || new Set<string>();
+    if (usuarios.size > 0 && [...usuarios].every((path) => usuariosDepurados.has(path))) {
+      tokensDepurados += 1;
+    }
+  }
+
+  return { tokensDepurados, erroresDepuracion };
+}
 
 async function broadcastPushToUsuarios(payload: {
   title: string;
@@ -2794,6 +2858,7 @@ async function broadcastPushToUsuarios(payload: {
 }): Promise<BroadcastStatistics> {
     const usuarios = await queryFirestoreCollection("usuarios", [], 0);
     const tokens = new Set<string>();
+    const tokenUsuarios = new Map<string, Set<string>>();
     let usuariosConTokens = 0;
     let tokensEncontrados = 0;
     let tokensDuplicados = 0;
@@ -2813,6 +2878,10 @@ async function broadcastPushToUsuarios(payload: {
           return;
         }
         const tokenNormalizado = token.trim();
+        const usuarioPath = getFirestoreRelativePath(usuario);
+        const usuariosDelToken = tokenUsuarios.get(tokenNormalizado) || new Set<string>();
+        usuariosDelToken.add(usuarioPath);
+        tokenUsuarios.set(tokenNormalizado, usuariosDelToken);
         if (tokens.has(tokenNormalizado)) {
           tokensDuplicados += 1;
           return;
@@ -2836,6 +2905,8 @@ async function broadcastPushToUsuarios(payload: {
         enviados: 0,
         fallidos: 0,
         deviceNotRegistered: 0,
+        tokensDepurados: 0,
+        erroresDepuracion: 0,
         receiptsDisponibles: 0,
       };
     }
@@ -2855,18 +2926,18 @@ async function broadcastPushToUsuarios(payload: {
         .filter((id): id is string => Boolean(id)),
     );
     const fallidosSinId = [...ticketsConError, ...receiptsConError].filter((item) => !item.id).length;
-    const deviceNotRegistered = new Set(
-      [...resultado.tickets, ...resultado.receipts]
-        .filter(expoTicketHasDeviceNotRegistered)
-        .map((item) => item.id)
-        .filter((id): id is string => Boolean(id)),
-    ).size;
+    const deviceNotRegistered = resultado.deviceNotRegisteredTokens.length;
+    const depuracion = await depurarPushTokensNoRegistrados(
+      resultado.deviceNotRegisteredTokens,
+      tokenUsuarios,
+    );
 
     return {
       ...estadisticasBase,
       enviados: resultado.tickets.filter((ticket) => ticket.status === "ok").length,
       fallidos: erroresPorId.size + fallidosSinId,
       deviceNotRegistered,
+      ...depuracion,
       receiptsDisponibles: resultado.receipts.length,
       receiptsNoDisponibles: resultado.receiptsUnavailable,
     };

@@ -32,6 +32,7 @@ export type ExpoPushResult = {
   tickets: ExpoPushTicket[];
   receipts: ExpoPushReceipt[];
   receiptsUnavailable: boolean;
+  deviceNotRegisteredTokens: string[];
 };
 
 function chunks<T>(items: T[], size: number): T[][] {
@@ -84,6 +85,8 @@ export async function sendExpoPushNotifications(input: {
   }
 
   const tickets: ExpoPushTicket[] = [];
+  const ticketTokenById = new Map<string, string>();
+  const deviceNotRegisteredTokens = new Set<string>();
   let lastStatus = 200;
 
   for (const batch of chunks(tokens, EXPO_BATCH_SIZE)) {
@@ -111,7 +114,16 @@ export async function sendExpoPushNotifications(input: {
         expoErrors: responseBody.errors,
       });
     }
-    if (Array.isArray(responseBody.data)) tickets.push(...responseBody.data);
+    if (Array.isArray(responseBody.data)) {
+      responseBody.data.forEach((ticket, index) => {
+        const token = batch[index];
+        if (ticket.id && token) ticketTokenById.set(ticket.id, token);
+        if (ticket.details?.error === "DeviceNotRegistered" && token) {
+          deviceNotRegisteredTokens.add(token);
+        }
+        tickets.push(ticket);
+      });
+    }
   }
 
   let receipts: ExpoPushReceipt[] = [];
@@ -122,13 +134,24 @@ export async function sendExpoPushNotifications(input: {
       receipts = await getExpoPushReceipts(
         tickets.map((ticket) => ticket.id).filter((id): id is string => Boolean(id)),
       );
+      receipts.forEach((receipt) => {
+        if (receipt.details?.error !== "DeviceNotRegistered" || !receipt.id) return;
+        const token = ticketTokenById.get(receipt.id);
+        if (token) deviceNotRegisteredTokens.add(token);
+      });
     } catch (error) {
       receiptsUnavailable = true;
       console.warn("[expo-push] No se pudieron consultar receipts:", error instanceof Error ? error.message : error);
     }
   }
 
-  return { status: lastStatus, tickets, receipts, receiptsUnavailable };
+  return {
+    status: lastStatus,
+    tickets,
+    receipts,
+    receiptsUnavailable,
+    deviceNotRegisteredTokens: [...deviceNotRegisteredTokens],
+  };
 }
 
 export function expoTicketHasDeviceNotRegistered(ticket: ExpoPushTicket): boolean {
