@@ -16,9 +16,11 @@ export type WelcomeEmailInput = {
   dni: string;
 };
 
-function buildWelcomeEmail(input: Pick<WelcomeEmailInput, "nombre" | "dni">): InstitutionalEmail {
+export const WELCOME_EMAIL_SUBJECT = "SiDCA | Te damos la bienvenida";
+
+export function buildWelcomeEmail(input: Pick<WelcomeEmailInput, "nombre" | "dni">): InstitutionalEmail {
   return buildInstitutionalEmail({
-    subject: "SiDCA | Te damos la bienvenida",
+    subject: WELCOME_EMAIL_SUBJECT,
     preheader: "Tu afiliación fue aprobada: ya sos parte de SiDCA.",
     title: "Te damos la bienvenida al Sindicato de Docentes de Catamarca",
     state: "approved",
@@ -65,7 +67,7 @@ export async function sendWelcomeEmail(input: WelcomeEmailInput): Promise<string
     {
       from: config.from,
       to: input.email,
-      subject: "SiDCA | Te damos la bienvenida",
+      subject: WELCOME_EMAIL_SUBJECT,
       ...(config.replyTo ? { replyTo: config.replyTo } : {}),
       html: email.html,
       text: email.text,

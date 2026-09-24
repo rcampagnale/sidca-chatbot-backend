@@ -12,9 +12,11 @@ export type ReaffiliationRejectedEmailInput = {
   solicitudId: string;
 };
 
-function buildReaffiliationRejectedEmail(input: Omit<ReaffiliationRejectedEmailInput, "email" | "solicitudId">): InstitutionalEmail {
+export const REAFFILIATION_REJECTED_EMAIL_SUBJECT = "SiDCA | Actualización de tu reafiliación";
+
+export function buildReaffiliationRejectedEmail(input: Omit<ReaffiliationRejectedEmailInput, "email" | "solicitudId">): InstitutionalEmail {
   return buildInstitutionalEmail({
-    subject: "SiDCA | Actualización de tu reafiliación",
+    subject: REAFFILIATION_REJECTED_EMAIL_SUBJECT,
     preheader: "Tenemos una actualización sobre tu solicitud de reafiliación.",
     title: "Tu solicitud de reafiliación no fue aprobada",
     state: "rejected",
@@ -64,7 +66,7 @@ export async function sendReaffiliationRejectedEmail(input: ReaffiliationRejecte
     {
       from: config.from,
       to: input.email,
-      subject: "SiDCA | Actualización de tu reafiliación",
+      subject: REAFFILIATION_REJECTED_EMAIL_SUBJECT,
       ...(config.replyTo ? { replyTo: config.replyTo } : {}),
       html: email.html,
       text: email.text,

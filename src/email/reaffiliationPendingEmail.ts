@@ -11,9 +11,11 @@ export type ReaffiliationPendingEmailInput = {
   solicitudId: string;
 };
 
-function buildReaffiliationPendingEmail(input: Omit<ReaffiliationPendingEmailInput, "email" | "solicitudId">): InstitutionalEmail {
+export const REAFFILIATION_PENDING_EMAIL_SUBJECT = "SiDCA | Solicitud de reafiliación recibida";
+
+export function buildReaffiliationPendingEmail(input: Omit<ReaffiliationPendingEmailInput, "email" | "solicitudId">): InstitutionalEmail {
   return buildInstitutionalEmail({
-    subject: "SiDCA | Solicitud de reafiliación recibida",
+    subject: REAFFILIATION_PENDING_EMAIL_SUBJECT,
     preheader: "Recibimos tu solicitud de reafiliación y está en revisión.",
     title: "Recibimos tu solicitud de reafiliación",
     state: "pending",
@@ -86,7 +88,7 @@ export async function sendReaffiliationPendingEmail(input: ReaffiliationPendingE
     {
       from: config.from,
       to: input.email,
-      subject: "SiDCA | Solicitud de reafiliación recibida",
+      subject: REAFFILIATION_PENDING_EMAIL_SUBJECT,
       ...(config.replyTo ? { replyTo: config.replyTo } : {}),
       html: email.html,
       text: email.text,

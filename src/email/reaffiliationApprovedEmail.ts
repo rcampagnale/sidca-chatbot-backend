@@ -16,9 +16,11 @@ export type ReaffiliationApprovedEmailInput = {
   solicitudId: string;
 };
 
-function buildReaffiliationApprovedEmail(input: Omit<ReaffiliationApprovedEmailInput, "email" | "solicitudId">): InstitutionalEmail {
+export const REAFFILIATION_APPROVED_EMAIL_SUBJECT = "SiDCA | Reafiliación aprobada";
+
+export function buildReaffiliationApprovedEmail(input: Omit<ReaffiliationApprovedEmailInput, "email" | "solicitudId">): InstitutionalEmail {
   return buildInstitutionalEmail({
-    subject: "SiDCA | Reafiliación aprobada",
+    subject: REAFFILIATION_APPROVED_EMAIL_SUBJECT,
     preheader: "Tu reafiliación fue aprobada: tu afiliación está activa nuevamente.",
     title: "Tu afiliación a SiDCA está activa nuevamente",
     state: "approved",
@@ -71,7 +73,7 @@ export async function sendReaffiliationApprovedEmail(input: ReaffiliationApprove
     {
       from: config.from,
       to: input.email,
-      subject: "SiDCA | Reafiliación aprobada",
+      subject: REAFFILIATION_APPROVED_EMAIL_SUBJECT,
       ...(config.replyTo ? { replyTo: config.replyTo } : {}),
       html: email.html,
       text: email.text,
