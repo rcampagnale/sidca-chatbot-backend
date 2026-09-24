@@ -401,14 +401,7 @@ export async function renderCertificadoPdfPage(
       cursor += altoFinal;
     });
   });
-  if (opciones.incluirQr === false) {
-    doc.font("Helvetica-Bold").fontSize(cqw(doc, 2.2)).fillColor("#111827");
-    doc.text("QR", pct(doc.page.width, 77.2), pct(doc.page.height, 76.2), {
-      width: pct(doc.page.width, 14.3),
-      align: "center",
-      lineBreak: false,
-    });
-  } else if (emision.urlValidacion) {
+  if (opciones.incluirQr !== false && emision.urlValidacion) {
     const qr = await QRCode.toBuffer(String(emision.urlValidacion), { margin: 2, width: 220 });
     doc.image(qr, pct(doc.page.width, 77.2), pct(doc.page.height, 71.4), { width: pct(doc.page.width, 14.3), height: pct(doc.page.width, 14.3) });
   }

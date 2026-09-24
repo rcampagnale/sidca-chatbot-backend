@@ -512,9 +512,7 @@ export async function renderCertificadoMinisterioPdfPage(
   }
 
   await dibujarFirmantes(doc, emision, recursos);
-  if (recursos.incluirQr === false) {
-    cabecera("QR", QR.x, QR.y + 30, QR.width, 18, true);
-  } else {
+  if (recursos.incluirQr !== false) {
     await dibujarQr(doc, emision);
   }
 }
