@@ -1787,9 +1787,17 @@ function datosSolicitudReafiliacionValidos(
 
 function nombreFechaAfiliacion(): string {
   const ahora = new Date();
-  const fecha = ahora.toLocaleDateString();
-  const hora = ahora.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  return `${fecha} ${hora}`;
+  const parts = new Intl.DateTimeFormat("es-AR", {
+    timeZone: "America/Argentina/Buenos_Aires",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(ahora);
+  const values = Object.fromEntries(parts.map(({ type, value }) => [type, value]));
+  return `${values.day}/${values.month}/${values.year} ${values.hour}:${values.minute}`;
 }
 
 function generarIdDocumentoFirestore(): string {
