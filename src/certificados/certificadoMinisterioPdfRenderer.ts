@@ -4,10 +4,16 @@ import QRCode from "qrcode";
 import fs from "node:fs/promises";
 import path from "node:path";
 import sharp from "sharp";
+import { nombreInstitucionOrganizadora } from "./institucionOrganizadora.js";
+import {
+  textoAuspicioConfiguracion,
+  textoAuspicioConResolucion,
+} from "./ministerioAuspicio.js";
 
 const PAGE = { width: 842, height: 595 };
 const QR = { x: 683, y: 431, width: 90, height: 90 };
 const TITULO_BOX = { left: 0.17, top: 0.355, width: 0.66, height: 0.052 };
+const COLOR_MINISTERIO = "#243b6b";
 const NIVELES_ORDENADOS = ["INICIAL", "PRIMARIO", "SECUNDARIO", "SUPERIOR"];
 
 let marcoBuffer: Buffer | null = null;
@@ -117,12 +123,33 @@ const cargarFirmaHistorica = async (firmante: any, emision: any): Promise<Buffer
   }
 };
 
-type TextoAjustado = {
+export type TextoAjustado = {
   lines: string[];
   fontSize: number;
   lineHeight: number;
   height: number;
 };
+
+// Tipografía oficial del bloque inferior. Se mantiene en unidades base del
+// layout A4 horizontal para que el PDF y el preview compartan la misma
+// jerarquía visual sin comprimir horizontalmente los textos.
+export const FIRMANTES_MINISTERIO_TIPOGRAFIA = {
+  nombre: {
+    inicial: 8.2,
+    minimo: 7.8,
+    maxLineas: 1,
+    interlineado: 1.15,
+  },
+  detalle: {
+    inicial: 6.2,
+    minimo: 5.8,
+    maxLineas: 1,
+    interlineado: 1.18,
+  },
+  separacion: 2.2,
+  margenHorizontal: 2.5,
+  escalaHorizontal: 1,
+} as const;
 
 const partirTexto = (
   doc: PDFKit.PDFDocument,
@@ -146,7 +173,7 @@ const partirTexto = (
   return lineas;
 };
 
-const ajustarTexto = (
+export const ajustarTexto = (
   doc: PDFKit.PDFDocument,
   contenido: string,
   opciones: {
@@ -216,7 +243,7 @@ const fechaCorta = (valor: unknown) => {
   return `${dia}/${mes}/${anio.slice(-2)}`;
 };
 
-const fechaExpedicion = (valor: unknown) => {
+export const fechaExpedicionMinisterio = (valor: unknown) => {
   const fecha = texto(valor);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(fecha)) return "";
   const [anio, mes, dia] = fecha.split("-").map(Number);
@@ -224,7 +251,7 @@ const fechaExpedicion = (valor: unknown) => {
     "enero", "febrero", "marzo", "abril", "mayo", "junio",
     "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
   ];
-  return `El presente certificado se expide en San Fernando del Valle de Catamarca a ${dia} días del mes de ${meses[mes - 1]} de ${anio}.`;
+  return `El presente certificado se expide en San Fernando Del Valle de Catamarca a ${dia} días del mes de ${meses[mes - 1]} de ${anio}.`;
 };
 
 const nivelesInstitucionales = (niveles: unknown) => {
@@ -249,42 +276,18 @@ const cargaHorariaPresentacion = (valor: unknown) => {
     : `${carga} horas cátedra`;
 };
 
-const normalizarNumeroResolucion = (valor: unknown) =>
-  texto(valor).replace(/^resoluci[oó]n\b[\s:.-]*/i, "");
-
-const ETIQUETA_RESOLUCION_MINISTERIO = "S.I.E.(MECYT) N°";
-
-const normalizarTextoAuspicio = (valor: unknown) =>
-  texto(valor)
-    .replace(
-      /resoluci[oó]n\s+S\.I\.C\.E\.\(MET\)\s*N[°º]\s*$/i,
-      `Resolución ${ETIQUETA_RESOLUCION_MINISTERIO}`
-    )
-    .replace(
-      /resoluci[oó]n\s*$/i,
-      `Resolución ${ETIQUETA_RESOLUCION_MINISTERIO}`
-    );
-
-const textoAuspicioConResolucion = (auspicio: unknown, resolucion: unknown) => {
-  const base = normalizarTextoAuspicio(auspicio);
-  const numero = normalizarNumeroResolucion(resolucion);
-  const conPunto = (valor: string) =>
-    valor && !/[.!?]$/.test(valor) ? `${valor}.` : valor;
-  const resultado = !base
-    ? numero
-      ? `Resolución ${ETIQUETA_RESOLUCION_MINISTERIO} ${numero}.`
-      : ""
-    : !numero
-      ? conPunto(base)
-      : /N[°º]\s*$/i.test(base)
-        ? `${base} ${numero}.`
-        : `${conPunto(base)} Resolución ${ETIQUETA_RESOLUCION_MINISTERIO} ${numero}.`;
-  return resultado
-    .replace(/(N[°º])\.\s*/gi, "$1 ")
-    .replace(/(N[°º]\.?\s*)resoluci[oó]n\b\s*/i, "$1");
+export const formatearTituloMinisterio = (valor: unknown) => {
+  const contenido = texto(valor)
+    .replace(/^["“”]+/, "")
+    .replace(/["“”]+$/, "")
+    .trim();
+  return contenido ? `"${contenido}"` : "";
 };
 
-const textoMinisterio = (certificado: any) => {
+export const construirTextoMinisterio = (certificado: any, participante: any = {}) => {
+  const modalidad = texto(certificado?.modalidad) || "[MODALIDAD]";
+  const inicio = fechaCorta(certificado?.fechaInicio) || "[FECHA INICIO]";
+  const fin = fechaCorta(certificado?.fechaFin) || "[FECHA FIN]";
   const localidad = texto(certificado?.localidad);
   const departamento = texto(certificado?.departamento);
   const ubicacion = localidad
@@ -294,16 +297,31 @@ const textoMinisterio = (certificado: any) => {
       : "";
   const evaluacion = texto(certificado?.textoEvaluacion);
   const carga = cargaHorariaPresentacion(certificado?.cargaHoraria);
+  const nombre = texto(participante?.apellidoNombre || participante?.nombre);
+  const dni = texto(participante?.dni);
+  const auspicio = textoAuspicioConResolucion(
+    textoAuspicioConfiguracion(certificado),
+    certificado?.resolucion
+  );
+  const expedicion = fechaExpedicionMinisterio(certificado?.fecha);
 
   return {
-    actividad: `Participó y aprobó el ${texto(certificado?.tipoActividad)} denominado`,
-    dictado: `Dictado de manera ${texto(certificado?.modalidad)}, desde ${fechaCorta(
-      certificado?.fechaInicio
-    )} al ${fechaCorta(certificado?.fechaFin)}${ubicacion}.`,
-    duracion: `Con una duración de ${carga}${evaluacion ? `, ${evaluacion}` : "."}`,
+    institucionOrganizadora: nombreInstitucionOrganizadora(certificado),
+    modalidad: texto(certificado?.modalidad),
+    textoEvaluacion: evaluacion,
+    firmantes: Array.isArray(certificado?.firmantesMinisterio)
+      ? certificado.firmantesMinisterio
+      : [],
+    titulo: formatearTituloMinisterio(certificado?.titulo),
+    participante: `Que ${nombre || "[APELLIDO Y NOMBRE]"} D.N.I. N° ${dni || "[DNI]"}`,
+    actividad: `Participó y aprobó el ${texto(certificado?.tipoActividad) || "[TIPO DE ACTIVIDAD]"} denominado`,
+    dictado: `Dictado de manera ${modalidad}, desde ${inicio} al ${fin}${ubicacion}`,
+    duracion: `con una duración de ${carga || "[CARGA HORARIA]"}${evaluacion ? `, ${evaluacion}` : "."}`,
     niveles: nivelesInstitucionales(certificado?.niveles),
-    auspicio: textoAuspicioConResolucion(certificado?.textoAuspicio, certificado?.resolucion),
-    expedicion: fechaExpedicion(certificado?.fecha),
+    auspicio,
+    textoAuspicioFinal: auspicio,
+    expedicion,
+    fechaExpedicion: expedicion,
   };
 };
 
@@ -335,6 +353,9 @@ const dibujarFirmantes = async (
     const anchoColumna = s(doc, anchosColumna[columna]);
     const anchoImagen = s(doc, anchosImagen[columna]);
     const izquierda = x(doc, posiciones[columna]);
+    const margenTexto = s(doc, FIRMANTES_MINISTERIO_TIPOGRAFIA.margenHorizontal);
+    const izquierdaTexto = izquierda + margenTexto;
+    const anchoTexto = anchoColumna - margenTexto * 2;
     const firma = await (recursos.cargarFirmaHistorica
       ? recursos.cargarFirmaHistorica(firmante, emision)
       : cargarFirmaHistorica(firmante, emision));
@@ -347,26 +368,35 @@ const dibujarFirmantes = async (
 
     let cursor = y(doc, 486);
     const textosFirmante = [
-      { valor: texto(firmante?.nombre), size: s(doc, 6.5), bold: true },
-      { valor: texto(firmante?.cargo), size: s(doc, 5.5), bold: false },
+      {
+        valor: texto(firmante?.nombre),
+        tipografia: FIRMANTES_MINISTERIO_TIPOGRAFIA.nombre,
+      },
+      {
+        valor: texto(firmante?.cargo),
+        tipografia: FIRMANTES_MINISTERIO_TIPOGRAFIA.detalle,
+      },
       ...texto(firmante?.organismo)
         .replace(/\.\s+/g, ".\n")
         .split("\n")
         .filter(Boolean)
-        .map((valor) => ({ valor, size: s(doc, 5.5), bold: false })),
+        .map((valor) => ({
+          valor,
+          tipografia: FIRMANTES_MINISTERIO_TIPOGRAFIA.detalle,
+        })),
     ];
 
     for (const renglon of textosFirmante) {
       const ajustado = ajustarTexto(doc, renglon.valor, {
-        ancho: anchoColumna,
-        inicial: renglon.size,
-        minimo: Math.max(s(doc, 4.2), renglon.size * 0.72),
-        maxLineas: 1,
-        interlineado: 1.12,
-        bold: renglon.bold,
+        ancho: anchoTexto,
+        inicial: s(doc, renglon.tipografia.inicial),
+        minimo: s(doc, renglon.tipografia.minimo),
+        maxLineas: renglon.tipografia.maxLineas,
+        interlineado: renglon.tipografia.interlineado,
+        bold: false,
       });
-      dibujarTexto(doc, ajustado, izquierda, cursor, anchoColumna, renglon.bold);
-      cursor += ajustado.height + s(doc, 1.2);
+      dibujarTexto(doc, ajustado, izquierdaTexto, cursor, anchoTexto, false);
+      cursor += ajustado.height + s(doc, FIRMANTES_MINISTERIO_TIPOGRAFIA.separacion);
     }
   }
 };
@@ -416,8 +446,25 @@ export async function renderCertificadoMinisterioPdfPage(
   doc.image(marco, 0, 0, { width: doc.page.width, height: doc.page.height });
   doc.image(logo, x(doc, 326.7), y(doc, 42), { width: s(doc, 49.4), height: y(doc, 58) });
 
-  const cabecera = (valor: string, izquierda: number, superior: number, ancho: number, cuerpo: number, bold = false, align: "center" | "left" = "center") => {
-    doc.font(bold ? "Helvetica-Bold" : "Helvetica").fontSize(s(doc, cuerpo)).fillColor("#000000");
+  const cabecera = (
+    valor: string,
+    izquierda: number,
+    superior: number,
+    ancho: number,
+    cuerpo: number,
+    bold = false,
+    align: "center" | "left" = "center",
+    color = "#000000",
+    italic = false
+  ) => {
+    const fuente = italic
+      ? bold
+        ? "Helvetica-BoldOblique"
+        : "Helvetica-Oblique"
+      : bold
+      ? "Helvetica-Bold"
+      : "Helvetica";
+    doc.font(fuente).fontSize(s(doc, cuerpo)).fillColor(color);
     doc.text(valor, x(doc, izquierda), y(doc, superior), {
       width: s(doc, ancho),
       align,
@@ -425,12 +472,35 @@ export async function renderCertificadoMinisterioPdfPage(
     });
   };
 
-  cabecera("Ministerio de\nEducación y Trabajo", 385, 49, 190, 13, true, "left");
-  cabecera("Catamarca Gobierno", 385, 84, 190, 11, false, "left");
-  cabecera("SECRETARIA DE INNOVACION Y CALIDAD EDUCATIVA", 274.3, 111.3, 293.1, 11, true);
-  cabecera("CERTIFICA", 351.7, 136, 138.5, 26, true);
+  cabecera("Ministerio de\nEducación y Trabajo", 385, 49, 190, 13, true, "left", COLOR_MINISTERIO);
+  cabecera("Catamarca Gobierno", 385, 79, 190, 11, false, "left");
+  cabecera("SECRETARIA DE INNOVACION Y CALIDAD EDUCATIVA", 274.3, 105, 293.1, 10.5, false);
+  const nombreInstitucion = nombreInstitucionOrganizadora(certificado);
+  const mostrarInstitucion = Boolean(nombreInstitucion);
+  if (mostrarInstitucion) {
+    cabecera(nombreInstitucion, 245, 122.5, 352, 12.5, true);
+  }
+  const coordenadas = mostrarInstitucion
+    ? {
+        certifica: 147.5,
+        participante: 184,
+        actividad: 207.9,
+        titulo: 234.5,
+        gapAfterTitle: 8,
+        gapBetweenBlocks: 10,
+      }
+    : {
+        certifica: 136,
+        participante: 172.5,
+        actividad: 196.4,
+        titulo: 223,
+        gapAfterTitle: 14,
+        gapBetweenBlocks: 12,
+      };
+  cabecera("CERTIFICA", 351.7, coordenadas.certifica, 138.5, 26, true, "center", "#000000", true);
 
-  const participanteTexto = `Que ${nombre} D.N.I. N° ${dni}`;
+  const textos = construirTextoMinisterio(certificado, participante);
+  const participanteTexto = textos.participante;
   const participanteAjustado = ajustarTexto(doc, participanteTexto, {
     ancho: s(doc, 640),
     inicial: s(doc, 13),
@@ -442,11 +512,10 @@ export async function renderCertificadoMinisterioPdfPage(
     doc,
     participanteAjustado,
     x(doc, 101),
-    y(doc, 172.5) - participanteAjustado.height / 2,
+    y(doc, coordenadas.participante) - participanteAjustado.height / 2,
     s(doc, 640)
   );
 
-  const textos = textoMinisterio(certificado);
   const actividad = ajustarTexto(doc, textos.actividad, {
     ancho: s(doc, 672),
     inicial: s(doc, 11.5),
@@ -454,27 +523,26 @@ export async function renderCertificadoMinisterioPdfPage(
     maxLineas: 1,
     interlineado: 1.2,
   });
-  dibujarTexto(doc, actividad, x(doc, 85), y(doc, 196.4) - actividad.height / 2, s(doc, 672));
+  dibujarTexto(doc, actividad, x(doc, 85), y(doc, coordenadas.actividad) - actividad.height / 2, s(doc, 672));
 
   // Las comillas también ocupan ancho. Se incluyen antes de medir para que un
   // título de dos líneas nunca se desborde al agregarlas al momento de pintar.
-  const titulo = ajustarTexto(doc, `“${texto(certificado.titulo)}”`, {
+  const titulo = ajustarTexto(doc, textos.titulo || '"[TÍTULO DE LA CAPACITACIÓN]"', {
     ancho: doc.page.width * TITULO_BOX.width,
     inicial: s(doc, 14.5),
     minimo: s(doc, 11.5),
     maxLineas: 2,
-    interlineado: 1.16,
+    interlineado: 1.1,
     bold: true,
   });
-  // El cuerpo conserva su flujo actual. La caja visual del título reproduce el
-  // preview: al crecer a dos líneas se desplaza media línea hacia abajo, para
-  // mantener el centro de la banda entre la actividad y el dictado.
-  const limiteSuperiorDictado = y(doc, 223) + titulo.height + y(doc, 14);
-  const desplazamientoTitulo = Math.max(0, (titulo.height - titulo.lineHeight) / 2);
-  const tituloBoxTop = doc.page.height * TITULO_BOX.top;
-  const tituloBoxHeight = doc.page.height * TITULO_BOX.height;
+  // El título se centra dinámicamente entre la actividad y el primer bloque
+  // del cuerpo. Su altura real depende de si entra en una o dos líneas.
+  const limiteSuperiorDictado =
+    y(doc, coordenadas.titulo) + titulo.height + y(doc, coordenadas.gapAfterTitle);
+  const limiteInferiorTitulo = y(doc, coordenadas.actividad + 11.5);
   const tituloTop =
-    tituloBoxTop + (tituloBoxHeight - titulo.height) / 2 + desplazamientoTitulo;
+    limiteInferiorTitulo +
+    (limiteSuperiorDictado - limiteInferiorTitulo - titulo.height) / 2;
   const tituloX = doc.page.width * TITULO_BOX.left;
   const tituloWidth = doc.page.width * TITULO_BOX.width;
   dibujarTexto(doc, titulo, tituloX, tituloTop, tituloWidth, true);
@@ -502,10 +570,10 @@ export async function renderCertificadoMinisterioPdfPage(
       cortePreferido: "cortePreferido" in bloque ? bloque.cortePreferido : undefined,
     });
     dibujarTexto(doc, ajustado, x(doc, 85), cursor, s(doc, 672));
-    cursor += ajustado.height + y(doc, 12);
+    cursor += ajustado.height + y(doc, coordenadas.gapBetweenBlocks);
   }
 
-  if (cursor - y(doc, 12) >= y(doc, 408)) {
+  if (cursor - y(doc, coordenadas.gapBetweenBlocks) >= y(doc, 408)) {
     throw new Error(
       `Certificado ${referenciaCertificado(emision)}: el texto Ministerio invade la zona de firmas.`
     );

@@ -50,6 +50,8 @@ import {
   esSegmentoValido,
   obtenerSegmento,
 } from "./certificados/segmentos.js";
+import { normalizarInstitucionOrganizadora, resolverInstitucionOrganizadora } from "./certificados/institucionOrganizadora.js";
+import { textoAuspicioConfiguracion } from "./certificados/ministerioAuspicio.js";
 import {
   decodificarUsuarioIdDesdeDocumentEvent,
   decodificarDniDesdeCounterEvent,
@@ -3560,6 +3562,7 @@ const configuracionCertificadoSchema = z.strictObject({
   fecha: z.string().trim().max(200),
   modalidad: z.string().trim().max(120),
   institucionCertificado: z.enum(INSTITUCIONES_CERTIFICADO),
+  institucionOrganizadora: z.string().trim().max(120).optional().default(""),
   autoridades: z.array(autoridadCertificadoSchema).max(2).optional().default([]),
   tipoActividad: z.string().trim().max(100).optional().default(""),
   fechaInicio: z.string().trim().max(10).optional().default(""),
@@ -3677,6 +3680,8 @@ function mapConfiguracionCertificado(
   record: FirestoreRecord,
   cursoId: string
 ): Record<string, any> {
+  const institucionCertificado = normalizarInstitucionCertificado(record);
+
   return {
     cursoId: record.cursoId || cursoId,
     cursoTitulo: record.cursoTitulo || "",
@@ -3686,7 +3691,8 @@ function mapConfiguracionCertificado(
     dias: record.dias || "",
     fecha: record.fecha || "",
     modalidad: record.modalidad || "",
-    institucionCertificado: normalizarInstitucionCertificado(record),
+    institucionCertificado,
+    institucionOrganizadora: resolverInstitucionOrganizadora(record),
     autoridades: obtenerAutoridadesConfiguracion(record),
     tipoActividad: record.tipoActividad || "",
     fechaInicio: record.fechaInicio || "",
@@ -3695,10 +3701,13 @@ function mapConfiguracionCertificado(
     departamento: record.departamento || "",
     niveles: Array.isArray(record.niveles) ? record.niveles : [],
     textoEvaluacion: record.textoEvaluacion || "",
-    textoAuspicio: record.textoAuspicio || "",
+    textoAuspicio:
+      institucionCertificado === "ministerio"
+        ? textoAuspicioConfiguracion(record)
+        : "",
     descargaAppHabilitada: record.descargaAppHabilitada !== false,
     firmantesMinisterio:
-      normalizarInstitucionCertificado(record) === "ministerio"
+      institucionCertificado === "ministerio"
         ? obtenerFirmantesMinisterioConfiguracion(record)
         : [],
     estadoConfiguracion: record.estadoConfiguracion || "borrador",
@@ -4420,6 +4429,9 @@ app.put("/api/certificados/admin/configuracion/:cursoId", async (req, res) => {
       modalidad: datosValidados.modalidad,
 
       institucionCertificado: datosValidados.institucionCertificado,
+      institucionOrganizadora: normalizarInstitucionOrganizadora(
+        datosValidados.institucionOrganizadora
+      ),
       descargaAppHabilitada: datosValidados.descargaAppHabilitada !== false,
 
       estadoConfiguracion,
@@ -7343,6 +7355,7 @@ async function emitirCertificadoParaUsuario({
       ...(institucionCertificado === "ministerio"
         ? {
             layoutVersion: "ministerio-v1",
+            institucionOrganizadora: resolverInstitucionOrganizadora(certificado),
             tipoActividad: String(certificado.tipoActividad || ""),
             fechaInicio: String(certificado.fechaInicio || ""),
             fechaFin: String(certificado.fechaFin || ""),
@@ -7352,7 +7365,7 @@ async function emitirCertificadoParaUsuario({
               ? certificado.niveles.map((nivel: unknown) => String(nivel || "").trim()).filter(Boolean)
               : [],
             textoEvaluacion: String(certificado.textoEvaluacion || ""),
-            textoAuspicio: String(certificado.textoAuspicio || ""),
+            textoAuspicio: textoAuspicioConfiguracion(certificado),
             firmantesMinisterio,
           }
         : {}),
@@ -7670,11 +7683,13 @@ function proyectarCertificadoValidacionPublica(
     modalidad: String(fuente.modalidad || ""),
     institucionCertificado,
     institucionValidacion,
+    institucionOrganizadora: resolverInstitucionOrganizadora(fuente),
   };
 
   if (institucionCertificado === "ministerio") {
     Object.assign(resultado, {
       layoutVersion: String(fuente.layoutVersion || "ministerio-v1"),
+      institucionOrganizadora: resolverInstitucionOrganizadora(fuente),
       tipoActividad: String(fuente.tipoActividad || ""),
       fechaInicio: String(fuente.fechaInicio || ""),
       fechaFin: String(fuente.fechaFin || ""),
@@ -7684,7 +7699,7 @@ function proyectarCertificadoValidacionPublica(
         ? fuente.niveles.map((nivel: unknown) => String(nivel || "").trim()).filter(Boolean)
         : [],
       textoEvaluacion: String(fuente.textoEvaluacion || ""),
-      textoAuspicio: String(fuente.textoAuspicio || ""),
+      textoAuspicio: textoAuspicioConfiguracion(fuente),
     });
   }
 

@@ -14,7 +14,8 @@
     "pdf:job": "node dist/src/certificadosPdfJob.js",
     "test:pdf-certificados": "tsx scripts/testCertificadosPdf.ts",
     "test:pdf-certificados-curso": "tsx scripts/testCertificadosPdfCurso.ts",
-    "test:ministerio-pdf-local": "tsx scripts/testMinisterioPdfLocal.ts"
+    "test:ministerio-pdf-local": "tsx scripts/testMinisterioPdfLocal.ts",
+    "test:ministerio-texto": "tsx scripts/testMinisterioTexto.ts"
   },
   "dependencies": {
     "@google-cloud/storage": "^7.22.0",
