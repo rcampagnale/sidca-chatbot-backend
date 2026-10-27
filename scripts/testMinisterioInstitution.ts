@@ -22,7 +22,15 @@ assert.equal(
     institucionCertificado: "ministerio",
     institucionOrganizadora: "instituto tecnológico municipal",
   }),
-  "INSTITUTO TECNOLÓGICO MUNICIPAL"
+  "INSTITUTO TECNOLOGICO MUNICIPAL (I.T.M)"
+);
+assert.equal(
+  normalizarInstitucionOrganizadora("INSTITUTO TECNOLOGICO MUNICIPAL (I.T.M)"),
+  "itm"
+);
+assert.equal(
+  normalizarInstitucionOrganizadora("INSTITUTO TECNOLÓGICO MUNICIPAL"),
+  "itm"
 );
 
 assert.equal(resolverInstitucionOrganizadora({ institucionCertificado: "ministerio" }), "");

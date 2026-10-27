@@ -55,7 +55,7 @@ const bulk = construirTextoMinisterio(certificado, participante);
 assert.equal(nombreInstitucionOrganizadora(certificado), "SINDICATO DE DOCENTES DE CATAMARCA - SI.D.CA.");
 assert.equal(
   nombreInstitucionOrganizadora({ ...certificado, institucionOrganizadora: "itm" }),
-  "INSTITUTO TECNOLÓGICO MUNICIPAL"
+  "INSTITUTO TECNOLOGICO MUNICIPAL (I.T.M)"
 );
 assert.equal(
   individual.titulo,
