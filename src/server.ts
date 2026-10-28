@@ -60,7 +60,11 @@ import {
   validarTipoCloudEventEsperado,
 } from "./events/firestoreDocumentEvent.js";
 import { resolverNumeroAfiliacionHistorico } from "./reafiliacion/historicAffiliationNumber.js";
-import { isExpoPushToken, sendExpoPushNotifications } from "./push/expoPush.js";
+import {
+  formatExpoPushErrorLog,
+  isExpoPushToken,
+  sendExpoPushNotifications,
+} from "./push/expoPush.js";
 
 const app = express();
 const PORT = Number(process.env.PORT || 8080);
@@ -2961,7 +2965,12 @@ app.post("/api/push/broadcast", async (req, res) => {
     const estadisticas = await broadcastPushToUsuarios(payload);
     return res.status(200).json({ ok: true, estadisticas });
   } catch (error: any) {
-    console.error("[push-broadcast] Error controlado:", error instanceof Error ? error.message : error);
+    const detalleExpo = formatExpoPushErrorLog(error);
+    console.error(
+      "[push-broadcast] Error controlado:",
+      error instanceof Error ? error.message : error,
+      detalleExpo || "",
+    );
     const statusCode = Number(error?.statusCode || 0);
     if (error instanceof z.ZodError) {
       return res.status(400).json({ ok: false, error: "Payload inválido.", issues: error.issues });
