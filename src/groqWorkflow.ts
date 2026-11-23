@@ -36,6 +36,12 @@ export type BackendArticulo = {
   [key: string]: unknown;
 };
 
+export type BackendServiceContact = {
+  area?: string;
+  whatsapp?: string;
+  url?: string;
+};
+
 export type ChatbotWorkflowOutput = {
   ok: boolean;
   tipo: string;
@@ -48,6 +54,7 @@ export type ChatbotWorkflowOutput = {
   referencias: string[];
   busqueda: SearchHit[];
   conversationId: string | null;
+  asesoramientoGremial?: BackendServiceContact;
   error?: string;
 };
 
@@ -128,6 +135,19 @@ type SourcesManifest = {
 
 let cachedChunks: LocalChunk[] | null = null;
 let cachedAt = 0;
+let cachedChunksComplete: LocalChunk[] | null = null;
+let cachedChunksVersion = "";
+let loadingChunksPromise: Promise<LocalChunk[]> | null = null;
+const SOURCE_LOAD_CONCURRENCY = 4;
+const RESPONSE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const RESPONSE_CACHE_MAX_ENTRIES = 500;
+
+type CachedChatbotResponse = {
+  expiresAt: number;
+  response: ChatbotWorkflowOutput;
+};
+
+const responseCache = new Map<string, CachedChatbotResponse>();
 
 const STOPWORDS = new Set([
   "para",
@@ -203,11 +223,30 @@ const QUERY_EXPANSIONS: QueryExpansion[] = [
       "enfermedad común",
       "afeccion comun",
       "afección común",
+      "gripe",
+      "resfrio",
+      "resfrío",
+      "fiebre",
+      "febricula",
+      "febrícula",
+      "enfermedad",
+      "enfermo",
+      "enferma",
+      "afeccion",
+      "afección",
+      "lesion",
+      "lesión",
+      "medico",
+      "médico",
+      "reposo medico",
+      "reposo médico",
+      "certificado medico",
+      "certificado médico",
       "operacion menor",
       "operación menor",
     ],
     terms: [
-      "afecciones de corto tratamiento enfermedad comun operaciones quirurgicas menores veinticinco dias",
+      "afecciones de corto tratamiento enfermedad comun gripe resfrio fiebre reposo medico certificado medico operaciones quirurgicas menores veinticinco dias",
     ],
     preferredArticles: ["16", "17"],
   },
@@ -217,6 +256,11 @@ const QUERY_EXPANSIONS: QueryExpansion[] = [
       "enfermedad hora",
       "me retire enfermo",
       "retirarme enfermo",
+      "me enferme",
+      "me enfermo",
+      "retirarme por enfermedad",
+      "en hora de labor",
+      "mientras estaba trabajando",
       "same",
       "guardia",
     ],
@@ -240,6 +284,12 @@ const QUERY_EXPANSIONS: QueryExpansion[] = [
     dominio: "licencias",
     triggers: [
       "largo tratamiento",
+      "enfermedad de largo tratamiento",
+      "tratamiento prolongado",
+      "enfermedad prolongada",
+      "afeccion prolongada",
+      "reposo prolongado",
+      "varios meses",
       "enfermedad grave",
       "junta medica",
       "junta médica",
@@ -247,7 +297,7 @@ const QUERY_EXPANSIONS: QueryExpansion[] = [
       "complejo diagnóstico",
     ],
     terms: [
-      "afecciones lesiones largo tratamiento junta medica un año seis meses haberes",
+      "afecciones lesiones largo tratamiento tratamiento prolongado enfermedad prolongada reposo prolongado varios meses junta medica un año seis meses haberes",
     ],
     preferredArticles: ["20", "21", "22"],
   },
@@ -343,7 +393,7 @@ const QUERY_EXPANSIONS: QueryExpansion[] = [
       "hijo enfermo",
     ],
     terms: [
-      "atencion grupo familiar enfermo accidentado quince dias cuarenta cinco dias con goce haberes",
+      "atencion grupo familiar cuidado familiar asistencia personal madre padre hijo enfermo accidentado quince dias cuarenta cinco dias con goce haberes",
     ],
     preferredArticles: ["30"],
   },
@@ -378,7 +428,6 @@ const QUERY_EXPANSIONS: QueryExpansion[] = [
       "exámenes",
       "rendir",
       "mesa examinadora",
-      "final",
     ],
     terms: [
       "estudios examenes practicas rendir examen finales nivel superior universitario postgrado treinta dias cinco dias articulo 35",
@@ -471,6 +520,8 @@ const QUERY_EXPANSIONS: QueryExpansion[] = [
       "conferencias",
       "simposio",
       "simposios",
+      "actualizacion profesional",
+      "actualización profesional",
     ],
     terms: [
       "capacitacion perfeccionamiento docente talleres congresos cursos conferencias simposios actividad cultural auspicio oficial diez dias habiles cinco dias anticipacion articulo 41",
@@ -528,6 +579,7 @@ const QUERY_EXPANSIONS: QueryExpansion[] = [
     triggers: [
       "fallecimiento",
       "duelo",
+      "fallecio",
       "murio",
       "murió",
       "muerte",
@@ -556,6 +608,13 @@ const QUERY_EXPANSIONS: QueryExpansion[] = [
       "meteorologicos",
       "meteorológica",
       "meteorológicas",
+      "caso fortuito",
+      "inundacion",
+      "inundación",
+      "crecida",
+      "corte de camino",
+      "imposibilidad material",
+      "acceso interrumpido",
       "fenomeno meteorologico",
       "fenómeno meteorológico",
       "fuerza mayor",
@@ -563,7 +622,7 @@ const QUERY_EXPANSIONS: QueryExpansion[] = [
       "razones climáticas",
     ],
     terms: [
-      "razones extraordinarias fenomenos meteorologicos fuerza mayor inasistencia justificacion articulo 49",
+      "razones extraordinarias fenomenos meteorologicos fuerza mayor caso fortuito inundacion crecida corte de camino imposibilidad material acceso interrumpido inasistencia justificacion articulo 49",
     ],
     preferredArticles: ["49"],
   },
@@ -1661,8 +1720,8 @@ async function getSourceConfigs(): Promise<SourceConfig[]> {
       );
     } catch (error: any) {
       console.warn(
-        "[groqWorkflow] No se pudo cargar SIDCA_DOCS_MANIFEST_URL. Se usa fallback local:",
-        error?.message || error
+        "[groqWorkflow] manifest_load_failed",
+        { code: "manifest_load_failed" },
       );
     }
   }
@@ -1800,6 +1859,55 @@ function getObjectField(item: unknown, keys: string[]): string | undefined {
   }
 
   return undefined;
+}
+
+function getAsesoramientoGremialContact(
+  chunks: LocalChunk[]
+): BackendServiceContact | undefined {
+  const chunk = chunks.find((item) => {
+    if (item.dominio !== "servicios") return false;
+
+    const id = getServiceItemId(item);
+    if (id === "sidca_asesoramiento_gremial") return true;
+
+    const title =
+      item.titulo ||
+      item.descripcion ||
+      getObjectField(item.raw, ["categoria", "titulo", "nombre"]) ||
+      "";
+    return normalizeText(title).includes("asesoramiento gremial");
+  });
+
+  if (!chunk || typeof chunk.raw !== "object" || chunk.raw === null) {
+    return undefined;
+  }
+
+  const raw = chunk.raw as Record<string, unknown>;
+  let contact: Record<string, unknown> | undefined;
+
+  const rawContact = raw.contact ?? raw.contacto;
+
+  if (typeof rawContact === "object" && rawContact !== null) {
+    contact = rawContact as Record<string, unknown>;
+  } else if (Array.isArray(raw.contactos)) {
+    const match = raw.contactos.find((item) => {
+      if (typeof item !== "object" || item === null) return false;
+      const area = getObjectField(item, ["area", "nombre"]) || "";
+      return normalizeText(area).includes("asesoramiento");
+    });
+    if (typeof match === "object" && match !== null) {
+      contact = match as Record<string, unknown>;
+    }
+  }
+
+  const whatsapp = getObjectField(contact, ["whatsapp", "telefono", "celular"]);
+  const url = getObjectField(contact, ["url"]);
+  const area =
+    getObjectField(contact, ["area", "nombre"]) || "Asesoramiento Gremial";
+
+  if (!whatsapp && !url) return undefined;
+
+  return { area, whatsapp, url };
 }
 
 function extractArticleRefs(value?: string): string[] {
@@ -2064,33 +2172,106 @@ function extractChunksFromJson(data: unknown, source: SourceConfig): LocalChunk[
   return singleChunk ? [singleChunk] : [];
 }
 
+async function mapConcurrenciaLimitada<T, R>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+
+  const runWorker = async () => {
+    while (true) {
+      const index = nextIndex++;
+      if (index >= items.length) return;
+      results[index] = await worker(items[index], index);
+    }
+  };
+
+  await Promise.all(
+    Array.from(
+      { length: Math.min(Math.max(concurrency, 1), items.length || 1) },
+      () => runWorker(),
+    ),
+  );
+
+  return results;
+}
+
 async function loadLocalChunks(): Promise<LocalChunk[]> {
   const ttl = Number(getEnv("LOCAL_RAG_CACHE_TTL_MS") || 5 * 60 * 1000);
   const now = Date.now();
 
   if (cachedChunks && now - cachedAt < ttl) {
+    console.log("[groqWorkflow] documents_cache_hit", {
+      fragmentos: cachedChunks.length,
+    });
     return cachedChunks;
   }
 
-  const sources = await getSourceConfigs();
-  const chunks: LocalChunk[] = [];
-
-  for (const source of sources) {
-    try {
-      const json = await loadJsonFromSource(source.source);
-      chunks.push(...extractChunksFromJson(json, source));
-    } catch (error: any) {
-      console.warn(
-        `[groqWorkflow] No se pudo cargar fuente ${source.filename}:`,
-        error?.message || error
-      );
-    }
+  if (loadingChunksPromise) {
+    console.log("[groqWorkflow] documents_load_shared");
+    return loadingChunksPromise;
   }
 
-  cachedChunks = chunks;
-  cachedAt = now;
+  loadingChunksPromise = (async () => {
+    const startedAt = Date.now();
+    const sources = await getSourceConfigs();
+    console.log("[groqWorkflow] documents_load_start", {
+      fuentes: sources.length,
+    });
 
-  return chunks;
+    const resultados = await mapConcurrenciaLimitada(
+      sources,
+      SOURCE_LOAD_CONCURRENCY,
+      async (source) => {
+        try {
+          const json = await loadJsonFromSource(source.source);
+          return { ok: true, chunks: extractChunksFromJson(json, source) };
+        } catch {
+          console.warn(
+            `[groqWorkflow] source_load_failed ${source.filename}`,
+            { code: "source_load_failed" },
+          );
+          return { ok: false, chunks: [] as LocalChunk[] };
+        }
+      },
+    );
+
+    const chunks = resultados.flatMap((resultado) => resultado.chunks);
+    const cargaCompleta = resultados.length === sources.length &&
+      resultados.every((resultado) => resultado.ok);
+
+    if (cargaCompleta && chunks.length > 0) {
+      cachedChunks = chunks;
+      cachedChunksComplete = chunks;
+      cachedAt = Date.now();
+      cachedChunksVersion = `${sources.map((source) => source.source).join("|")}:${chunks.length}:${cachedAt}`;
+    } else if (cachedChunksComplete) {
+      console.warn("[groqWorkflow] documents_stale_cache_used", {
+        fuentesFallidas: resultados.filter((resultado) => !resultado.ok).length,
+        fragmentos: cachedChunksComplete.length,
+      });
+      return cachedChunksComplete;
+    } else {
+      throw new Error("initial_documents_unavailable");
+    }
+
+    console.log("[groqWorkflow] documents_loaded", {
+      fuentes: sources.length,
+      fragmentos: chunks.length,
+      cargaCompleta,
+      duracionMs: Date.now() - startedAt,
+    });
+
+    return chunks;
+  })();
+
+  try {
+    return await loadingChunksPromise;
+  } finally {
+    loadingChunksPromise = null;
+  }
 }
 
 function expandQuestion(pregunta: string, dominio: DominioBackend): string {
@@ -2190,6 +2371,12 @@ function isClimateQuestion(pregunta: string): boolean {
     text.includes("fenomenos meteorologicos") ||
     text.includes("meteorolog") ||
     text.includes("fuerza mayor") ||
+    text.includes("caso fortuito") ||
+    text.includes("inundacion") ||
+    text.includes("crecida") ||
+    text.includes("corte de camino") ||
+    text.includes("imposibilidad material") ||
+    text.includes("acceso interrumpido") ||
     text.includes("lluvia") ||
     text.includes("temporal") ||
     text.includes("tormenta") ||
@@ -2197,6 +2384,29 @@ function isClimateQuestion(pregunta: string): boolean {
     compact.includes("climtic") ||
     compact.includes("clim")
   );
+}
+
+function isIllnessDuringWorkQuestion(pregunta: string): boolean {
+  const text = normalizeText(pregunta);
+  const mentionsIllness =
+    text.includes("enferme") ||
+    text.includes("enfermo") ||
+    text.includes("enfermedad") ||
+    text.includes("fiebre") ||
+    text.includes("gripe") ||
+    text.includes("resfrio");
+  const mentionsWorkContext =
+    text.includes("trabaj") ||
+    text.includes("escuela") ||
+    text.includes("hora de labor") ||
+    text.includes("durante la jornada");
+  const mentionsLeaving =
+    text.includes("retir") ||
+    text.includes("me fui") ||
+    text.includes("tuve que salir") ||
+    text.includes("salir del trabajo");
+
+  return mentionsIllness && mentionsWorkContext && mentionsLeaving;
 }
 
 function isUnjustifiedAbsenceQuestion(pregunta: string): boolean {
@@ -2226,6 +2436,20 @@ function isMaternityQuestion(pregunta: string): boolean {
   const text = normalizeText(pregunta);
   const compact = text.replace(/\s+/g, "");
 
+  const isFamilyCareContext =
+    (text.includes("madre") ||
+      text.includes("padre") ||
+      text.includes("hijo") ||
+      text.includes("familiar") ||
+      text.includes("grupo familiar")) &&
+    (text.includes("enferm") ||
+      text.includes("accident") ||
+      text.includes("cuid") ||
+      text.includes("atencion") ||
+      text.includes("asistencia"));
+
+  if (isFamilyCareContext) return false;
+
   return (
     text.includes("maternidad") ||
     text.includes("embarazo") ||
@@ -2245,6 +2469,141 @@ function isMaternityQuestion(pregunta: string): boolean {
     text.includes("licencia por ser mama") ||
     compact.includes("soymam") ||
     compact.includes("licenciaparamam")
+  );
+}
+
+function isFamilyCareQuestion(pregunta: string): boolean {
+  const text = normalizeText(pregunta);
+  const mentionsFamily =
+    text.includes("grupo familiar") ||
+    text.includes("familiar enfermo") ||
+    text.includes("familiar accidentado") ||
+    text.includes("atencion familiar") ||
+    text.includes("cuidar a mi madre") ||
+    text.includes("cuidar mi madre") ||
+    text.includes("cuidar a mi padre") ||
+    text.includes("cuidar mi padre") ||
+    text.includes("cuidar a mi hijo") ||
+    text.includes("cuidar mi hijo");
+
+  if (mentionsFamily) return true;
+
+  const mentionsRelative =
+    text.includes("madre") || text.includes("padre") || text.includes("hijo");
+  const mentionsCare =
+    text.includes("enferm") ||
+    text.includes("accident") ||
+    text.includes("cuid") ||
+    text.includes("atencion") ||
+    text.includes("asistencia");
+
+  return mentionsRelative && mentionsCare;
+}
+
+function isBereavementQuestion(pregunta: string): boolean {
+  const text = normalizeText(pregunta);
+
+  return (
+    text.includes("fallec") ||
+    text.includes("murio") ||
+    text.includes("muerte") ||
+    text.includes("duelo") ||
+    text.includes("sepelio")
+  );
+}
+
+function isLongTreatmentQuestion(pregunta: string): boolean {
+  const text = normalizeText(pregunta);
+
+  return (
+    text.includes("largo tratamiento") ||
+    text.includes("tratamiento prolongado") ||
+    text.includes("enfermedad prolongada") ||
+    text.includes("afeccion prolongada") ||
+    text.includes("reposo prolongado") ||
+    text.includes("varios meses") ||
+    (text.includes("enfermedad") && text.includes("meses"))
+  );
+}
+
+function hasShortTreatmentHealthSignal(pregunta: string): boolean {
+  const text = normalizeText(pregunta);
+
+  return (
+    text.includes("gripe") ||
+    text.includes("fiebre") ||
+    text.includes("resfrio") ||
+    text.includes("enfermedad") ||
+    text.includes("enfermo") ||
+    text.includes("enferma") ||
+    text.includes("certificado medico") ||
+    text.includes("reposo medico") ||
+    text.includes("afeccion") ||
+    text.includes("lesion") ||
+    text.includes("medico")
+  );
+}
+
+function isShortTreatmentQuestion(pregunta: string): boolean {
+  const text = normalizeText(pregunta);
+  const hasDuration =
+    text.includes("pocos dias") ||
+    text.includes("un dia") ||
+    text.includes("dos dias") ||
+    text.includes("tres dias") ||
+    text.includes("1 dia") ||
+    text.includes("2 dias") ||
+    text.includes("3 dias");
+
+  if (!hasShortTreatmentHealthSignal(pregunta)) return false;
+  if (isLongTreatmentQuestion(pregunta)) return false;
+
+  return Boolean(
+    hasDuration ||
+      text.includes("corto tratamiento") ||
+      text.includes("afeccion comun") ||
+      hasShortTreatmentHealthSignal(pregunta)
+  );
+}
+
+function isExamLicenseQuestion(pregunta: string): boolean {
+  const text = normalizeText(pregunta);
+
+  return (
+    text.includes("examen") ||
+    text.includes("rendir") ||
+    text.includes("mesa examinadora")
+  );
+}
+
+function isBloodDonationQuestion(pregunta: string): boolean {
+  const text = normalizeText(pregunta);
+
+  return (
+    text.includes("donacion de sangre") ||
+    text.includes("donar sangre") ||
+    text.includes("done sangre") ||
+    text.includes("doné sangre") ||
+    text.includes("donante de sangre")
+  );
+}
+
+function isTrainingLicenseQuestion(pregunta: string): boolean {
+  const text = normalizeText(pregunta);
+
+  if (isExamLicenseQuestion(pregunta) || isBloodDonationQuestion(pregunta)) {
+    return false;
+  }
+
+  return (
+    text.includes("capacitacion") ||
+    text.includes("perfeccionamiento") ||
+    text.includes("congreso") ||
+    text.includes("curso") ||
+    text.includes("taller") ||
+    text.includes("conferencia") ||
+    text.includes("simposio") ||
+    text.includes("actualizacion profesional")
   );
 }
 
@@ -2783,6 +3142,19 @@ function scoreChunk(
   const normalizedDescription = normalizeText(chunk.descripcion || "");
   const normalizedNivel = normalizeText(chunk.nivel || "");
   const normalizedSeccion = normalizeText(chunk.seccion || "");
+  const shortTreatmentQuery =
+    dominio === "licencias" &&
+    isShortTreatmentQuestion(pregunta) &&
+    expansions.some((expansion) =>
+      (expansion.preferredArticles || []).includes("16")
+    );
+  const illnessDuringWorkQuery =
+    dominio === "licencias" && isIllnessDuringWorkQuestion(pregunta);
+  const examQuery = dominio === "licencias" && isExamLicenseQuestion(pregunta);
+  const bloodDonationQuery =
+    dominio === "licencias" && isBloodDonationQuestion(pregunta);
+  const trainingQuery =
+    dominio === "licencias" && isTrainingLicenseQuestion(pregunta);
 
   const chunkSearchText = normalizeText(
     [
@@ -2852,6 +3224,65 @@ function scoreChunk(
     }
   }
 
+  if (shortTreatmentQuery) {
+    const isShortTreatmentArticle =
+      articleMatches(chunk, "16") || articleMatches(chunk, "17");
+    const hasShortTreatmentCategory =
+      normalizedTitle.includes("corto tratamiento") ||
+      normalizedDescription.includes("corto tratamiento") ||
+      normalizedTitle.includes("afecciones comunes") ||
+      normalizedDescription.includes("afecciones comunes");
+
+    if (isShortTreatmentArticle) {
+      score += chunk.kind === "articulo" ? 420 : 260;
+      if (articleMatches(chunk, "16")) {
+        score += chunk.kind === "articulo" ? 180 : 100;
+      }
+    } else if (hasShortTreatmentCategory) {
+      score += 180;
+    } else {
+      score -= 240;
+    }
+  }
+
+  if (examQuery && chunk.dominio === "licencias") {
+    if (articleMatches(chunk, "35")) {
+      score += chunk.kind === "articulo" ? 460 : 280;
+    } else if (articleMatches(chunk, "36")) {
+      score += chunk.kind === "articulo" ? 180 : 110;
+    } else if (articleMatches(chunk, "41")) {
+      score -= 320;
+    }
+  }
+
+  if (bloodDonationQuery && chunk.dominio === "licencias") {
+    if (articleMatches(chunk, "50")) {
+      score += chunk.kind === "articulo" ? 460 : 280;
+    } else if (articleMatches(chunk, "51")) {
+      score += chunk.kind === "articulo" ? 120 : 80;
+    } else if (articleMatches(chunk, "41")) {
+      score -= 320;
+    }
+  }
+
+  if (trainingQuery && chunk.dominio === "licencias") {
+    if (articleMatches(chunk, "41")) {
+      score += chunk.kind === "articulo" ? 460 : 280;
+    } else if (articleMatches(chunk, "34")) {
+      score += chunk.kind === "articulo" ? 160 : 100;
+    } else if (articleMatches(chunk, "16") || articleMatches(chunk, "17")) {
+      score -= 320;
+    }
+  }
+
+  if (illnessDuringWorkQuery) {
+    if (articleMatches(chunk, "18")) {
+      score += chunk.kind === "articulo" ? 420 : 260;
+    } else {
+      score -= 240;
+    }
+  }
+
   if (chunk.kind === "resumen") {
     score -= 12;
   }
@@ -2892,11 +3323,48 @@ function scoreChunk(
 
   const climateQuery = dominio === "licencias" && isClimateQuestion(pregunta);
 
+  const longTreatmentQuery =
+    dominio === "licencias" && isLongTreatmentQuestion(pregunta);
+  const familyCareQuery =
+    dominio === "licencias" && isFamilyCareQuestion(pregunta);
+  const bereavementQuery =
+    dominio === "licencias" && isBereavementQuestion(pregunta);
+
   if (climateQuery && chunk.dominio === "licencias") {
     if (articleMatches(chunk, "49")) {
       score += chunk.kind === "articulo" ? 360 : 220;
     } else {
       score -= 360;
+    }
+  }
+
+  if (longTreatmentQuery && chunk.dominio === "licencias") {
+    if (articleMatches(chunk, "20")) {
+      score += chunk.kind === "articulo" ? 460 : 280;
+    } else if (articleMatches(chunk, "21") || articleMatches(chunk, "22")) {
+      score += chunk.kind === "articulo" ? 220 : 140;
+    } else if (
+      ["72", "73", "74", "75", "76"].some((article) =>
+        articleMatches(chunk, article)
+      )
+    ) {
+      score -= 320;
+    }
+  }
+
+  if (familyCareQuery && chunk.dominio === "licencias") {
+    if (articleMatches(chunk, "30")) {
+      score += chunk.kind === "articulo" ? 460 : 280;
+    } else if (articleMatches(chunk, "27")) {
+      score -= 320;
+    }
+  }
+
+  if (bereavementQuery && chunk.dominio === "licencias") {
+    if (articleMatches(chunk, "48")) {
+      score += chunk.kind === "articulo" ? 460 : 280;
+    } else if (articleMatches(chunk, "27") || articleMatches(chunk, "30")) {
+      score -= 260;
     }
   }
 
@@ -3181,9 +3649,10 @@ function collectArticleAndSummaryChunks(
 
 async function searchLocalFragments(
   input: ChatbotQueryInput,
-  dominio: DominioBackend
+  dominio: DominioBackend,
+  documentos?: LocalChunk[],
 ): Promise<LocalChunk[]> {
-  const chunks = await loadLocalChunks();
+  const chunks = documentos || (await loadLocalChunks());
   const maxResults = Math.min(Math.max(input.maxResults ?? 5, 1), 8);
 
   if (dominio === "servicios") {
@@ -3208,6 +3677,45 @@ async function searchLocalFragments(
 
     if (onlyArticle49.length) {
       return onlyArticle49;
+    }
+  }
+
+  if (dominio === "licencias" && isLongTreatmentQuestion(input.pregunta)) {
+    const longTreatmentChunks = collectArticleAndSummaryChunks(
+      chunks,
+      dominio,
+      ["20", "21", "22"],
+      maxResults
+    );
+
+    if (longTreatmentChunks.length) {
+      return longTreatmentChunks;
+    }
+  }
+
+  if (dominio === "licencias" && isBereavementQuestion(input.pregunta)) {
+    const bereavementChunks = collectArticleAndSummaryChunks(
+      chunks,
+      dominio,
+      ["48"],
+      maxResults
+    );
+
+    if (bereavementChunks.length) {
+      return bereavementChunks;
+    }
+  }
+
+  if (dominio === "licencias" && isFamilyCareQuestion(input.pregunta)) {
+    const familyCareChunks = collectArticleAndSummaryChunks(
+      chunks,
+      dominio,
+      ["30"],
+      maxResults
+    );
+
+    if (familyCareChunks.length) {
+      return familyCareChunks;
     }
   }
 
@@ -3237,6 +3745,19 @@ async function searchLocalFragments(
     }
   }
 
+  if (dominio === "licencias" && isIllnessDuringWorkQuestion(input.pregunta)) {
+    const illnessDuringWorkChunks = collectArticleAndSummaryChunks(
+      chunks,
+      dominio,
+      ["18"],
+      maxResults,
+    );
+
+    if (illnessDuringWorkChunks.length) {
+      return illnessDuringWorkChunks;
+    }
+  }
+
   if (dominio === "licencias" && isSuperpositionQuestion(input.pregunta)) {
     const superpositionChunks = collectArticleAndSummaryChunks(
       chunks,
@@ -3250,12 +3771,55 @@ async function searchLocalFragments(
     }
   }
 
+  if (dominio === "licencias" && isExamLicenseQuestion(input.pregunta)) {
+    const examChunks = collectArticleAndSummaryChunks(
+      chunks,
+      dominio,
+      ["35", "36"],
+      maxResults
+    );
+
+    if (examChunks.length) {
+      return examChunks;
+    }
+  }
+
+  if (dominio === "licencias" && isBloodDonationQuestion(input.pregunta)) {
+    const bloodDonationChunks = collectArticleAndSummaryChunks(
+      chunks,
+      dominio,
+      ["50"],
+      maxResults
+    );
+
+    if (bloodDonationChunks.length) {
+      return bloodDonationChunks;
+    }
+  }
+
+  if (dominio === "licencias" && isTrainingLicenseQuestion(input.pregunta)) {
+    const trainingChunks = collectArticleAndSummaryChunks(
+      chunks,
+      dominio,
+      ["41", "34"],
+      maxResults
+    );
+
+    if (trainingChunks.length) {
+      return trainingChunks;
+    }
+  }
+
   const matchedExpansions = getMatchedExpansions(input.pregunta, dominio);
   const preferredArticles = Array.from(
     new Set(matchedExpansions.flatMap((item) => item.preferredArticles || []))
   );
 
-  if (dominio === "licencias" && preferredArticles.includes("16")) {
+  if (
+    dominio === "licencias" &&
+    preferredArticles.includes("16") &&
+    isShortTreatmentQuestion(input.pregunta)
+  ) {
     const shortTreatmentChunks = collectArticleAndSummaryChunks(
       chunks,
       dominio,
@@ -3389,71 +3953,51 @@ function buildContext(chunks: LocalChunk[]): string {
     .join("\n\n");
 }
 
-function buildLocalFallbackAnswer(chunks: LocalChunk[]): string {
+function buildLocalFallbackAnswer(
+  chunks: LocalChunk[],
+  pregunta: string,
+): string {
   if (!chunks.length) return NO_ENCONTRADO;
 
   if (chunks[0]?.dominio === "servicios") {
-    const respuestas = chunks
-      .slice(0, 3)
-      .map((chunk) => {
-        const sugerida = getObjectField(chunk.raw, ["respuesta_sugerida"]);
-        const titulo =
-          chunk.titulo ||
-          getObjectField(chunk.raw, ["categoria", "titulo", "nombre"]) ||
-          "Servicio SiDCa";
-
-        return sugerida
-          ? `${titulo}:\n${sugerida}`
-          : `${titulo}:\n${truncateText(chunk.text, 1200)}`;
-      })
-      .join("\n\n");
-
-    const referencias = Array.from(
-      new Set(chunks.map((chunk) => chunk.referencia).filter(Boolean))
-    );
+    const primary = chunks[0];
+    const sugerida = getObjectField(primary.raw, ["respuesta_sugerida"]);
+    const titulo =
+      primary.titulo ||
+      getObjectField(primary.raw, ["categoria", "titulo", "nombre"]) ||
+      "Servicio SiDCa";
 
     return [
-      respuestas,
-      "",
-      `Fuente consultada: ${referencias.join(" | ")}`,
-    ].join("\n");
+      `Encontré información relacionada con ${titulo}.`,
+      sugerida
+        ? truncateText(sugerida, 500)
+        : "La documentación disponible contiene información relacionada, pero no detalla una orientación adicional.",
+      "La información de respaldo queda disponible en la tarjeta documental.",
+    ].join("\n\n");
   }
 
-  const main = chunks
-    .slice(0, 3)
-    .map((chunk) => {
-      const title = chunk.articulo
-        ? `Artículo ${chunk.articulo}${
-            chunk.descripcion ? ` – ${chunk.descripcion}` : ""
-          }`
-        : chunk.descripcion || chunk.titulo || "Fragmento encontrado";
-
-      const extra = [
-        chunk.seccion ? `Sección: ${chunk.seccion}` : "",
-        chunk.nivel ? `Nivel: ${chunk.nivel}` : "",
-        chunk.otorgante ? `Funcionario otorgante: ${chunk.otorgante}` : "",
-        chunk.interviniente
-          ? `Funcionario interviniente: ${chunk.interviniente}`
-          : "",
-      ]
-        .filter(Boolean)
-        .join("\n");
-
-      return `${title}:\n${truncateText(chunk.text, 1200)}${
-        extra ? `\n${extra}` : ""
-      }`;
-    })
-    .join("\n\n");
-
-  const referencias = Array.from(new Set(chunks.map((chunk) => chunk.referencia)));
+  const primary = chunks[0];
+  const title = primary.articulo
+    ? `Artículo ${primary.articulo}${
+        primary.descripcion ? ` – ${primary.descripcion}` : ""
+      }`
+    : primary.descripcion || primary.titulo || "fragmento relacionado";
+  const asksForProcedure = /\b(c[oó]mo|qu[eé] tengo que|d[oó]nde|qui[eé]n|cu[aá]ntos?|presentar|tr[aá]mite|procedimiento)\b/i.test(
+    pregunta,
+  );
+  const hasProcedureSignals = /\b(presentar|presentaci[oó]n|solicitud|tr[aá]mite|plazo|deber[aá]|ante)\b/i.test(
+    primary.text,
+  );
 
   return [
-    "No pude generar la respuesta con Groq en este momento, pero encontré información local relacionada:",
-    "",
-    main,
-    "",
-    `Fuente consultada: ${referencias.join(" | ")}`,
-  ].join("\n");
+    `Encontré información relacionada con ${title}.`,
+    asksForProcedure && !hasProcedureSignals
+      ? "La documentación disponible permite identificar el encuadre normativo, pero no detalla en este fragmento el procedimiento que debés realizar. Para recibir orientación sobre el trámite, comunicate con SiDCa."
+      : asksForProcedure
+        ? "La documentación disponible contiene indicaciones relacionadas. Podés abrir el artículo para revisar el texto completo antes de realizar el trámite."
+      : "La documentación disponible identifica el artículo relacionado. Podés abrirlo para consultar el texto completo.",
+    `Base normativa: ${title}.`,
+  ].join("\n\n");
 }
 
 function toSearchHits(
@@ -3472,6 +4016,10 @@ function toArticulos(chunks: LocalChunk[]): BackendArticulo[] {
   return chunks.map((chunk) => ({
     articulo: chunk.articulo,
     titulo_articulo: chunk.descripcion || chunk.titulo,
+    resumen: truncateText(
+      chunk.descripcion || chunk.titulo || chunk.text,
+      chunk.descripcion || chunk.titulo ? 320 : 420,
+    ),
     texto: truncateText(chunk.text, 1800),
     fuente: chunk.referencia,
     otorgante: chunk.otorgante,
@@ -3490,15 +4038,28 @@ function getGroqClient(): OpenAI | null {
   return new OpenAI({
     apiKey,
     baseURL: getEnv("GROQ_BASE_URL") || "https://api.groq.com/openai/v1",
+    timeout: 10000,
+    maxRetries: 0,
   });
 }
 
 function buildGroqSystemPrompt(): string {
   return [
     "Sos el Asistente Virtual de SiDCa.",
+    "Tu función no es copiar normativa: es ayudar a un docente afiliado a comprenderla y orientarse con prudencia.",
     "Respondé únicamente con la información incluida en los fragmentos normativos proporcionados.",
-    "No inventes artículos, plazos, requisitos, autoridades ni procedimientos.",
+    "No inventes requisitos, plazos, formularios, autoridades, organismos, trámites ni procedimientos.",
     "Si la información no está en los fragmentos, indicá que no se encontró información suficiente.",
+    "Si preguntan cómo hacer un trámite, qué presentar, dónde ir, cuántos días corresponden o quién autoriza, sólo afirmalo si está expresamente respaldado por los fragmentos.",
+    "Si falta el procedimiento concreto, decilo claramente y recomendá comunicarse con SiDCa sin inventar pasos.",
+    "Cuando falte el procedimiento, podés decir: La normativa consultada encuadra esta situación, pero la información disponible en el asistente no detalla el trámite que debés realizar. Para indicarte el procedimiento correcto, comunicate con SiDCa.",
+    "No uses conocimiento general para completar datos faltantes.",
+    "Respondé primero la pregunta concreta en lenguaje español argentino claro, con párrafos breves.",
+    "Usá esta estructura sólo cuando corresponda: Respuesta breve; Qué establece la normativa; Qué podés hacer; Base normativa.",
+    "Omití una sección si los fragmentos no permiten sostenerla.",
+    "No repitas el mismo artículo ni copies bloques extensos del contexto.",
+    "Preferí una respuesta de hasta cinco párrafos breves y aproximadamente 180 palabras.",
+    "No menciones Groq, OpenAI, RAG, embeddings, prompts, modelos ni proveedores.",
     "Si el dominio detectado es servicios, respondé sobre servicios, contactos, beneficios y secciones de la App SiDCa. Priorizá la respuesta_sugerida, la ubicación en la app, el WhatsApp, la dirección, el aula virtual o el enlace que aparezca en los fragmentos. No inventes números, direcciones, horarios ni enlaces.",
     "Para consultas de servicios como viajes, turismo, Casa del Docente, hotelería, convenios, certificados, capacitaciones, Oficina de Gestión, soporte técnico, asesoramiento gremial o legal, indicá el camino dentro de la app cuando esté disponible y el contacto correspondiente si figura en los fragmentos.",
     "Si el usuario pide asesoramiento gremial, contacto gremial, número gremial o con quién comunicarse por asesoramiento gremial del sindicato, respondé con el servicio de Asesoramiento Gremial y el WhatsApp de Asesoramiento General si aparece en los fragmentos. No lo confundas con licencia por representación gremial, delegados gremiales ni franquicias gremiales.",
@@ -3506,6 +4067,9 @@ function buildGroqSystemPrompt(): string {
     "Cuando respondas sobre contactos, escribí el número de WhatsApp completo y, si aparece, el área a la que corresponde. No mezcles contactos de áreas no relacionadas salvo que el fragmento principal los incluya como medios generales de contacto.",
 
     "Si la consulta es por razones climáticas o fenómenos meteorológicos, respondé solo con el Artículo 49 si ese es el fragmento disponible; no mezcles el Artículo 52 ni menciones plazos de razones particulares.",
+    "Si la consulta es por enfermedad de largo tratamiento, tratamiento prolongado o reposo de varios meses, priorizá el Artículo 20 y sus artículos complementarios 21 y 22; no confundas la licencia sustantiva con los artículos 72 a 76 de trámite, reconocimiento o control médico.",
+    "Si la consulta es por cuidar o atender a una madre, padre, hijo o familiar enfermo o accidentado, priorizá el Artículo 30; no lo confundas con maternidad del Artículo 27.",
+    "Si la consulta es por fallecimiento de un padre, madre u otro familiar, duelo o sepelio, priorizá el Artículo 48 y no reemplaces la licencia por el Artículo 30 u otra causal distinta.",
     "Si la consulta es por afecciones, lesiones o licencia de corto tratamiento, respondé solo con los artículos 16 y 17 y el resumen correspondiente si están disponibles. No desarrolles el Artículo 20 de largo tratamiento ni el Artículo 27 de maternidad salvo que el usuario los pregunte expresamente.",
     "Si la consulta es por superposición de horarios, respondé solo con los artículos 53 y 54 y el resumen correspondiente si están disponibles. No desarrolles el Artículo 36 salvo que el usuario pregunte expresamente por prácticas obligatorias.",
     "Si la consulta es por maternidad, mamá, madre, embarazo o parto, respondé con el Artículo 27 y el resumen correspondiente si está disponible. No mezcles artículos de corto o largo tratamiento salvo que el fragmento del Artículo 27 los mencione como referencia accesoria.",
@@ -3526,30 +4090,56 @@ function buildGroqSystemPrompt(): string {
     "No infieras diferencias entre docente suplente, interino o titular si los fragmentos no contienen una definición explícita. Si la consulta está incompleta, pedí que se aclare qué situaciones de revista desea comparar.",
     "Si la consulta pregunta desde cuándo o a partir de cuántos días después de optar, tomar o ser designado en un cargo se puede solicitar licencia médica, no respondas con el Artículo 52 de razones particulares. Si no hay un fragmento con ese plazo específico, indicá que no se encontró una regla específica sobre ese plazo.",
     "No digas que algo no existe si en los fragmentos aparece información relacionada y suficiente.",
-    "Al final incluí una línea con el formato: Fuente consultada: nombre de la fuente.",
+    "Mencioná el artículo o la norma en Base normativa; las fuentes completas se mostrarán aparte en la aplicación.",
   ].join(" ");
 }
 
-async function askGroq(
+type GroqGeneration = {
+  text: string;
+  finishReason: string;
+  completionTokens: number | null;
+  status: number;
+};
+
+function respuestaPareceIncompleta(
+  text: string,
+  finishReason: string,
+): boolean {
+  const clean = text.trim();
+
+  if (!clean || finishReason === "length") return true;
+
+  const markdownMarkers = (clean.match(/\*\*|`/g) || []).length;
+  if (markdownMarkers % 2 !== 0) return true;
+
+  if (/(?:^|\s)(?:artículo|articulo|art\.)$/i.test(clean)) return true;
+  if (/[,:;]\s*$/.test(clean)) return true;
+
+  return false;
+}
+
+async function solicitarGeneracionGroq(
+  client: OpenAI,
+  model: string,
+  maxTokens: number,
   pregunta: string,
   dominio: DominioBackend,
-  chunks: LocalChunk[]
-): Promise<string> {
-  const client = getGroqClient();
+  context: string,
+  referencias: string[],
+  retryInstruction = "",
+): Promise<GroqGeneration> {
+  const reasoningOptions = model.startsWith("openai/gpt-oss-")
+    ? {
+        reasoning_effort: "low",
+        include_reasoning: false,
+      }
+    : {};
 
-  if (!client) {
-    throw new Error("Falta GROQ_API_KEY.");
-  }
-
-  const model = getEnv("GROQ_MODEL") || "llama-3.1-8b-instant";
-  const maxTokens = Number(getEnv("GROQ_MAX_TOKENS") || 900);
-  const context = buildContext(chunks);
-  const referencias = Array.from(new Set(chunks.map((chunk) => chunk.referencia)));
-
-  const response: any = await client.chat.completions.create({
+  const requestBody: any = {
     model,
     temperature: 0.12,
     max_tokens: maxTokens,
+    ...reasoningOptions,
     messages: [
       {
         role: "system",
@@ -3562,18 +4152,94 @@ async function askGroq(
           `Consulta del docente:\n${pregunta}\n\n` +
           `Fragmentos recuperados:\n\n${context}\n\n` +
           `Fuentes disponibles para citar al final: ${referencias.join(" | ")}\n\n` +
-          "Redactá una respuesta clara, precisa y directa. No uses información externa a los fragmentos.",
+          "Redactá una respuesta clara, precisa y directa. No uses información externa a los fragmentos." +
+          retryInstruction,
       },
     ],
-  });
+  };
+  const response: any = await client.chat.completions.create(requestBody);
 
   const content = response?.choices?.[0]?.message?.content;
+  const finishReason = String(response?.choices?.[0]?.finish_reason || "unknown");
+  const completionTokens = Number.isFinite(response?.usage?.completion_tokens)
+    ? Number(response.usage.completion_tokens)
+    : null;
+  const promptTokens = Number.isFinite(response?.usage?.prompt_tokens)
+    ? Number(response.usage.prompt_tokens)
+    : null;
+  const totalTokens = Number.isFinite(response?.usage?.total_tokens)
+    ? Number(response.usage.total_tokens)
+    : null;
+  const text = typeof content === "string" ? content.trim() : "";
 
-  if (typeof content !== "string" || !content.trim()) {
+  console.log("[groqWorkflow] usage", {
+    promptTokens,
+    finishReason,
+    completionTokens,
+    totalTokens,
+  });
+
+  if (!text) {
     throw new Error("Groq no devolvió contenido utilizable.");
   }
 
-  return content.trim();
+  return {
+    text,
+    finishReason,
+    completionTokens,
+    status: Number(response?.status || 200),
+  };
+}
+
+async function askGroq(
+  pregunta: string,
+  dominio: DominioBackend,
+  chunks: LocalChunk[]
+): Promise<GroqGeneration> {
+  const client = getGroqClient();
+
+  if (!client) {
+    throw new Error("Falta GROQ_API_KEY.");
+  }
+
+  const model = getEnv("GROQ_MODEL") || "openai/gpt-oss-20b";
+  const maxTokens = Number(getEnv("GROQ_MAX_TOKENS") || 900);
+  const context = buildContext(chunks);
+  const referencias = Array.from(new Set(chunks.map((chunk) => chunk.referencia)));
+  const first = await solicitarGeneracionGroq(
+    client,
+    model,
+    maxTokens,
+    pregunta,
+    dominio,
+    context,
+    referencias,
+  );
+
+  if (!respuestaPareceIncompleta(first.text, first.finishReason)) {
+    return first;
+  }
+
+  console.warn("[groqWorkflow] generation_retry", {
+    reason: first.finishReason === "length" ? "max_tokens" : "incomplete_text",
+  });
+
+  const retry = await solicitarGeneracionGroq(
+    client,
+    model,
+    maxTokens,
+    pregunta,
+    dominio,
+    context,
+    referencias,
+    " Respondé de forma completa y cerrá todas las frases y marcas Markdown antes de terminar.",
+  );
+
+  if (respuestaPareceIncompleta(retry.text, retry.finishReason)) {
+    throw new Error("Groq devolvió una respuesta incompleta.");
+  }
+
+  return retry;
 }
 
 function isRateLimitError(error: any): boolean {
@@ -3581,6 +4247,80 @@ function isRateLimitError(error: any): boolean {
   const message = String(error?.message || "").toLowerCase();
 
   return status === 429 || message.includes("rate limit") || message.includes("429");
+}
+
+function extractCitedArticleRefs(text: string): string[] {
+  const normalized = normalizeText(text);
+  const refs = new Set<string>();
+  const patterns = [
+    /\b(?:articulos?|arts?)\s+([0-9]+(?:\s*(?:y|e|,)\s*[0-9]+)*)/g,
+  ];
+
+  for (const pattern of patterns) {
+    for (const match of normalized.matchAll(pattern)) {
+      for (const ref of String(match[1] || "").match(/\d+/g) || []) {
+        refs.add(ref);
+      }
+    }
+  }
+
+  return Array.from(refs);
+}
+
+function citedArticlesAreSupported(
+  respuesta: string,
+  chunks: LocalChunk[]
+): boolean {
+  const cited = extractCitedArticleRefs(respuesta);
+  if (!cited.length) return true;
+
+  const available = new Set<string>();
+  for (const chunk of chunks) {
+    for (const ref of [
+      ...(chunk.articleRefs || []),
+      ...(String(chunk.articulo || "").match(/\d+/g) || []),
+    ]) {
+      available.add(String(ref));
+    }
+  }
+
+  return cited.every((ref) => available.has(ref));
+}
+
+function responseCacheKey(
+  dominio: DominioBackend,
+  pregunta: string
+): string {
+  return `${cachedChunksVersion}|${dominio}|${normalizeText(pregunta)}`;
+}
+
+function getCachedResponse(key: string): ChatbotWorkflowOutput | null {
+  const cached = responseCache.get(key);
+  if (!cached) return null;
+
+  if (cached.expiresAt <= Date.now()) {
+    responseCache.delete(key);
+    return null;
+  }
+
+  responseCache.delete(key);
+  responseCache.set(key, cached);
+  console.log("[chatbot] response_cache_hit");
+  return cached.response;
+}
+
+function setCachedResponse(key: string, response: ChatbotWorkflowOutput): void {
+  responseCache.delete(key);
+  responseCache.set(key, {
+    expiresAt: Date.now() + RESPONSE_CACHE_TTL_MS,
+    response,
+  });
+
+  while (responseCache.size > RESPONSE_CACHE_MAX_ENTRIES) {
+    const oldestKey = responseCache.keys().next().value;
+    if (!oldestKey) break;
+    responseCache.delete(oldestKey);
+  }
 }
 
 function chunksForSearch(chunks: LocalChunk[]): LocalChunk[] {
@@ -3595,6 +4335,7 @@ function buildOutput(params: {
   consulta: string;
   respuesta: string;
   chunks: LocalChunk[];
+  asesoramientoGremial?: BackendServiceContact;
   error?: string;
 }): ChatbotWorkflowOutput {
   const referencias = Array.from(
@@ -3617,6 +4358,7 @@ function buildOutput(params: {
       params.dominio
     ),
     conversationId: null,
+    asesoramientoGremial: params.asesoramientoGremial,
     error: params.error,
   };
 }
@@ -3679,9 +4421,21 @@ export async function runGroqWorkflow(
   }
 
   try {
-    const chunks = await searchLocalFragments(input, dominio);
+    const documentos = await loadLocalChunks();
+    const cacheKey = responseCacheKey(dominio, input.pregunta);
+    const cachedResponse = getCachedResponse(cacheKey);
+
+    if (cachedResponse) {
+      return cachedResponse;
+    }
+
+    const chunks = await searchLocalFragments(input, dominio, documentos);
 
     if (!chunks.length) {
+      const asesoramientoGremial = getAsesoramientoGremialContact(
+        documentos
+      );
+
       return buildOutput({
         ok: true,
         tipo: "sin_resultados",
@@ -3690,28 +4444,46 @@ export async function runGroqWorkflow(
         consulta: input.pregunta,
         respuesta: NO_ENCONTRADO,
         chunks: [],
+        asesoramientoGremial,
       });
     }
 
     try {
-      const respuestaGroq = await askGroq(input.pregunta, dominio, chunks);
+      const generacionGroq = await askGroq(input.pregunta, dominio, chunks);
 
-      return buildOutput({
+      if (!citedArticlesAreSupported(generacionGroq.text, chunks)) {
+        console.warn("[groqWorkflow] hallucinated_article_rejected");
+        return buildOutput({
+          ok: true,
+          tipo: "respuesta_local",
+          origen: "local_rag_fallback",
+          dominio,
+          consulta: input.pregunta,
+          respuesta: buildLocalFallbackAnswer(chunks, input.pregunta),
+          chunks,
+          error: "hallucinated_article_rejected",
+        });
+      }
+
+      const response = buildOutput({
         ok: true,
         tipo: "respuesta_ia",
         origen: "groq_rag",
         dominio,
         consulta: input.pregunta,
-        respuesta: respuestaGroq,
+        respuesta: generacionGroq.text,
         chunks,
       });
+
+      setCachedResponse(cacheKey, response);
+      return response;
     } catch (groqError: any) {
-      const localAnswer = buildLocalFallbackAnswer(chunks);
+      const localAnswer = buildLocalFallbackAnswer(chunks, input.pregunta);
       const rateLimit = isRateLimitError(groqError);
 
       console.warn(
-        "[groqWorkflow] Groq no respondió. Se usa fallback local:",
-        groqError?.message || groqError
+        "[groqWorkflow] provider_unavailable",
+        { code: rateLimit ? "provider_rate_limit" : "provider_error" },
       );
 
       return buildOutput({
@@ -3722,11 +4494,13 @@ export async function runGroqWorkflow(
         consulta: input.pregunta,
         respuesta: localAnswer,
         chunks,
-        error: groqError?.message || "Error al consultar Groq",
+        error: rateLimit ? "provider_rate_limit" : "provider_error",
       });
     }
-  } catch (error: any) {
-    console.error("[groqWorkflow] Error general:", error);
+  } catch {
+    console.error("[groqWorkflow] workflow_error", {
+      code: "workflow_error",
+    });
 
     return buildOutput({
       ok: false,
@@ -3736,7 +4510,7 @@ export async function runGroqWorkflow(
       consulta: input.pregunta,
       respuesta: SERVICIO_NO_DISPONIBLE,
       chunks: [],
-      error: error?.message || "Error interno",
+      error: "workflow_error",
     });
   }
 }

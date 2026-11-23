@@ -20,3 +20,10 @@ src/server.ts.backup
 
 *.pdf
 npm-debug.log
+
+git
+it
+diagnostico-cena-1234567.json
+scripts/_probarSegmentos.ts
+scripts/fixtures/
+tmp/

@@ -6,3 +6,9 @@ dist
 .DS_Store
 Thumbs.db
 scripts/email-previews/generated/
+git
+it
+diagnostico-cena-1234567.json
+scripts/_probarSegmentos.ts
+scripts/fixtures/
+tmp/
