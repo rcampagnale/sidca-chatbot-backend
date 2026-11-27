@@ -249,6 +249,85 @@ test("Caso 22: comparación recupera Ley 26058 nacional y Ley 5381 provincial", 
   assert.equal(invalidCitation.origen,"local_rag_fallback"); mockAnswer="El artículo 6 establece el cambio automático de suplente a interino.";
 });
 
+test("regresión: consulta temática de artículo resuelve el régimen de licencias sin pedir norma", async () => {
+  now += 6 * 60_000;
+  setWorkflowTestDependencies({ now: () => now, fetchJson: async (url) => url === "mock://manifest"
+    ? { version:"theme", fuentes:[{id:"licencias_docentes_provincial",dominio:"licencias",referencia:"Régimen Provincial de Licencias Docentes",url:"mock://licenses",activo:true}] }
+    : licenciaRegression, groqClient:mockClient });
+  const before = requests.length;
+  const result = await runGroqWorkflow({ pregunta:"¿Qué establece el artículo 16 del régimen de licencias docentes?" });
+  assert.equal(requests.length, before + 1); assert.notEqual(result.tipo, "aclaracion");
+  assert.match(requests.at(-1).messages[1].content, /Artículo\/s: 16/); assert.match(requests.at(-1).messages[1].content, /veinticinco \(25\) días corridos/);
+});
+
+test("regresión: advertencia del artículo 32 no bloquea artículo completo del Decreto-Ley 3387", async () => {
+  const previousAnswer = mockAnswer; mockAnswer = "El fragmento consultado está disponible en la fuente documental.";
+  const { result, prompt, generated } = await queryIntegrity("Decreto-Ley 3387 artículo 1", "decreto_ley_3387_educacion_privada", "general", privateLaw);
+  mockAnswer = previousAnswer;
+  assert.equal(generated, true); assert.match(prompt, /Artículo 1/); assert.doesNotMatch(result.respuesta, /está truncado/);
+});
+
+test("regresión: artículo derogado de otra sección no interrumpe artículo vigente consultado", async () => {
+  const previousAnswer = mockAnswer; mockAnswer = "El artículo consultado establece que la educación es un derecho personal y social.";
+  const { result, prompt, generated } = await queryIntegrity("Ley Nacional 26.206 artículo 2", "ley_26206_educacion_nacional", "general", nationalLaw);
+  mockAnswer = previousAnswer;
+  assert.equal(generated, true); assert.match(prompt, /Artículo 2/); assert.doesNotMatch(result.respuesta, /texto histórico|derogado|sustituido/i);
+});
+
+test("regresión: acepta ambos órdenes de cita al validar identidad normativa y artículo", async () => {
+  const previousAnswer = mockAnswer; mockAnswer = "La Ley 3122, artículo 6, reconoce derechos; también, el artículo 6 de la Ley Provincial 3122 trata esos derechos.";
+  now += 6 * 60_000;
+  setWorkflowTestDependencies({ now: () => now, fetchJson: async (url) => url === "mock://manifest"
+    ? { version:"citations", fuentes:[{id:"estatuto_docente_provincial",dominio:"estatuto",referencia:"Ley Provincial 3122 Catamarca",url:"mock://estatuto",activo:true}] }
+    : estatutoRegression, groqClient:mockClient });
+  const result = await runGroqWorkflow({ pregunta:"Ley Provincial 3122 artículo 6", dominio:"estatuto" }); mockAnswer = previousAnswer;
+  assert.equal(result.origen, "groq_rag"); assert.match(result.respuesta, /Ley 3122, artículo 6/); assert.match(result.respuesta, /artículo 6 de la Ley Provincial 3122/);
+});
+
+test("regresión: rechazo de cita cuyo número solo comparte una subcadena", async () => {
+  const previousAnswer = mockAnswer; mockAnswer = "La Ley Provincial 31220, artículo 6, establece esta regla.";
+  now += 6 * 60_000;
+  setWorkflowTestDependencies({ now: () => now, fetchJson: async (url) => url === "mock://manifest"
+    ? { version:"citation-mismatch", fuentes:[{id:"estatuto_docente_provincial",dominio:"estatuto",referencia:"Ley Provincial 3122 Catamarca",url:"mock://estatuto",activo:true}] }
+    : estatutoRegression, groqClient:mockClient });
+  const result = await runGroqWorkflow({ pregunta:"Ley Provincial 3122 artículo 6", dominio:"estatuto" }); mockAnswer = previousAnswer;
+  assert.equal(result.origen, "local_rag_fallback"); assert.doesNotMatch(result.respuesta, /31220/);
+});
+
+test("regresión: mismo corpus recargado después del TTL conserva la respuesta cacheada", async () => {
+  const previousAnswer = mockAnswer; mockAnswer = "Respuesta estable del corpus de prueba.";
+  const stableManifest = { version:"cache-stable", fuentes:[{id:"movilidad_docente_decreto_533",dominio:"coberturas",referencia:"Decreto Acuerdo 533/2021 Catamarca",url:"mock://movilidad",activo:true}] };
+  now += 6 * 60_000;
+  setWorkflowTestDependencies({ now: () => now, fetchJson: async (url) => url === "mock://manifest" ? stableManifest : source, groqClient:mockClient });
+  const questionStable = "Decreto 533/2021 artículo 6, consulta estable de prueba";
+  await runGroqWorkflow({ pregunta:questionStable }); const generatedAtFirst = requests.length;
+  now += 6 * 60_000;
+  updateWorkflowTestDependencies({ now: () => now, fetchJson: async (url) => url === "mock://manifest" ? stableManifest : structuredClone(source) });
+  const response = await runGroqWorkflow({ pregunta:questionStable }); mockAnswer = previousAnswer;
+  assert.equal(requests.length, generatedAtFirst); assert.match(response.respuesta, /Respuesta estable/);
+});
+
+test("regresión: Ley 5381 activa se asigna al dominio educacion_provincial por su ID", async () => {
+  now += 6 * 60_000;
+  setWorkflowTestDependencies({ now: () => now, fetchJson: async (url) => url === "mock://manifest"
+    ? { version:"law5381", fuentes:[{id:"ley_5381_educacion_catamarca",dominio:"general",referencia:"Ley Provincial 5381 Catamarca",url:"mock://5381",activo:true}] }
+    : provincialLaw, groqClient:mockClient });
+  const result = await runGroqWorkflow({ pregunta:"Ley Provincial 5381 Catamarca artículo 49", dominio:"educacion_provincial" });
+  assert.equal(result.dominio, "educacion_provincial"); assert.ok(result.articulos.length > 0);
+});
+
+test("regresión: comparación multinormativa no usa Ley 5381 para la referencia parcial 381", async () => {
+  now += 6 * 60_000;
+  setWorkflowTestDependencies({ now: () => now, fetchJson: async (url) => url === "mock://manifest"
+    ? { version:"exact-multinorm", fuentes:[{id:"ley_5381_educacion_catamarca",dominio:"general",referencia:"Ley Provincial 5381 Catamarca",url:"mock://5381",activo:true}] }
+    : provincialLaw, groqClient:mockClient });
+  const before = requests.length;
+  await runGroqWorkflow({ pregunta:"¿Qué diferencias existen entre la Ley Provincial 5381 y la Ley Provincial 381?", dominio:"educacion_provincial" });
+  const prompt = requests.at(-1).messages[1].content;
+  assert.equal(requests.length, before + 1); assert.equal((prompt.match(/### Fragmento \d+/g) || []).length, 2);
+  assert.match(prompt, /Ley Provincial 5381 Catamarca/); assert.doesNotMatch(prompt, /Norma identificada: Ley 381\b/);
+});
+
 test("Caso 23: artículo sin norma ni contexto solicita aclaración sin retrieval", async () => {
   const before=downloads; const beforeRequests=requests.length; const result=await runGroqWorkflow({pregunta:"¿Qué establece el artículo 35?"});
   assert.equal(result.tipo,"aclaracion"); assert.match(result.respuesta,/¿De qué norma/); assert.equal(downloads,before); assert.equal(requests.length,beforeRequests);

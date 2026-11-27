@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { activeSources, attachDocumentControl, classifyNomenclator, normalizeNorm, rankNormative, recordsFromDocument, sourceFingerprint, type RagChunk } from "../src/ragCore.js";
+import { activeSources, attachDocumentControl, classifyNomenclator, normalizeNorm, parseNormativeReferences, rankNormative, recordsFromDocument, sourceFingerprint, type RagChunk } from "../src/ragCore.js";
 
 const manifest = JSON.parse(await readFile(new URL("./fixtures/manifest.json", import.meta.url), "utf8"));
 const nomen = JSON.parse(await readFile(new URL("./fixtures/nomencladores.json", import.meta.url), "utf8"));
@@ -44,3 +44,13 @@ test("29 el fallo parcial no modifica datos recibidos",()=>assert.equal(sourceFi
 test("30 fallback respeta activo estricto",()=>assert.deepEqual(activeSources({fuentes:[{url:"a"},{url:"b",activo:false}]}),[]));
 for (const [i, domain] of ["licencias","estatuto","coberturas","servicios","general"].entries()) test(`regresión dominio existente ${domain}`,()=>assert.ok(["licencias","estatuto","coberturas","servicios","general"].includes(domain)));
 test("control documental acompaña cada fragmento",()=>assert.equal(attachDocumentControl(base,{control_documental:"verificar"})[0].metadata?.control_documental,"verificar"));
+test("identidad normativa compara el número completo, no una subcadena",()=>assert.deepEqual(rankNormative([{...base[1],norm:"Ley Nacional 126058",source:"Ley Nacional 126058"}],"Ley Nacional 26.058"),[]));
+test("la referencia diferencia Ley de Decreto-Ley",()=>assert.deepEqual(rankNormative([{...base[1],norm:"Decreto-Ley 26058",source:"Decreto-Ley 26058"}],"Ley 26058"),[]));
+test("la referencia exige el año completo cuando fue indicado",()=>assert.deepEqual(rankNormative([{...base[0],norm:"Decreto Acuerdo 533/2020",source:"Decreto Acuerdo 533/2020"}],"Decreto 533/2021 artículo 6"),[]));
+test("Decreto Acuerdo explícito no coincide con un decreto sin ese calificador",()=>assert.deepEqual(rankNormative([{...base[0],norm:"Decreto 533/2021",source:"Decreto 533/2021"}],"Decreto Acuerdo 533/2021 artículo 6"),[]));
+test("parsea Ley Provincial, símbolo N.º, puntos y año abreviado",()=>assert.deepEqual(parseNormativeReferences("Ley Provincial N.º 5.381 y Decreto Acuerdo Nº 533/21"),[
+ {kind:"ley",number:"5381",qualifier:"provincial",jurisdiction:"provincial"},{kind:"decreto",number:"533",year:"2021",qualifier:"acuerdo"}
+]));
+test("reconoce Decreto-Ley como tipo independiente",()=>assert.equal(parseNormativeReferences("Decreto-Ley Nº 3.387")[0].kind,"decreto-ley"));
+test("no exige que la jurisdicción de consulta se repita en la identidad cuando no fue pedida",()=>assert.equal(rankNormative([{...base[1],sourceId:"ley_5381",norm:"Ley 5381",source:"Ley 5381",jurisdiction:"Catamarca",article:"49"}],"Ley 5381 artículo 49").length,1));
+test("jurisdicción explícita impide confundir norma nacional con provincial",()=>assert.equal(rankNormative([{...base[1],sourceId:"ley_5381",norm:"Ley 5381",source:"Ley 5381",jurisdiction:"Catamarca",article:"49"}],"Ley Nacional 5381 artículo 49").length,0));

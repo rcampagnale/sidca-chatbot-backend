@@ -1,7 +1,7 @@
 import OpenAI from "openai";
 import { readFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
-import { rankNormative, type RagChunk } from "./ragCore.js";
+import { chunkMatchesNormativeReference, parseNormativeReferences, rankNormative, type RagChunk } from "./ragCore.js";
 
 export type DominioBackend =
   | "licencias"
@@ -1415,6 +1415,7 @@ function classifyDomain(
   if (text.includes("centro educativo") || text.includes("centros educativos") || text.includes("jardin maternal") || text.includes("jardines maternales") || text.includes("pasitos cuidados")) return "nomenclador";
   if (/\b26\s*\.?\s*058\b/.test(text)) return "educacion_tecnico_profesional";
   if (/\b26\s*\.?\s*206\b/.test(text)) return "educacion_nacional";
+  if (/\b5381\b/.test(text)) return "educacion_provincial";
   if (/\b3387\b/.test(text) || text.includes("educacion privada")) return "educacion_privada";
 
   if (isGremialAdviceServiceQuestion(pregunta) || isAppNavigationServicesQuestion(pregunta)) {
@@ -1730,6 +1731,7 @@ async function getSourceConfigs(): Promise<SourceConfig[]> {
         if (sourceId.includes("nomenclador")) return "nomenclador";
         if (sourceId.startsWith("ley_26058")) return "educacion_tecnico_profesional";
         if (sourceId.startsWith("ley_26206")) return "educacion_nacional";
+        if (sourceId.startsWith("ley_5381")) return "educacion_provincial";
         if (sourceId.includes("educacion_privada")) return "educacion_privada";
         if (sourceId.includes("sumarios")) return "sumarios";
         if (sourceId.includes("licencias")) return "licencias";
@@ -1749,6 +1751,7 @@ async function getSourceConfigs(): Promise<SourceConfig[]> {
           const dominio = (sourceId.includes("nomenclador") ? "nomenclador"
             : sourceId.startsWith("ley_26058") ? "educacion_tecnico_profesional"
             : sourceId.startsWith("ley_26206") ? "educacion_nacional"
+            : sourceId.startsWith("ley_5381") ? "educacion_provincial"
             : sourceId.includes("educacion_privada") ? "educacion_privada"
             : sourceId.includes("sumarios") ? "sumarios"
             : (isDominioBackend(fuente.dominio) ? fuente.dominio : inferDomainFromSourceId(sourceId))) as DominioBackend;
@@ -2172,6 +2175,7 @@ function extractChunksFromJson(data: unknown, source: SourceConfig): LocalChunk[
         ? "nomenclador"
         : source.id?.startsWith("ley_26058") ? "educacion_tecnico_profesional"
         : source.id?.startsWith("ley_26206") ? "educacion_nacional"
+        : source.id?.startsWith("ley_5381") ? "educacion_provincial"
         : source.id?.includes("educacion_privada") ? "educacion_privada"
         : source.id?.includes("sumarios") ? "sumarios"
         : source.dominio;
@@ -2342,18 +2346,21 @@ async function loadLocalChunks(): Promise<LocalChunk[]> {
       resultados.every((resultado) => resultado.ok);
 
     if (cargaCompleta && chunks.length > 0) {
+      const nextVersion = createHash("sha256").update(JSON.stringify({ sources, chunks })).digest("hex");
+      const corpusChanged = cachedChunksVersion !== nextVersion;
       cachedChunks = chunks;
       cachedChunksComplete = chunks;
       cachedAt = workflowNow();
-      cachedChunksVersion = createHash("sha256").update(JSON.stringify({ sources, chunks })).digest("hex");
-      responseCache.clear();
+      cachedChunksVersion = nextVersion;
+      if (corpusChanged) responseCache.clear();
     } else if (cachedChunksComplete) {
       const activeSourceUrls = new Set(sources.map((source) => source.source));
       const safeStaleChunks = cachedChunksComplete.filter((chunk) => activeSourceUrls.has(chunk.source));
-      const changedCorpus = safeStaleChunks.length !== cachedChunksComplete.length;
+      const nextVersion = createHash("sha256").update(JSON.stringify({ sources, chunks: safeStaleChunks })).digest("hex");
+      const corpusChanged = cachedChunksVersion !== nextVersion;
       cachedChunks = safeStaleChunks;
-      cachedChunksVersion = createHash("sha256").update(JSON.stringify({ sources, chunks: safeStaleChunks })).digest("hex");
-      if (changedCorpus) responseCache.clear();
+      cachedChunksVersion = nextVersion;
+      if (corpusChanged) responseCache.clear();
       console.warn("[groqWorkflow] documents_stale_cache_used", {
         fuentesFallidas: resultados.filter((resultado) => !resultado.ok).length,
         fragmentos: safeStaleChunks.length,
@@ -3799,16 +3806,18 @@ async function searchLocalFragments(
   const chunks = documentos || (await loadLocalChunks());
   const maxResults = Math.min(Math.max(input.maxResults ?? 5, 1), 8);
 
-  const explicitlyRequestedNormNumbers = Array.from(new Set((input.pregunta.match(/\b(?:ley|decreto(?:[- ]ley)?|resoluci[oó]n)\s*(?:(?:nacional|provincial|acuerdo|ecyt)\s+)*(?:n(?:ro)?[º°.]?\s*)?\d[\d.]*/gi) || []).map((item) => (item.match(/\d[\d.]*/) || [""])[0].replace(/\./g, "")))).filter(Boolean);
-  const isMultiNormComparison = /diferencias|comparar|comparaci[oó]n|relaci[oó]n|entre/i.test(input.pregunta) && explicitlyRequestedNormNumbers.length > 1;
+  const explicitlyRequestedNorms = Array.from(new Map(parseNormativeReferences(input.pregunta).map((reference) => [
+    [reference.kind, reference.number, reference.year || "", reference.qualifier || "", reference.jurisdiction || ""].join("|"), reference,
+  ])).values());
+  const isMultiNormComparison = /diferencias|comparar|comparaci[oó]n|relaci[oó]n|entre/i.test(input.pregunta) && explicitlyRequestedNorms.length > 1;
   if (isMultiNormComparison) {
-    const perNorm = Math.max(1, Math.floor(maxResults / explicitlyRequestedNormNumbers.length));
+    const perNorm = Math.max(1, Math.floor(maxResults / explicitlyRequestedNorms.length));
     const selected: LocalChunk[] = [];
-    for (const number of explicitlyRequestedNormNumbers) {
-      const matches = chunks.filter((chunk) => {
-        const identity = normalizeText(`${chunk.norma || ""} ${chunk.metadata?.documento || ""} ${chunk.referencia} ${chunk.sourceId || ""} ${chunk.filename}`).replace(/\./g, "");
-        return identity.includes(number);
-      }).map((chunk) => ({ chunk, score: scoreChunk(chunk, input.pregunta, chunk.dominio) }))
+    for (const requestedNorm of explicitlyRequestedNorms) {
+      const matches = chunks.filter((chunk) => chunkMatchesNormativeReference({
+        sourceId: chunk.sourceId || chunk.filename, source: chunk.referencia, norm: chunk.norma || chunk.referencia,
+        jurisdiction: String(chunk.metadata?.jurisdiccion || ""), metadata: chunk.metadata, text: chunk.text,
+      }, requestedNorm)).map((chunk) => ({ chunk, score: scoreChunk(chunk, input.pregunta, chunk.dominio) }))
         .map((match) => {
           const normalizedQuestion = normalizeText(input.pregunta);
           const normalizedText = normalizeText(match.chunk.text);
@@ -3825,15 +3834,15 @@ async function searchLocalFragments(
   const decreeAndModification = input.pregunta.match(/\b(?:decreto(?:\s+acuerdo)?|dcto\.?\s*acdo\.?)\s*(?:n(?:ro)?[º°.]?\s*)?(\d{2,5})\s*\/\s*(\d{4})/i);
   const resolutionModification = input.pregunta.match(/\bRESRH[- ]?(\d{4})[- ]?(\d+)/i);
   if (decreeAndModification && resolutionModification && /modific|reemplaz/i.test(input.pregunta)) {
-    const decreeNumber = `${decreeAndModification[1]}/${decreeAndModification[2]}`;
+    const requestedDecree = parseNormativeReferences(decreeAndModification[0])[0];
     const resolutionNumber = `resrh ${resolutionModification[1]} ${resolutionModification[2]}`;
     const decreeChunks = chunks.filter((chunk) => {
-      const identity = normalizeText(`${chunk.norma || ""} ${chunk.metadata?.documento || ""} ${chunk.referencia}`);
-      return identity.includes(normalizeText(decreeNumber));
+      return Boolean(requestedDecree && chunkMatchesNormativeReference({ sourceId: chunk.sourceId || chunk.filename, source: chunk.referencia, norm: chunk.norma || chunk.referencia, jurisdiction: String(chunk.metadata?.jurisdiccion || ""), metadata: chunk.metadata, text: chunk.text }, requestedDecree));
     });
     const modifyingChunks = chunks.filter((chunk) => {
-      const identity = normalizeText(`${chunk.norma || ""} ${chunk.metadata?.documento || ""} ${chunk.text}`);
-      return identity.includes(normalizeText(resolutionNumber));
+      const matchesResolution = (value: string) => Array.from(value.matchAll(/\bRESRH[- ]?(\d{4})[- ]?(\d+)(?:-[A-Z0-9]+)*\b/gi))
+        .some((match) => `${match[1]} ${match[2]}` === resolutionNumber.replace(/^resrh\s*/i, ""));
+      return matchesResolution(`${chunk.norma || ""} ${chunk.metadata?.documento || ""} ${chunk.referencia} ${chunk.text}`);
     });
     const annexChunk = decreeChunks.find((chunk) => /articulo\s*2\b/.test(normalizeText(String(chunk.articulo || ""))) || /como anexo ii/.test(normalizeText(chunk.text)));
     const selected = [annexChunk, ...modifyingChunks.filter((chunk) => /anexo ii|modificacion y reemplazo/i.test(`${chunk.titulo || ""} ${chunk.text}`))]
@@ -4478,29 +4487,35 @@ function citedArticlesAreSupported(
 }
 
 function citedNormsAreSupported(answer: string, chunks: LocalChunk[]): boolean {
-  const citations = Array.from(answer.matchAll(/\b(ley|decreto(?:[- ]ley)?|resoluci[oó]n)\s*(?:n(?:ro)?[º°.]?\s*)?(\d[\d.]*(?:\s*\/\s*\d{2,4})?)/gi))
-    .map((match) => normalizeText(match[0]).replace(/\./g, "").replace(/\s+/g, " "));
+  const citations = parseNormativeReferences(answer);
   if (!citations.length) return true;
-  const supported = normalizeText(chunks.map((chunk) => `${chunk.norma || ""} ${chunk.referencia} ${chunk.filename} ${chunk.text}`).join(" ")).replace(/\./g, "").replace(/\s+/g, " ");
-  return citations.every((citation) => supported.includes(citation));
+  return citations.every((citation) => chunks.some((chunk) => chunkMatchesNormativeReference({
+    sourceId: chunk.sourceId || chunk.filename, source: chunk.referencia, norm: chunk.norma || chunk.referencia,
+    jurisdiction: String(chunk.metadata?.jurisdiccion || ""), metadata: chunk.metadata, text: chunk.text,
+  }, citation)));
 }
 
 function citedNormArticlePairsAreSupported(answer: string, chunks: LocalChunk[]): boolean {
-  const pairs = Array.from(answer.matchAll(/\b((?:ley|decreto(?:[- ]ley)?|resoluci[oó]n)\s*(?:(?:nacional|provincial|acuerdo|ecyt)\s+)*(?:n(?:ro)?[º°.]?\s*)?\d[\d.]*(?:\s*\/\s*\d{2,4})?)[^\n.;]{0,80}?\b(?:art(?:i|í)culo|art)\.?\s*(\d+)\b/gi));
-  return pairs.every((pair) => {
-    const citedNormDigits = String(pair[1]).replace(/\D/g, "");
-    const citedArticle = String(pair[2]);
-    return chunks.some((chunk) => {
-      const identity = `${chunk.norma || ""} ${chunk.metadata?.documento || ""} ${chunk.referencia} ${chunk.sourceId || ""}`;
-      const identityDigits = identity.replace(/\D/g, "");
-      const normMatches = Boolean(citedNormDigits) && identityDigits.includes(citedNormDigits);
-      const articleMatchesChunk = [
-        ...(chunk.articleRefs || []).map(String),
-        ...(String(chunk.articulo || "").match(/\d+/g) || []),
-      ].includes(citedArticle);
-      return normMatches && articleMatchesChunk;
-    });
-  });
+  const pairs: Array<{ norm: ReturnType<typeof parseNormativeReferences>[number]; article: string }> = [];
+  const normFirst = /\b(?:ley(?:\s+(?:nacional|provincial))?|decreto(?:\s*[-–]\s*ley|\s+acuerdo|\s+ecyt)?|resoluci[oó]n(?:\s+(?:nacional|provincial))?)\s*(?:(?:n(?:ro)?|numero)\s*(?:[º°ª]\.?|\.\s*[º°ª]?|)?\s*)?\d[\d.]*(?:\s*\/\s*\d{2,4})?[^\n.;]{0,80}?\b(?:art(?:i|í)culo|art)\.?\s*(\d+)\b/gi;
+  for (const match of answer.matchAll(normFirst)) {
+    const norm = parseNormativeReferences(match[0])[0];
+    const article = match[1];
+    if (norm && article) pairs.push({ norm, article });
+  }
+  const articleFirst = /\b(?:art(?:i|í)culo|art)\.?\s*(\d+)\s+(?:de\s+)?(?:la\s+)?((?:ley(?:\s+(?:nacional|provincial))?|decreto(?:\s*[-–]\s*ley|\s+acuerdo|\s+ecyt)?|resoluci[oó]n(?:\s+(?:nacional|provincial))?)\s*(?:(?:n(?:ro)?|numero)\s*(?:[º°ª]\.?|\.\s*[º°ª]?|)?\s*)?\d[\d.]*(?:\s*\/\s*\d{2,4})?)/gi;
+  for (const match of answer.matchAll(articleFirst)) {
+    const norm = parseNormativeReferences(match[2])[0];
+    if (norm && match[1]) pairs.push({ norm, article: match[1] });
+  }
+  return pairs.every(({ norm, article }) => chunks.some((chunk) => {
+    const exactNorm = chunkMatchesNormativeReference({
+      sourceId: chunk.sourceId || chunk.filename, source: chunk.referencia, norm: chunk.norma || chunk.referencia,
+      jurisdiction: String(chunk.metadata?.jurisdiccion || ""), metadata: chunk.metadata, text: chunk.text,
+    }, norm);
+    const hasArticle = [...(chunk.articleRefs || []).map(String), ...(String(chunk.articulo || "").match(/\d+/g) || [])].includes(article);
+    return exactNorm && hasArticle;
+  }));
 }
 
 function responseCacheKey(
@@ -4585,9 +4600,10 @@ export async function runGroqWorkflow(
   const preguntaEfectiva = input.contextoConversacional
     ? `${input.pregunta}\nContexto conversacional previo del mismo usuario: ${input.contextoConversacional}`
     : input.pregunta;
-  const explicitNormInQuestion = /\b(?:ley|decreto(?:[- ]ley)?|resoluci[oó]n)\s*(?:(?:nacional|provincial|acuerdo|ecyt)\s+)*(?:n(?:ro)?[º°.]?\s*)?\d/i.test(input.pregunta);
+  const explicitNormInQuestion = parseNormativeReferences(input.pregunta).length > 0;
   const asksSingleArticle = /\b(?:art(?:i|í)culo|art)\.?\s*\d+\b/i.test(input.pregunta) && !explicitNormInQuestion;
-  if (asksSingleArticle && !input.contextoConversacional) {
+  const preliminaryDomain = classifyDomain(preguntaEfectiva, input.dominio);
+  if (asksSingleArticle && !input.contextoConversacional && preliminaryDomain === "general") {
     return buildOutput({ ok: true, tipo: "aclaracion", origen: "local_rag", dominio: input.dominio || "general", consulta: input.pregunta,
       respuesta: "¿De qué norma querés consultar ese artículo? Hay varias normas documentales con artículos de igual numeración; indicá la ley o decreto para evitar una respuesta ambigua.", chunks: [] });
   }
@@ -4708,7 +4724,9 @@ export async function runGroqWorkflow(
       });
     }
 
-    const nonCurrent = chunks.find((chunk) => /derogado|sustituido/.test(normalizeText(String(chunk.metadata?.estado_vigencia || ""))));
+    const requestedArticles = extractArticleNumbersFromQuery(input.pregunta);
+    const nonCurrent = chunks.find((chunk) => /derogado|sustituido/.test(normalizeText(String(chunk.metadata?.estado_vigencia || ""))) &&
+      (!requestedArticles.length || requestedArticles.some((article) => articleMatches(chunk, article))));
     if (nonCurrent) {
       const update: any = nonCurrent.metadata?.actualizacion;
       const status = normalizeText(String(update?.estado || nonCurrent.metadata?.estado_vigencia || ""));
@@ -4717,7 +4735,9 @@ export async function runGroqWorkflow(
         respuesta: `El artículo solicitado se conserva en la fuente como texto histórico y figura como ${status}. No corresponde presentarlo como disposición vigente. ${update?.norma ? `La ficha atribuye esta actualización a ${update.norma}.` : ""} ${summary ? `La fuente incluye este resumen de actualización, no una transcripción oficial: ${summary}` : ""}`.trim(), chunks: [nonCurrent] });
     }
 
-    const truncated = chunks.find((chunk) => /articulo 32 truncado/.test(normalizeText(String((chunk.metadata?.control_documental as any)?.contenido || ""))));
+    const truncated = requestedArticles.includes("32") && /3387/.test(normalizeText(input.pregunta))
+      ? chunks.find((chunk) => articleMatches(chunk, "32") && /articulo 32 truncado/.test(normalizeText(String((chunk.metadata?.control_documental as any)?.contenido || ""))))
+      : undefined;
     if (truncated) {
       return buildOutput({ ok: true, tipo: "respuesta_local", origen: "local_rag", dominio, consulta: input.pregunta,
         respuesta: "La fuente del Decreto-Ley 3387 advierte que el artículo 32 está truncado. El fragmento disponible no es íntegro; no puedo reconstruir el texto faltante. La advertencia es un control documental, no parte del texto normativo.", chunks: [truncated] });
@@ -4726,7 +4746,10 @@ export async function runGroqWorkflow(
     try {
       const generacionGroq = await askGroq(preguntaEfectiva, dominio, chunks);
 
-      if (!citedArticlesAreSupported(generacionGroq.text, chunks) || !citedNormsAreSupported(generacionGroq.text, chunks) || !citedNormArticlePairsAreSupported(generacionGroq.text, chunks)) {
+      const supportedArticles = citedArticlesAreSupported(generacionGroq.text, chunks);
+      const supportedNorms = citedNormsAreSupported(generacionGroq.text, chunks);
+      const supportedPairs = citedNormArticlePairsAreSupported(generacionGroq.text, chunks);
+      if (!supportedArticles || !supportedNorms || !supportedPairs) {
         console.warn("[groqWorkflow] unsupported_normative_citation_rejected");
         return buildOutput({
           ok: true,
