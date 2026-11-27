@@ -184,9 +184,10 @@ const bodySchema = z.object({
     .min(2, "La pregunta es obligatoria")
     .max(2000, "La consulta es demasiado extensa. Intentá resumirla."),
   dominio: z
-    .enum(["licencias", "estatuto", "general", "coberturas", "servicios"])
+    .enum(["licencias", "estatuto", "general", "coberturas", "servicios", "nomenclador", "sumarios", "educacion_nacional", "educacion_provincial", "educacion_privada", "educacion_tecnico_profesional"])
     .optional(),
   maxResults: z.number().int().min(1).max(8).optional(),
+  contextoConversacional: z.string().trim().max(2000).optional(),
 });
 
 const secureMercadoPagoPreferenceSchema = z.object({

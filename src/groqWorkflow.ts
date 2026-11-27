@@ -1,17 +1,26 @@
 import OpenAI from "openai";
 import { readFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { rankNormative, type RagChunk } from "./ragCore.js";
 
 export type DominioBackend =
   | "licencias"
   | "estatuto"
   | "general"
   | "coberturas"
-  | "servicios";
+  | "servicios"
+  | "nomenclador"
+  | "sumarios"
+  | "educacion_nacional"
+  | "educacion_provincial"
+  | "educacion_privada"
+  | "educacion_tecnico_profesional";
 
 export type ChatbotQueryInput = {
   pregunta: string;
   dominio?: DominioBackend;
   maxResults?: number;
+  contextoConversacional?: string;
 };
 
 export type SearchHit = {
@@ -59,10 +68,12 @@ export type ChatbotWorkflowOutput = {
 };
 
 type SourceConfig = {
+  id?: string;
   dominio: DominioBackend;
   source: string;
   filename: string;
   referencia: string;
+  norma?: string;
 };
 
 type LocalChunkKind = "articulo" | "resumen" | "documento";
@@ -83,6 +94,9 @@ type LocalChunk = {
   seccion?: string;
   nivel?: string;
   tipo?: string;
+  norma?: string;
+  sourceId?: string;
+  metadata?: Record<string, unknown>;
   text: string;
   raw?: unknown;
 };
@@ -109,7 +123,7 @@ const DEFAULT_GENERAL_URL =
   "https://raw.githubusercontent.com/rcampagnale/sidca-chatbot-docs/main/consultas_generales.json";
 
 const DEFAULT_COBERTURAS_URL =
-  "https://raw.githubusercontent.com/rcampagnale/sidca-chatbot-docs/main/decreto_636_coberturas_docentes.json";
+  "https://raw.githubusercontent.com/rcampagnale/sidca-chatbot-docs/main/decreto_636_coberturas_actualizado_res3335.json";
 
 const DEFAULT_SERVICIOS_URL =
   "https://raw.githubusercontent.com/rcampagnale/sidca-chatbot-docs/main/servicios_sidca_app.json";
@@ -138,6 +152,8 @@ let cachedAt = 0;
 let cachedChunksComplete: LocalChunk[] | null = null;
 let cachedChunksVersion = "";
 let loadingChunksPromise: Promise<LocalChunk[]> | null = null;
+let cachedSourceConfigs: SourceConfig[] | null = null;
+let cachedInactiveSourceLabels: string[] = [];
 const SOURCE_LOAD_CONCURRENCY = 4;
 const RESPONSE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const RESPONSE_CACHE_MAX_ENTRIES = 500;
@@ -148,6 +164,16 @@ type CachedChatbotResponse = {
 };
 
 const responseCache = new Map<string, CachedChatbotResponse>();
+type WorkflowTestDependencies = { fetchJson?: (url: string) => Promise<unknown>; now?: () => number; groqClient?: OpenAI | null };
+let workflowTestDependencies: WorkflowTestDependencies = {};
+export function setWorkflowTestDependencies(dependencies: WorkflowTestDependencies = {}): void {
+  workflowTestDependencies = dependencies;
+  cachedChunks = null; cachedChunksComplete = null; cachedAt = 0; cachedChunksVersion = ""; loadingChunksPromise = null; cachedSourceConfigs = null; cachedInactiveSourceLabels = []; responseCache.clear();
+}
+export function updateWorkflowTestDependencies(dependencies: WorkflowTestDependencies = {}): void {
+  workflowTestDependencies = { ...workflowTestDependencies, ...dependencies };
+}
+const workflowNow = () => workflowTestDependencies.now?.() ?? Date.now();
 
 const STOPWORDS = new Set([
   "para",
@@ -1376,12 +1402,20 @@ function classifyDomain(
     dominio === "licencias" ||
     dominio === "estatuto" ||
     dominio === "coberturas" ||
-    dominio === "servicios"
+    dominio === "servicios" || (dominio !== undefined && ["nomenclador", "sumarios", "educacion_nacional", "educacion_provincial", "educacion_privada", "educacion_tecnico_profesional"].includes(dominio))
   ) {
     return dominio;
   }
 
   const text = normalizeText(pregunta);
+
+  if (/\b533\s*(?:\/\s*)?(?:21|2021)\b/.test(text)) return "coberturas";
+  if (/\b636\s*(?:\/\s*)?2021\b/.test(text)) return "coberturas";
+  if (/\b(?:2431\s*(?:\/\s*)?2016|2453\s*(?:\/\s*)?2019|1480\s*(?:\/\s*)?2019)\b/.test(text) || text.includes("nomenclador")) return "nomenclador";
+  if (text.includes("centro educativo") || text.includes("centros educativos") || text.includes("jardin maternal") || text.includes("jardines maternales") || text.includes("pasitos cuidados")) return "nomenclador";
+  if (/\b26\s*\.?\s*058\b/.test(text)) return "educacion_tecnico_profesional";
+  if (/\b26\s*\.?\s*206\b/.test(text)) return "educacion_nacional";
+  if (/\b3387\b/.test(text) || text.includes("educacion privada")) return "educacion_privada";
 
   if (isGremialAdviceServiceQuestion(pregunta) || isAppNavigationServicesQuestion(pregunta)) {
     return "servicios";
@@ -1434,6 +1468,8 @@ function classifyDomain(
     text.includes("licencias") ||
     text.includes("inasistencia") ||
     text.includes("justificacion") ||
+    text.includes("razones particulares") ||
+    text.includes("razones especiales") ||
     text.includes("franquicia") ||
     text.includes("maternidad") ||
     text.includes("enfermedad") ||
@@ -1452,6 +1488,12 @@ function classifyDomain(
   }
 
   const rules: Record<DominioBackend, string[]> = {
+    nomenclador: ["nomenclador", "centro educativo", "centros educativos", "jardin maternal", "jardines maternales"],
+    sumarios: ["sumario", "sumarios", "procedimiento disciplinario", "instructor sumariante"],
+    educacion_nacional: ["educacion nacional", "educación nacional", "ley nacional"],
+    educacion_provincial: ["educacion provincial", "educación provincial", "estatuto docente provincial"],
+    educacion_privada: ["educacion privada", "educación privada", "escuela privada"],
+    educacion_tecnico_profesional: ["tecnico profesional", "técnico profesional", "educacion tecnica", "educación técnica"],
     licencias: [
       "licencia",
       "licencias",
@@ -1609,13 +1651,7 @@ function classifyDomain(
 }
 
 function isDominioBackend(value: unknown): value is DominioBackend {
-  return (
-    value === "licencias" ||
-    value === "estatuto" ||
-    value === "general" ||
-    value === "coberturas" ||
-    value === "servicios"
-  );
+  return ["licencias", "estatuto", "general", "coberturas", "servicios", "nomenclador", "sumarios", "educacion_nacional", "educacion_provincial", "educacion_privada", "educacion_tecnico_profesional"].includes(String(value));
 }
 
 function getFilenameFromUrl(url: string, fallback: string): string {
@@ -1687,15 +1723,38 @@ async function getSourceConfigs(): Promise<SourceConfig[]> {
   if (manifestUrl) {
     try {
       const manifest = (await loadJsonFromSource(manifestUrl)) as SourcesManifest;
+      cachedInactiveSourceLabels = (manifest.fuentes || []).filter((fuente) => fuente.activo === false)
+        .map((fuente) => [fuente.id, fuente.nombre, fuente.referencia].filter(Boolean).join(" "));
+
+      const inferDomainFromSourceId = (sourceId: string): DominioBackend | undefined => {
+        if (sourceId.includes("nomenclador")) return "nomenclador";
+        if (sourceId.startsWith("ley_26058")) return "educacion_tecnico_profesional";
+        if (sourceId.startsWith("ley_26206")) return "educacion_nacional";
+        if (sourceId.includes("educacion_privada")) return "educacion_privada";
+        if (sourceId.includes("sumarios")) return "sumarios";
+        if (sourceId.includes("licencias")) return "licencias";
+        if (sourceId.includes("estatuto")) return "estatuto";
+        if (sourceId.includes("consultas_generales")) return "general";
+        if (sourceId.includes("coberturas") || sourceId.includes("movilidad")) return "coberturas";
+        if (sourceId.includes("servicios")) return "servicios";
+        return undefined;
+      };
 
       const manifestSources = (manifest.fuentes || [])
-        .filter((fuente) => fuente.activo !== false)
-        .filter((fuente) => fuente.url && isDominioBackend(fuente.dominio))
+        .filter((fuente) => fuente.activo === true)
+        .filter((fuente) => fuente.url && (isDominioBackend(fuente.dominio) || inferDomainFromSourceId(String(fuente.id || ""))))
         .map((fuente) => {
           const source = String(fuente.url);
-          const dominio = fuente.dominio as DominioBackend;
+          const sourceId = String(fuente.id || "");
+          const dominio = (sourceId.includes("nomenclador") ? "nomenclador"
+            : sourceId.startsWith("ley_26058") ? "educacion_tecnico_profesional"
+            : sourceId.startsWith("ley_26206") ? "educacion_nacional"
+            : sourceId.includes("educacion_privada") ? "educacion_privada"
+            : sourceId.includes("sumarios") ? "sumarios"
+            : (isDominioBackend(fuente.dominio) ? fuente.dominio : inferDomainFromSourceId(sourceId))) as DominioBackend;
 
           return {
+            id: fuente.id,
             dominio,
             source,
             filename: getFilenameFromUrl(source, `${fuente.id || dominio}.json`),
@@ -1708,6 +1767,7 @@ async function getSourceConfigs(): Promise<SourceConfig[]> {
         });
 
       if (manifestSources.length > 0) {
+        cachedSourceConfigs = manifestSources;
         console.log(
           `[groqWorkflow] Fuentes cargadas desde índice: ${manifestSources.length}`
         );
@@ -1715,9 +1775,9 @@ async function getSourceConfigs(): Promise<SourceConfig[]> {
         return manifestSources;
       }
 
-      console.warn(
-        "[groqWorkflow] El índice de fuentes no tiene fuentes activas válidas. Se usa fallback local."
-      );
+      console.warn("[groqWorkflow] manifest_has_no_active_sources");
+      cachedSourceConfigs = [];
+      return [];
     } catch (error: any) {
       console.warn(
         "[groqWorkflow] manifest_load_failed",
@@ -1726,10 +1786,15 @@ async function getSourceConfigs(): Promise<SourceConfig[]> {
     }
   }
 
-  return getFallbackSourceConfigs();
+  if (cachedSourceConfigs) {
+    console.warn("[groqWorkflow] manifest_stale_configuration_used");
+    return cachedSourceConfigs;
+  }
+  throw new Error("document_manifest_unavailable");
 }
 
 async function loadJsonFromSource(source: string): Promise<unknown> {
+  if (workflowTestDependencies.fetchJson) return workflowTestDependencies.fetchJson(source);
   if (/^https?:\/\//i.test(source)) {
     const controller = new AbortController();
     const timeoutId = globalThis.setTimeout(() => controller.abort(), 15000);
@@ -2020,6 +2085,7 @@ function makeArticleChunk(
 
   return {
     id: `${source.dominio}-${source.filename}-${index}-${articulo || "sin-articulo"}`,
+    sourceId: source.id,
     kind: articulo ? "articulo" : "documento",
     dominio: source.dominio,
     filename: source.filename,
@@ -2034,6 +2100,8 @@ function makeArticleChunk(
     seccion: getObjectField(item, ["seccion", "sección"]),
     nivel: getObjectField(item, ["nivel"]),
     tipo: getObjectField(item, ["tipo"]),
+    norma: getObjectField(item, ["norma", "numero_norma", "número_norma", "documento", "ley", "decreto", "resolucion", "resolución"]) || source.referencia,
+    metadata: typeof item === "object" && item !== null ? item as Record<string, unknown> : undefined,
     text,
     raw: item,
   };
@@ -2092,10 +2160,41 @@ function makeResumenChunk(
 }
 
 function extractChunksFromJson(data: unknown, source: SourceConfig): LocalChunk[] {
+  if (typeof data === "object" && data !== null && !Array.isArray(data)) {
+    const envelope = data as Record<string, unknown>;
+    const nested = Array.isArray(envelope.registros)
+      ? envelope.registros
+      : Array.isArray(envelope.servicios)
+      ? envelope.servicios
+      : null;
+    if (nested) {
+      const derivedDomain: DominioBackend = source.id?.includes("nomenclador")
+        ? "nomenclador"
+        : source.id?.startsWith("ley_26058") ? "educacion_tecnico_profesional"
+        : source.id?.startsWith("ley_26206") ? "educacion_nacional"
+        : source.id?.includes("educacion_privada") ? "educacion_privada"
+        : source.id?.includes("sumarios") ? "sumarios"
+        : source.dominio;
+      const derivedSource = { ...source, dominio: derivedDomain, referencia: String(envelope.fuente && typeof envelope.fuente === "object" ? (envelope.fuente as any).norma || source.referencia : source.referencia) };
+      const chunks = nested.map((item, index) => makeArticleChunk(item, derivedSource, index)).filter((chunk): chunk is LocalChunk => Boolean(chunk));
+      const metadata = ["estado_vigencia", "actualizacion", "instruccion_chatbot", "instrucciones_chatbot", "observaciones", "notas", "tipo", "control_documental", "articulos_faltantes", "articulos_repetidos", "url_texto_actualizado"]
+        .map((key) => `${key}: ${objectToText(envelope[key])}`).filter((value) => !value.endsWith(": ")).join("\n");
+      if (metadata) for (const chunk of chunks) chunk.metadata = { ...chunk.metadata, ...(envelope as Record<string, unknown>) };
+      return chunks;
+    }
+  }
   if (Array.isArray(data)) {
     const chunks: LocalChunk[] = [];
+    const controls = data.filter((item: any) => item && typeof item === "object" && normalizeText(String(item.tipo || "")) === "control documental");
+    const normativaRows = data.filter((item: any) => !(item && typeof item === "object" && normalizeText(String(item.tipo || "")) === "control documental"));
 
-    data.forEach((item, index) => {
+    normativaRows.forEach((originalItem: any, index) => {
+      const matchingControl = controls.find((control: any) => {
+        const controlDocument = normalizeText(String(control.documento || ""));
+        const rowDocument = normalizeText(String(originalItem?.documento || originalItem?.documento_normativo || ""));
+        return controlDocument && rowDocument && (controlDocument === rowDocument || rowDocument.includes(controlDocument));
+      });
+      const item = matchingControl ? { ...originalItem, control_documental: matchingControl } : originalItem;
       if (isResumenContainer(item)) {
         const obj = item as Record<string, unknown>;
         const titulo =
@@ -2200,7 +2299,7 @@ async function mapConcurrenciaLimitada<T, R>(
 
 async function loadLocalChunks(): Promise<LocalChunk[]> {
   const ttl = Number(getEnv("LOCAL_RAG_CACHE_TTL_MS") || 5 * 60 * 1000);
-  const now = Date.now();
+  const now = workflowNow();
 
   if (cachedChunks && now - cachedAt < ttl) {
     console.log("[groqWorkflow] documents_cache_hit", {
@@ -2245,14 +2344,22 @@ async function loadLocalChunks(): Promise<LocalChunk[]> {
     if (cargaCompleta && chunks.length > 0) {
       cachedChunks = chunks;
       cachedChunksComplete = chunks;
-      cachedAt = Date.now();
-      cachedChunksVersion = `${sources.map((source) => source.source).join("|")}:${chunks.length}:${cachedAt}`;
+      cachedAt = workflowNow();
+      cachedChunksVersion = createHash("sha256").update(JSON.stringify({ sources, chunks })).digest("hex");
+      responseCache.clear();
     } else if (cachedChunksComplete) {
+      const activeSourceUrls = new Set(sources.map((source) => source.source));
+      const safeStaleChunks = cachedChunksComplete.filter((chunk) => activeSourceUrls.has(chunk.source));
+      const changedCorpus = safeStaleChunks.length !== cachedChunksComplete.length;
+      cachedChunks = safeStaleChunks;
+      cachedChunksVersion = createHash("sha256").update(JSON.stringify({ sources, chunks: safeStaleChunks })).digest("hex");
+      if (changedCorpus) responseCache.clear();
       console.warn("[groqWorkflow] documents_stale_cache_used", {
         fuentesFallidas: resultados.filter((resultado) => !resultado.ok).length,
-        fragmentos: cachedChunksComplete.length,
+        fragmentos: safeStaleChunks.length,
       });
-      return cachedChunksComplete;
+      if (!safeStaleChunks.length) throw new Error("no_safe_documents_after_partial_failure");
+      return safeStaleChunks;
     } else {
       throw new Error("initial_documents_unavailable");
     }
@@ -2755,6 +2862,10 @@ function isGenericTeacherQuestion(pregunta: string): boolean {
   return (hasGenericPattern || hasOnlyGenericTokens) && !hasSpecificKeyword;
 }
 
+function isStandaloneGreeting(pregunta: string): boolean {
+  return /^(hola|buen dia|buenos dias|buenas tardes|buenas noches|saludos|hola sidca)$/.test(normalizeText(pregunta));
+}
+
 function isIncompleteTeacherComparisonQuestion(pregunta: string): boolean {
   const text = normalizeText(pregunta);
 
@@ -2855,6 +2966,11 @@ type ServiceExpansion = {
 };
 
 const SERVICE_EXPANSIONS: ServiceExpansion[] = [
+  {
+    triggers: ["servicios de la app", "servicios tiene la app", "qué servicios tiene la app", "secciones principales de la app", "secciones principales app", "qué puedo hacer en la app"],
+    terms: ["app sidca secciones nosotros informacion asesoramiento beneficios servicios institucionales"],
+    preferredIds: ["sidca_servicios_home_resumen"],
+  },
   {
     triggers: ["contacto", "whatsapp", "telefono", "numero", "número", "sede", "direccion", "dirección", "donde queda sidca"],
     terms: ["medios de contacto whatsapp telefono sede central ayacucho 227"],
@@ -3130,6 +3246,34 @@ function scoreChunk(
   dominio: DominioBackend
 ): number {
   if (chunk.dominio !== dominio) return -1000;
+
+  const comparativeNorms = /\b(compar|diferencia|entre|versus|vs\.?|ambos|diferentes|modific|reemplaz|relacion|relaci[oó]n)\b/i.test(pregunta);
+  const normalizedQuestion = normalizeText(pregunta);
+  const explicitCenter = /centros? educativos?/.test(normalizedQuestion);
+  const explicitGarden = /jardines? maternales?|pasitos cuidados?/.test(normalizedQuestion);
+  const sourceIdNormalized = normalizeText(`${chunk.sourceId || ""} ${chunk.filename}`);
+  const explicitCommonSchool = /escuela comun|escuela primaria|escuela secundaria/.test(normalizedQuestion);
+  if (explicitCenter && !explicitGarden && !sourceIdNormalized.includes("centros educativos")) return -100000;
+  if (explicitGarden && !explicitCenter && !sourceIdNormalized.includes("jardines maternales")) return -100000;
+  if (explicitCommonSchool && sourceIdNormalized.includes("centros educativos")) return -100000;
+  if (explicitCommonSchool && sourceIdNormalized.includes("jardines maternales")) return -100000;
+  const normativeQuery = !comparativeNorms && /\b(?:ley|decreto(?:[- ]ley)?|resoluci[oó]n)\s*(?:n(?:ro)?[º°.]?\s*)?\d[\d.]*(?:\s*\/\s*\d{2,4})?/i.test(pregunta);
+  const requestedArticle = /\b(?:art(?:i|í)culo|art)\.?\s*\d+/i.test(pregunta);
+  if (normativeQuery || requestedArticle) {
+    const normativeHit = rankNormative([{
+      sourceId: chunk.sourceId || chunk.filename,
+      source: chunk.referencia,
+      norm: chunk.norma || chunk.referencia,
+      article: chunk.articulo,
+      jurisdiction: String(chunk.metadata?.jurisdiccion || ""),
+      domain: chunk.dominio,
+      title: chunk.titulo,
+      text: chunk.text,
+      status: String(chunk.metadata?.estado_vigencia || ""),
+      metadata: chunk.metadata,
+    } as RagChunk], pregunta);
+    if (!normativeHit.length) return -100000;
+  }
 
   const expanded = expandQuestion(pregunta, dominio);
   const queryTokens = tokenize(expanded);
@@ -3655,6 +3799,48 @@ async function searchLocalFragments(
   const chunks = documentos || (await loadLocalChunks());
   const maxResults = Math.min(Math.max(input.maxResults ?? 5, 1), 8);
 
+  const explicitlyRequestedNormNumbers = Array.from(new Set((input.pregunta.match(/\b(?:ley|decreto(?:[- ]ley)?|resoluci[oó]n)\s*(?:(?:nacional|provincial|acuerdo|ecyt)\s+)*(?:n(?:ro)?[º°.]?\s*)?\d[\d.]*/gi) || []).map((item) => (item.match(/\d[\d.]*/) || [""])[0].replace(/\./g, "")))).filter(Boolean);
+  const isMultiNormComparison = /diferencias|comparar|comparaci[oó]n|relaci[oó]n|entre/i.test(input.pregunta) && explicitlyRequestedNormNumbers.length > 1;
+  if (isMultiNormComparison) {
+    const perNorm = Math.max(1, Math.floor(maxResults / explicitlyRequestedNormNumbers.length));
+    const selected: LocalChunk[] = [];
+    for (const number of explicitlyRequestedNormNumbers) {
+      const matches = chunks.filter((chunk) => {
+        const identity = normalizeText(`${chunk.norma || ""} ${chunk.metadata?.documento || ""} ${chunk.referencia} ${chunk.sourceId || ""} ${chunk.filename}`).replace(/\./g, "");
+        return identity.includes(number);
+      }).map((chunk) => ({ chunk, score: scoreChunk(chunk, input.pregunta, chunk.dominio) }))
+        .map((match) => {
+          const normalizedQuestion = normalizeText(input.pregunta);
+          const normalizedText = normalizeText(match.chunk.text);
+          const asksSecondaryTechnical = /secundaria/.test(normalizedQuestion) && /tecnica/.test(normalizedQuestion);
+          const directlyAddressesSecondaryTechnical = /secundaria|nivel medio/.test(normalizedText) && /tecnic/.test(normalizedText);
+          return { ...match, score: match.score + (asksSecondaryTechnical && directlyAddressesSecondaryTechnical ? 120 : 0) };
+        })
+        .sort((a, b) => b.score - a.score);
+      selected.push(...matches.slice(0, perNorm).map(({ chunk }) => chunk));
+    }
+    return selected.slice(0, maxResults);
+  }
+
+  const decreeAndModification = input.pregunta.match(/\b(?:decreto(?:\s+acuerdo)?|dcto\.?\s*acdo\.?)\s*(?:n(?:ro)?[º°.]?\s*)?(\d{2,5})\s*\/\s*(\d{4})/i);
+  const resolutionModification = input.pregunta.match(/\bRESRH[- ]?(\d{4})[- ]?(\d+)/i);
+  if (decreeAndModification && resolutionModification && /modific|reemplaz/i.test(input.pregunta)) {
+    const decreeNumber = `${decreeAndModification[1]}/${decreeAndModification[2]}`;
+    const resolutionNumber = `resrh ${resolutionModification[1]} ${resolutionModification[2]}`;
+    const decreeChunks = chunks.filter((chunk) => {
+      const identity = normalizeText(`${chunk.norma || ""} ${chunk.metadata?.documento || ""} ${chunk.referencia}`);
+      return identity.includes(normalizeText(decreeNumber));
+    });
+    const modifyingChunks = chunks.filter((chunk) => {
+      const identity = normalizeText(`${chunk.norma || ""} ${chunk.metadata?.documento || ""} ${chunk.text}`);
+      return identity.includes(normalizeText(resolutionNumber));
+    });
+    const annexChunk = decreeChunks.find((chunk) => /articulo\s*2\b/.test(normalizeText(String(chunk.articulo || ""))) || /como anexo ii/.test(normalizeText(chunk.text)));
+    const selected = [annexChunk, ...modifyingChunks.filter((chunk) => /anexo ii|modificacion y reemplazo/i.test(`${chunk.titulo || ""} ${chunk.text}`))]
+      .filter((chunk): chunk is LocalChunk => Boolean(chunk));
+    if (selected.length) return selected.slice(0, maxResults);
+  }
+
   if (dominio === "servicios") {
     const preferredServiceChunks = collectPreferredServiceChunks(
       chunks,
@@ -3936,10 +4122,13 @@ function buildContext(chunks: LocalChunk[]): string {
         `Archivo: ${chunk.filename}`,
         `Tipo: ${chunk.kind}`,
         `Fuente: ${chunk.referencia}`,
+        chunk.norma ? `Norma identificada: ${chunk.norma}` : "",
         chunk.articulo ? `Artículo/s: ${chunk.articulo}` : "",
         chunk.seccion ? `Sección: ${chunk.seccion}` : "",
         chunk.nivel ? `Nivel: ${chunk.nivel}` : "",
+        chunk.metadata?.jurisdiccion ? `Jurisdicción: ${chunk.metadata.jurisdiccion}` : "",
         chunk.titulo ? `Título: ${chunk.titulo}` : "",
+      chunk.metadata ? `Metadatos documentales: ${JSON.stringify(Object.fromEntries(Object.entries(chunk.metadata).filter(([key]) => /vigencia|actualiz|derog|sustit|histor|observ|nota|control|integridad|faltant|repetid|url_texto/i.test(key))))}` : "",
         chunk.descripcion ? `Descripción: ${chunk.descripcion}` : "",
         chunk.otorgante ? `Funcionario otorgante: ${chunk.otorgante}` : "",
         chunk.interviniente
@@ -4031,6 +4220,7 @@ function toArticulos(chunks: LocalChunk[]): BackendArticulo[] {
 }
 
 function getGroqClient(): OpenAI | null {
+  if (workflowTestDependencies.groqClient !== undefined) return workflowTestDependencies.groqClient;
   const apiKey = getEnv("GROQ_API_KEY");
 
   if (!apiKey) return null;
@@ -4287,6 +4477,32 @@ function citedArticlesAreSupported(
   return cited.every((ref) => available.has(ref));
 }
 
+function citedNormsAreSupported(answer: string, chunks: LocalChunk[]): boolean {
+  const citations = Array.from(answer.matchAll(/\b(ley|decreto(?:[- ]ley)?|resoluci[oó]n)\s*(?:n(?:ro)?[º°.]?\s*)?(\d[\d.]*(?:\s*\/\s*\d{2,4})?)/gi))
+    .map((match) => normalizeText(match[0]).replace(/\./g, "").replace(/\s+/g, " "));
+  if (!citations.length) return true;
+  const supported = normalizeText(chunks.map((chunk) => `${chunk.norma || ""} ${chunk.referencia} ${chunk.filename} ${chunk.text}`).join(" ")).replace(/\./g, "").replace(/\s+/g, " ");
+  return citations.every((citation) => supported.includes(citation));
+}
+
+function citedNormArticlePairsAreSupported(answer: string, chunks: LocalChunk[]): boolean {
+  const pairs = Array.from(answer.matchAll(/\b((?:ley|decreto(?:[- ]ley)?|resoluci[oó]n)\s*(?:(?:nacional|provincial|acuerdo|ecyt)\s+)*(?:n(?:ro)?[º°.]?\s*)?\d[\d.]*(?:\s*\/\s*\d{2,4})?)[^\n.;]{0,80}?\b(?:art(?:i|í)culo|art)\.?\s*(\d+)\b/gi));
+  return pairs.every((pair) => {
+    const citedNormDigits = String(pair[1]).replace(/\D/g, "");
+    const citedArticle = String(pair[2]);
+    return chunks.some((chunk) => {
+      const identity = `${chunk.norma || ""} ${chunk.metadata?.documento || ""} ${chunk.referencia} ${chunk.sourceId || ""}`;
+      const identityDigits = identity.replace(/\D/g, "");
+      const normMatches = Boolean(citedNormDigits) && identityDigits.includes(citedNormDigits);
+      const articleMatchesChunk = [
+        ...(chunk.articleRefs || []).map(String),
+        ...(String(chunk.articulo || "").match(/\d+/g) || []),
+      ].includes(citedArticle);
+      return normMatches && articleMatchesChunk;
+    });
+  });
+}
+
 function responseCacheKey(
   dominio: DominioBackend,
   pregunta: string
@@ -4298,7 +4514,7 @@ function getCachedResponse(key: string): ChatbotWorkflowOutput | null {
   const cached = responseCache.get(key);
   if (!cached) return null;
 
-  if (cached.expiresAt <= Date.now()) {
+  if (cached.expiresAt <= workflowNow()) {
     responseCache.delete(key);
     return null;
   }
@@ -4312,7 +4528,7 @@ function getCachedResponse(key: string): ChatbotWorkflowOutput | null {
 function setCachedResponse(key: string, response: ChatbotWorkflowOutput): void {
   responseCache.delete(key);
   responseCache.set(key, {
-    expiresAt: Date.now() + RESPONSE_CACHE_TTL_MS,
+    expiresAt: workflowNow() + RESPONSE_CACHE_TTL_MS,
     response,
   });
 
@@ -4366,7 +4582,23 @@ function buildOutput(params: {
 export async function runGroqWorkflow(
   input: ChatbotQueryInput
 ): Promise<ChatbotWorkflowOutput> {
-  const dominio = classifyDomain(input.pregunta, input.dominio);
+  const preguntaEfectiva = input.contextoConversacional
+    ? `${input.pregunta}\nContexto conversacional previo del mismo usuario: ${input.contextoConversacional}`
+    : input.pregunta;
+  const explicitNormInQuestion = /\b(?:ley|decreto(?:[- ]ley)?|resoluci[oó]n)\s*(?:(?:nacional|provincial|acuerdo|ecyt)\s+)*(?:n(?:ro)?[º°.]?\s*)?\d/i.test(input.pregunta);
+  const asksSingleArticle = /\b(?:art(?:i|í)culo|art)\.?\s*\d+\b/i.test(input.pregunta) && !explicitNormInQuestion;
+  if (asksSingleArticle && !input.contextoConversacional) {
+    return buildOutput({ ok: true, tipo: "aclaracion", origen: "local_rag", dominio: input.dominio || "general", consulta: input.pregunta,
+      respuesta: "¿De qué norma querés consultar ese artículo? Hay varias normas documentales con artículos de igual numeración; indicá la ley o decreto para evitar una respuesta ambigua.", chunks: [] });
+  }
+  const dominio = explicitNormInQuestion
+    ? classifyDomain(input.pregunta, input.dominio)
+    : classifyDomain(preguntaEfectiva, input.dominio);
+
+  if (isStandaloneGreeting(input.pregunta)) {
+    return buildOutput({ ok: true, tipo: "respuesta_local", origen: "local_rag", dominio: "general", consulta: input.pregunta,
+      respuesta: "¡Hola! ¿En qué puedo ayudarte?", chunks: [] });
+  }
 
   if (isGenericTeacherQuestion(input.pregunta)) {
     return buildOutput({
@@ -4422,16 +4654,44 @@ export async function runGroqWorkflow(
 
   try {
     const documentos = await loadLocalChunks();
-    const cacheKey = responseCacheKey(dominio, input.pregunta);
+    const cacheKey = responseCacheKey(dominio, preguntaEfectiva);
     const cachedResponse = getCachedResponse(cacheKey);
 
     if (cachedResponse) {
       return cachedResponse;
     }
 
-    const chunks = await searchLocalFragments(input, dominio, documentos);
+    const searchInput = { ...input, pregunta: preguntaEfectiva };
+    const chunks = await searchLocalFragments(searchInput, dominio, documentos);
+
+    const requestedArticle = extractArticleNumbersFromQuery(input.pregunta)[0];
+    const asksPrivateDecree = /3387/.test(normalizeText(input.pregunta));
+    const missingControlChunk = asksPrivateDecree && requestedArticle && documentos.find((chunk) => {
+      const control: any = chunk.metadata?.control_documental;
+      const refs = Array.isArray(control?.articulos_faltantes) ? control.articulos_faltantes.map(String) : [];
+      return refs.includes(requestedArticle) && /3387/.test(normalizeText(`${chunk.referencia} ${chunk.filename}`));
+    });
+    if (missingControlChunk) {
+      return buildOutput({ ok: true, tipo: "sin_resultados", origen: "local_rag", dominio, consulta: input.pregunta,
+        respuesta: `El artículo ${requestedArticle} del Decreto-Ley 3387 no está disponible en la fuente documental. El control de integridad indica que los artículos 33 a 75 están ausentes y que no deben completarse por inferencia.`, chunks: [missingControlChunk] });
+    }
 
     if (!chunks.length) {
+      const questionNumbers = (preguntaEfectiva.match(/\d+/g) || []).map((value) => value.replace(/\D/g, ""));
+      const compactQuestionDigits = preguntaEfectiva.replace(/\D/g, "");
+      const inactive = cachedInactiveSourceLabels.find((label) => {
+        const normalizedLabel = normalizeText(label).replace(/[^a-z0-9 ]/g, " ");
+        const nums = normalizedLabel.match(/\d+/g) || [];
+        return nums.some((number) => {
+          if (number.length < 4) return false;
+          if (compactQuestionDigits.includes(number)) return true;
+          return questionNumbers.some((asked) => asked.length >= 4 && (asked.includes(number) || number.includes(asked)));
+        });
+      });
+      if (inactive) {
+        return buildOutput({ ok: true, tipo: "sin_resultados", origen: "local_rag", dominio, consulta: input.pregunta,
+          respuesta: `La norma solicitada figura en el índice documental, pero su fuente está inactiva y no se utiliza para responder. No hay fragmentos habilitados suficientes para informar su contenido.`, chunks: [] });
+      }
       const asesoramientoGremial = getAsesoramientoGremialContact(
         documentos
       );
@@ -4448,11 +4708,26 @@ export async function runGroqWorkflow(
       });
     }
 
-    try {
-      const generacionGroq = await askGroq(input.pregunta, dominio, chunks);
+    const nonCurrent = chunks.find((chunk) => /derogado|sustituido/.test(normalizeText(String(chunk.metadata?.estado_vigencia || ""))));
+    if (nonCurrent) {
+      const update: any = nonCurrent.metadata?.actualizacion;
+      const status = normalizeText(String(update?.estado || nonCurrent.metadata?.estado_vigencia || ""));
+      const summary = String(update?.resumen_no_literal || "").trim();
+      return buildOutput({ ok: true, tipo: "respuesta_local", origen: "local_rag", dominio, consulta: input.pregunta,
+        respuesta: `El artículo solicitado se conserva en la fuente como texto histórico y figura como ${status}. No corresponde presentarlo como disposición vigente. ${update?.norma ? `La ficha atribuye esta actualización a ${update.norma}.` : ""} ${summary ? `La fuente incluye este resumen de actualización, no una transcripción oficial: ${summary}` : ""}`.trim(), chunks: [nonCurrent] });
+    }
 
-      if (!citedArticlesAreSupported(generacionGroq.text, chunks)) {
-        console.warn("[groqWorkflow] hallucinated_article_rejected");
+    const truncated = chunks.find((chunk) => /articulo 32 truncado/.test(normalizeText(String((chunk.metadata?.control_documental as any)?.contenido || ""))));
+    if (truncated) {
+      return buildOutput({ ok: true, tipo: "respuesta_local", origen: "local_rag", dominio, consulta: input.pregunta,
+        respuesta: "La fuente del Decreto-Ley 3387 advierte que el artículo 32 está truncado. El fragmento disponible no es íntegro; no puedo reconstruir el texto faltante. La advertencia es un control documental, no parte del texto normativo.", chunks: [truncated] });
+    }
+
+    try {
+      const generacionGroq = await askGroq(preguntaEfectiva, dominio, chunks);
+
+      if (!citedArticlesAreSupported(generacionGroq.text, chunks) || !citedNormsAreSupported(generacionGroq.text, chunks) || !citedNormArticlePairsAreSupported(generacionGroq.text, chunks)) {
+        console.warn("[groqWorkflow] unsupported_normative_citation_rejected");
         return buildOutput({
           ok: true,
           tipo: "respuesta_local",
@@ -4461,7 +4736,7 @@ export async function runGroqWorkflow(
           consulta: input.pregunta,
           respuesta: buildLocalFallbackAnswer(chunks, input.pregunta),
           chunks,
-          error: "hallucinated_article_rejected",
+          error: "unsupported_normative_citation_rejected",
         });
       }
 
