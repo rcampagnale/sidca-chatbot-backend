@@ -1,0 +1,308 @@
+{
+  "version": "1.0.0",
+  "actualizado": "2026-05-10",
+  "nombre": "Servicios, contactos y beneficios de la App SiDCa",
+  "descripcion": "Base de conocimiento para el chatbot SiDCa construida a partir del análisis del repositorio rcampagnale/SiDCaapp2024. Incluye servicios disponibles en la app, contactos, beneficios, capacitaciones, certificados, turismo, Casa del Docente, red de convenios, oficina de gestión y asesoramientos.",
+  "dominio": "servicios",
+  "fuente_general": "App SiDCa / Repositorio rcampagnale/SiDCaapp2024",
+  "servicios": [
+    {
+      "id": "sidca_contactos_institucionales",
+      "dominio": "servicios",
+      "categoria": "Contactos institucionales",
+      "titulo_articulo": "Medios de contacto de SiDCa",
+      "contenido": "La app SiDCa incluye una pantalla de Medios de contacto con números de WhatsApp para distintas áreas del sindicato. La sede central informada es Ayacucho 227 - 1° Piso, San Fernando del Valle de Catamarca, Catamarca, CP 4700.",
+      "respuesta_sugerida": "Podés consultar los medios de contacto desde la app en Nosotros > Contacto. Allí figuran los WhatsApp de asesoramiento general, jurídico, gestión de expedientes, turismo, Casa del Docente, radio, hotelería interprovincial, capacitación, soporte técnico, afiliado adherente y entrega de certificados. La sede central de SiDCa es Ayacucho 227 - 1° Piso, San Fernando del Valle de Catamarca.",
+      "contactos": [
+        {
+          "area": "Asesoramiento General",
+          "whatsapp": "5493834051983",
+          "url": "https://wa.me/5493834051983"
+        },
+        {
+          "area": "Departamento Jurídico",
+          "whatsapp": "5493834397239",
+          "url": "https://wa.me/5493834397239"
+        },
+        {
+          "area": "SiDCa Gestión Expediente",
+          "whatsapp": "5493834230813",
+          "url": "https://wa.me/5493834230813"
+        },
+        {
+          "area": "SiDCa Turismo",
+          "whatsapp": "5493834283151",
+          "url": "https://wa.me/5493834283151"
+        },
+        {
+          "area": "Casa del Docente",
+          "whatsapp": "5493834250139",
+          "url": "https://wa.me/5493834250139"
+        },
+        {
+          "area": "SiDCa Radio",
+          "whatsapp": "5493834220295",
+          "url": "https://wa.me/5493834220295"
+        },
+        {
+          "area": "Hotelería Interprovincial",
+          "whatsapp": "5493835406450",
+          "url": "https://wa.me/5493835406450"
+        },
+        {
+          "area": "Secretaría de Capacitación",
+          "whatsapp": "5493834012228",
+          "url": "https://wa.me/5493834012228"
+        },
+        {
+          "area": "Soporte Técnico",
+          "whatsapp": "5493832437803",
+          "url": "https://wa.me/5493832437803"
+        },
+        {
+          "area": "Afiliado Adherente",
+          "whatsapp": "5493834539754",
+          "url": "https://wa.me/5493834539754"
+        },
+        {
+          "area": "Entrega de Certificados",
+          "whatsapp": "5493834325816",
+          "url": "https://wa.me/5493834325816"
+        }
+      ],
+      "ubicacion_app": "Home > Nosotros > Contacto",
+      "preguntas_relacionadas": [
+        "¿Cuál es el contacto de SiDCa?",
+        "¿Dónde queda SiDCa?",
+        "¿Cuál es el WhatsApp de asesoramiento general?",
+        "¿Cuál es el WhatsApp del departamento jurídico?",
+        "¿Cuál es el WhatsApp de soporte técnico?",
+        "¿Cuál es el WhatsApp para afiliado adherente?"
+      ],
+      "palabras_clave": [
+        "contacto",
+        "whatsapp",
+        "telefono",
+        "sede",
+        "direccion",
+        "asesoramiento",
+        "juridico",
+        "soporte",
+        "afiliado adherente"
+      ],
+      "fuente": "App SiDCa",
+      "fuente_codigo": [
+        "app/contact/contact-information.tsx"
+      ]
+    },
+    {
+      "id": "sidca_red_convenios",
+      "dominio": "servicios",
+      "categoria": "Red de Convenios",
+      "titulo_articulo": "Comercios adheridos y convenios hoteleros",
+      "contenido": "La app informa que SiDCa firmó convenios con empresas de la ciudad y hoteles en diferentes provincias del país, ofreciendo a sus afiliados descuentos especiales y condiciones preferenciales. Para acceder a estos beneficios se debe presentar la credencial digital desde la aplicación. La sección permite ver Lista de Comercios Adheridos y Convenio Interprovincial Hoteleros. Los comercios se cargan desde Firestore con categoría convenio_comercio y los hoteles con categoría convenio_hoteles.",
+      "respuesta_sugerida": "Para consultar por convenios, ingresá en la app a Beneficios > Red de Convenios. Allí podés ver comercios adheridos y convenios hoteleros interprovinciales. Para acceder a los beneficios, la app indica que debés presentar la credencial digital de afiliado. Para hotelería interprovincial también podés consultar por WhatsApp al 5493835406450.",
+      "contacto_hoteleria": {
+        "area": "Hotelería Interprovincial",
+        "whatsapp": "5493835406450",
+        "url": "https://wa.me/5493835406450"
+      },
+      "ubicacion_app": "Home > Beneficios > Red de Convenios",
+      "datos_dinamicos": [
+        {
+          "coleccion": "novedades",
+          "categoria": "convenio_comercio",
+          "descripcion": "Lista de Comercios Adheridos",
+          "filtro": "departamento"
+        },
+        {
+          "coleccion": "novedades",
+          "categoria": "convenio_hoteles",
+          "descripcion": "Convenio Interprovincial Hoteleros"
+        }
+      ],
+      "preguntas_relacionadas": [
+        "¿Dónde veo los convenios?",
+        "¿Qué comercios tienen convenio con SiDCa?",
+        "¿Dónde consulto por hoteles?",
+        "¿Cuál es el contacto de hotelería interprovincial?",
+        "¿Cómo accedo a los descuentos de comercios?",
+        "¿Tengo que mostrar la credencial digital para usar un convenio?"
+      ],
+      "palabras_clave": [
+        "convenios",
+        "comercios",
+        "hoteles",
+        "hoteleria",
+        "interprovincial",
+        "descuentos",
+        "credencial digital",
+        "beneficios"
+      ],
+      "fuente": "App SiDCa",
+      "fuente_codigo": [
+        "app/convenio/convenio.tsx",
+        "app/convenio/ModalComponent.tsx",
+        "app/contact/contact-information.tsx"
+      ]
+    },
+    {
+      "id": "sidca_capacitaciones",
+      "dominio": "servicios",
+      "categoria": "Capacitaciones",
+      "titulo_articulo": "Capacitaciones, cursos disponibles y aula virtual",
+      "contenido": "La Secretaría de Capacitación de SiDCa brinda durante el año ofertas de capacitación y perfeccionamiento docente gratuita a sus afiliados mediante cursos, talleres, congresos y seminarios. La app permite acceder al Aula Virtual, ver Cursos Aprobados, Cursos Disponibles y Registro de Asistencia. Los cursos disponibles se cargan desde Firestore en la colección cursos, mostrando los cursos cuyo estado no sea terminado. Cada curso puede incluir título, imagen, descripción y link de inscripción.",
+      "respuesta_sugerida": "Para consultar capacitaciones, ingresá en la app a Información > Capacitaciones. Allí podés ver cursos disponibles, cursos aprobados y el registro de asistencia. También podés acceder al Aula Virtual en https://aula.sidcagremio.com. Para consultas, comunicate con la Secretaría de Capacitación por WhatsApp al 5493834012228.",
+      "contacto": {
+        "area": "Secretaría de Capacitación",
+        "whatsapp": "5493834012228",
+        "url": "https://wa.me/5493834012228"
+      },
+      "aula_virtual": "https://aula.sidcagremio.com",
+      "ubicacion_app": "Home > Información > Capacitaciones",
+      "datos_dinamicos": {
+        "coleccion": "cursos",
+        "criterio": "estado distinto de terminado",
+        "campos_posibles": [
+          "titulo",
+          "imagen",
+          "descripcion",
+          "link",
+          "estado"
+        ]
+      },
+      "opciones_app": [
+        "Cursos Aprobados",
+        "Cursos Disponibles",
+        "Registro de Asistencia",
+        "Abrir Aula Virtual"
+      ],
+      "preguntas_relacionadas": [
+        "¿Dónde veo las capacitaciones?",
+        "¿Cómo me inscribo a un curso?",
+        "¿Cuál es el contacto de capacitación?",
+        "¿Dónde está el aula virtual?",
+        "¿Dónde veo mis cursos aprobados?",
+        "¿Dónde registro asistencia?"
+      ],
+      "palabras_clave": [
+        "capacitaciones",
+        "cursos",
+        "talleres",
+        "congresos",
+        "seminarios",
+        "aula virtual",
+        "asistencia",
+        "inscripcion",
+        "secretaria de capacitacion"
+      ],
+      "fuente": "App SiDCa",
+      "fuente_codigo": [
+        "app/courses/options-courses.tsx",
+        "app/courses/courses-aviables.tsx",
+        "app/contact/contact-information.tsx"
+      ]
+    },
+    {
+      "id": "sidca_certificados",
+      "dominio": "servicios",
+      "categoria": "Certificados",
+      "titulo_articulo": "Certificados de cursos y entrega de certificados",
+      "contenido": "La app tiene una pantalla de certificados vinculada a cursos aprobados. Consulta la colección certificados en Firestore y puede mostrar resolución, modalidad, fecha, días, carga horaria e imagen o firma. En la pantalla de cursos aprobados se consultan los cursos del usuario con estado terminado. La opción de imprimir certificado figura como no disponible en el código actual. Para entrega de certificados, la app informa el WhatsApp 5493834325816.",
+      "respuesta_sugerida": "Para consultar por certificados, ingresá a la app en Información > Capacitaciones > Cursos Aprobados. Si necesitás consultar por entrega de certificados, comunicate por WhatsApp al 5493834325816. La app contiene información de certificados vinculados a cursos aprobados, pero la opción de imprimir certificado figura actualmente como no disponible.",
+      "contacto": {
+        "area": "Entrega de Certificados",
+        "whatsapp": "5493834325816",
+        "url": "https://wa.me/5493834325816"
+      },
+      "ubicacion_app": "Home > Información > Capacitaciones > Cursos Aprobados",
+      "datos_dinamicos": {
+        "coleccion": "certificados",
+        "campos_posibles": [
+          "resolucion",
+          "modalidad",
+          "fecha",
+          "dias",
+          "cargaHoraria",
+          "imagen",
+          "titulo",
+          "cursoId"
+        ]
+      },
+      "preguntas_relacionadas": [
+        "¿Dónde consulto por certificados?",
+        "¿Cuál es el contacto de entrega de certificados?",
+        "¿Dónde veo mis cursos aprobados?",
+        "¿Puedo imprimir mi certificado?",
+        "¿Cómo consulto el certificado de un curso?"
+      ],
+      "palabras_clave": [
+        "certificados",
+        "entrega de certificados",
+        "curso aprobado",
+        "imprimir certificado",
+        "resolucion",
+        "carga horaria"
+      ],
+      "fuente": "App SiDCa",
+      "fuente_codigo": [
+        "app/courses/certificados.tsx",
+        "app/courses/courses-picked.tsx",
+        "app/contact/contact-information.tsx"
+      ]
+    },
+    {
+      "id": "sidca_servicios_home_resumen",
+      "dominio": "servicios",
+      "categoria": "Mapa de la app",
+      "titulo_articulo": "Secciones principales de la app SiDCa",
+      "contenido": "La pantalla principal organiza los servicios de la app en cuatro bloques: Nosotros, Información, Asesoramiento y Beneficios. Nosotros incluye Quienes somos, Credencial de Afiliado, Contacto y Cuotas Adherentes. Información incluye Capacitaciones, Sala de Reuniones y Enlaces de utilidad. Asesoramiento incluye Gremial, Legal y Oficina de Gestión. Beneficios incluye Turismo, Casa del Docente, Predio Recreativo y Red de Convenios.",
+      "respuesta_sugerida": "La app SiDCa organiza sus servicios en cuatro secciones: Nosotros, Información, Asesoramiento y Beneficios. En Nosotros encontrás contacto, credencial y cuotas adherentes; en Información, capacitaciones, sala de reuniones y enlaces útiles; en Asesoramiento, gremial, legal y oficina de gestión; y en Beneficios, turismo, Casa del Docente, predio recreativo y red de convenios.",
+      "ubicacion_app": "Home",
+      "secciones": {
+        "Nosotros": [
+          "Quienes somos",
+          "Credencial de Afiliado",
+          "Contacto",
+          "Cuotas Adherentes"
+        ],
+        "Información": [
+          "Capacitaciones",
+          "Sala de Reuniones",
+          "Enlaces de utilidad"
+        ],
+        "Asesoramiento": [
+          "Gremial",
+          "Legal",
+          "Oficina de Gestión"
+        ],
+        "Beneficios": [
+          "Turismo",
+          "Casa del Docente",
+          "Predio Recreativo",
+          "Red de Convenios"
+        ]
+      },
+      "preguntas_relacionadas": [
+        "¿Qué servicios tiene la app?",
+        "¿Dónde encuentro beneficios?",
+        "¿Dónde está asesoramiento?",
+        "¿Dónde encuentro información para docentes?",
+        "¿Qué puedo hacer en la app SiDCa?"
+      ],
+      "palabras_clave": [
+        "home",
+        "servicios",
+        "beneficios",
+        "informacion",
+        "nosotros",
+        "asesoramiento",
+        "app sidca"
+      ],
+      "fuente": "App SiDCa",
+      "fuente_codigo": [
+        "app/home/index.tsx"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,102 @@
+[
+  {
+    "id": 1,
+    "pregunta": "¿Cómo me afilio al sindicato?",
+    "respuesta": "La afiliación se realiza presentando la documentación requerida en la sede correspondiente o por los canales habilitados por el sindicato."
+  },
+  {
+    "id": 2,
+    "pregunta": "¿Qué documentación necesito para afiliarme?",
+    "respuesta": "Generalmente se solicita DNI, constancia laboral o recibo de haberes y la ficha de afiliación. Te sugerimos consultar en la sede o con la secretaría correspondiente para confirmar los requisitos actualizados."
+  },
+  {
+    "id": 3,
+    "pregunta": "¿Dónde están las oficinas del sindicato?",
+    "respuesta": "Podés consultar la dirección, horarios de atención y medios de contacto en los canales oficiales del sindicato."
+  },
+  {
+    "id": 4,
+    "pregunta": "¿Cuál es el horario de atención del sindicato?",
+    "respuesta": "El horario de atención puede variar según la sede o el área. Te recomendamos verificarlo por los medios oficiales antes de asistir."
+  },
+  {
+    "id": 5,
+    "pregunta": "¿Qué beneficios tienen los afiliados?",
+    "respuesta": "Los afiliados pueden acceder a asesoramiento, acompañamiento gremial, capacitaciones, servicios y otros beneficios que brinda la institución."
+  },
+  {
+    "id": 6,
+    "pregunta": "¿Cómo me comunico con el sindicato?",
+    "respuesta": "Podés comunicarte por teléfono, WhatsApp, redes sociales o de manera presencial en las oficinas del sindicato, según los canales habilitados."
+  },
+  {
+    "id": 7,
+    "pregunta": "¿Cómo hago una consulta gremial?",
+    "respuesta": "Podés realizar tu consulta acercándote a la sede, comunicándote por WhatsApp o utilizando los formularios y medios oficiales del sindicato."
+  },
+  {
+    "id": 8,
+    "pregunta": "¿Cómo presento una nota o un pedido en el sindicato?",
+    "respuesta": "Los pedidos o notas se presentan por mesa de entrada o por el canal administrativo que indique el sindicato. Conviene acompañarlos con tus datos personales y una descripción clara del trámite."
+  },
+  {
+    "id": 9,
+    "pregunta": "¿Dónde puedo pedir asesoramiento?",
+    "respuesta": "Podés solicitar asesoramiento en las áreas correspondientes del sindicato, según se trate de afiliación, gestiones administrativas, capacitaciones u otros servicios."
+  },
+  {
+    "id": 10,
+    "pregunta": "¿Cómo me inscribo en una capacitación?",
+    "respuesta": "La inscripción a las capacitaciones se realiza por los formularios, enlaces o canales de difusión que publique el sindicato."
+  },
+  {
+    "id": 11,
+    "pregunta": "¿Dónde veo las capacitaciones disponibles?",
+    "respuesta": "Las capacitaciones disponibles suelen difundirse por los canales oficiales del sindicato, redes sociales, formularios o medios institucionales."
+  },
+  {
+    "id": 12,
+    "pregunta": "¿Cómo obtengo mi certificado de una capacitación?",
+    "respuesta": "Los certificados se entregan o publican según el procedimiento establecido para cada capacitación. Si ya finalizaste una propuesta, consultá por el canal correspondiente."
+  },
+  {
+    "id": 13,
+    "pregunta": "¿Cómo recupero mi certificado?",
+    "respuesta": "Si ya realizaste una capacitación y no encontrás tu certificado, podés comunicarte con el área responsable para solicitar orientación sobre su recuperación."
+  },
+  {
+    "id": 14,
+    "pregunta": "¿Cómo actualizo mis datos personales en el sindicato?",
+    "respuesta": "La actualización de datos personales se realiza por los canales administrativos habilitados por el sindicato. Es importante mantener tus datos actualizados para recibir información y beneficios."
+  },
+  {
+    "id": 15,
+    "pregunta": "¿Cómo sé si estoy afiliado?",
+    "respuesta": "Podés confirmar tu situación de afiliación consultando en la sede del sindicato o por los canales administrativos correspondientes."
+  },
+  {
+    "id": 16,
+    "pregunta": "¿Cómo hago un trámite en el sindicato?",
+    "respuesta": "Para realizar un trámite, te recomendamos comunicarte primero con el sindicato para que te indiquen el área correspondiente, la documentación necesaria y la modalidad de presentación."
+  },
+  {
+    "id": 17,
+    "pregunta": "¿Dónde consulto novedades del sindicato?",
+    "respuesta": "Las novedades institucionales suelen informarse por los canales oficiales del sindicato, redes sociales, comunicados y medios de contacto habilitados."
+  },
+  {
+    "id": 18,
+    "pregunta": "¿Cómo accedo a los formularios del sindicato?",
+    "respuesta": "Los formularios se comparten por los canales oficiales del sindicato, según el trámite o la convocatoria correspondiente."
+  },
+  {
+    "id": 19,
+    "pregunta": "¿Qué servicios brinda el sindicato?",
+    "respuesta": "El sindicato brinda acompañamiento gremial, asesoramiento, gestión de consultas, capacitaciones y otros servicios institucionales para sus afiliados."
+  },
+  {
+    "id": 20,
+    "pregunta": "¿Cómo hago una consulta sobre una gestión en curso?",
+    "respuesta": "Si ya iniciaste una gestión, podés consultar su estado por el canal donde fue presentada o comunicándote con el área correspondiente del sindicato."
+  }
+]
