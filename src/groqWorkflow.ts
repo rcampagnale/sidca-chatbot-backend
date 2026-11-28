@@ -4315,6 +4315,14 @@ function buildVerbatimArticleAnswer(chunk: LocalChunk): string {
     const endIndex = nextHeading?.index ?? content.length;
     content = content.slice(startIndex, endIndex).trim();
   }
+  const trailingLines = content.split(/\r?\n/);
+  const finalLine = trailingLines.at(-1)?.trim() || "";
+  const separatorBeforeFinal = trailingLines.length > 1 && /^_{5,}$/.test(trailingLines.at(-2)?.trim() || "");
+  const knownArticle45NextSectionHeader = requestedArticle === "45" && normalizeText(finalLine) === "para acompanar al conyuge/concubino";
+  if (finalLine && (separatorBeforeFinal || normalizeText(finalLine) === "superposicion de horarios" || knownArticle45NextSectionHeader)) {
+    trailingLines.splice(separatorBeforeFinal ? -2 : -1);
+    content = trailingLines.join("\n").trimEnd();
+  }
   return `${chunk.referencia}\n\n${content}`.trim();
 }
 
@@ -4403,6 +4411,13 @@ function nomenclatorLevel(candidate: NomenclatorCandidate): string {
   return normalizeText(`${candidate.record.nivel_modalidad || ""} ${candidate.record.nivel_educativo || ""} ${candidate.record.nivel || ""} ${candidate.record.modalidad || ""}`);
 }
 
+function nomenclatorMatchesLevel(candidate: NomenclatorCandidate, requested: string): boolean {
+  const level = nomenclatorLevel(candidate);
+  if (level.includes(requested) || /\btodos\b/.test(level)) return true;
+  if (requested === "nivel inicial") return /\b(?:inicial|maternal)\b/.test(level);
+  return false;
+}
+
 function nomenclatorComparisonSegments(question: string, roleAnchors: string[]): string[] {
   const normalized = normalizeCargoLabel(question);
   const explicit = normalized.split(/\s+\b(?:vs\.?|versus|contra)\b\s+/i).map((part) => part.trim()).filter(Boolean);
@@ -4423,7 +4438,7 @@ function getNomenclatorNumber(record: Record<string, any>, keys: string[]): numb
   return null;
 }
 
-function renderNomenclatorRecord(chunk: LocalChunk, record: Record<string, any>): string {
+function renderNomenclatorRecord(chunk: LocalChunk, record: Record<string, any>, includeInternalId = true): string {
   const category = String(record.categoria || record.titulo_articulo || record.titulo || record.nombre || "Cargo sin denominación");
   const norm = String(record.normativa || record.documento || record.fuente || chunk.referencia);
   const normalizedCategory = normalizeText(category);
@@ -4444,15 +4459,11 @@ function renderNomenclatorRecord(chunk: LocalChunk, record: Record<string, any>)
     clockMinutes === null ? "" : `Minutos reloj semanales: ${clockMinutes}`,
     `Puntos salariales/nomenclador: ${salary === null ? "sin dato en el registro" : salary}`,
     `Puntos de incompatibilidad: ${incompatibility === null ? "sin dato en el registro" : incompatibility}`,
-    record.unidad ? `Unidad: ${record.unidad}` : "",
-    record.tipo ? `Tipo de registro: ${record.tipo}` : "",
-    record.alcance ? `Alcance: ${record.alcance}` : "",
     `Norma: ${norm}`,
-    record.articulo ? `Artículo/registro: ${record.articulo}` : "",
-    record.id ? `ID documental: ${record.id}` : "",
-    record.pagina_pdf ? `Página PDF: ${record.pagina_pdf}` : "",
+    record.alcance && isNomenclatorPof(record) ? `Alcance: ${record.alcance}` : "",
+    includeInternalId && record.id ? `ID documental: ${record.id}` : "",
   ].filter(Boolean);
-  return fields.join("; ");
+  return fields.join("\n");
 }
 
 function resolveNomenclatorQuery(pregunta: string, chunks: LocalChunk[]): NomenclatorResolution | null {
@@ -4498,9 +4509,13 @@ function resolveNomenclatorQuery(pregunta: string, chunks: LocalChunk[]): Nomenc
     const segmentText = normalizeCargoLabel(segment);
     const segmentAnchors = availableAnchors.filter((anchor) => new RegExp(`(?:^|\\s)${anchor.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:$|\\s)`).test(segmentText));
     if (segmentAnchors.length && !segmentAnchors.includes(candidate.roleAnchor)) return false;
-    const segmentDetails = Array.from(candidateDetails).filter((detail) => new RegExp(`(?:^|\\s)${detail.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:$|\\s)`).test(segmentText));
+    const abbreviatedCenterDirector = /\bdirector de centros? educativos?\b/.test(segmentText)
+      && candidate.roleAnchor === "director" && candidate.sourceKind === "centers";
+    const segmentDetails = Array.from(candidateDetails).filter((detail) => !availableAnchors.includes(detail)
+      && new RegExp(`(?:^|\\s)${detail.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:$|\\s)`).test(segmentText));
     const detailsForRole = new Set(candidates.filter((item) => item.roleAnchor === candidate.roleAnchor).flatMap((item) => item.roleDetails));
-    if (segmentDetails.some((detail) => detailsForRole.has(detail) && !candidate.roleDetails.includes(detail))) return false;
+    if (!abbreviatedCenterDirector && segmentDetails.some((detail) => detailsForRole.has(detail) && !candidate.roleDetails.includes(detail))) return false;
+    if (!abbreviatedCenterDirector && candidate.roleDetails.some((detail) => !availableAnchors.includes(detail) && !segmentDetails.includes(detail))) return false;
     const centers = /centros? educativos?/.test(segmentText);
     const gardens = /jardines? maternales?|pasitos cuidados?/.test(segmentText);
     const common = /escuela comun|escuela primaria|escuela secundaria/.test(segmentText);
@@ -4514,16 +4529,31 @@ function resolveNomenclatorQuery(pregunta: string, chunks: LocalChunk[]): Nomenc
     const jornada = nomenclatorJornada(candidate);
     const level = nomenclatorLevel(candidate);
     if (journeyOptions.length && !journeyOptions.includes(jornada)) return false;
-    if (levelOptions.length && !levelOptions.some((option) => level.includes(option))) return false;
+    if (levelOptions.length && !levelOptions.some((option) => nomenclatorMatchesLevel(candidate, option))) return false;
     if (dimension?.kind === "role" && candidate.roleAnchor !== dimension.value) return false;
     if (dimension?.kind === "journey" && jornada !== dimension.value) return false;
-    if (dimension?.kind === "level" && !level.includes(dimension.value)) return false;
+    if (dimension?.kind === "level" && !nomenclatorMatchesLevel(candidate, dimension.value)) return false;
     if (dimension?.kind === "institution" && candidate.sourceKind !== dimension.value) return false;
     return true;
   };
 
   const roleAnchors = explicitAnchors.length ? explicitAnchors : availableAnchors.filter((anchor) => new RegExp(`(?:^|\\s)${anchor.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:$|\\s)`).test(text));
-  const segments = compare ? nomenclatorComparisonSegments(pregunta, roleAnchors) : [pregunta];
+  let segments = compare ? nomenclatorComparisonSegments(pregunta, roleAnchors) : [pregunta];
+  if (compare && segments.length > 1) {
+    const segmentTexts = segments.map(normalizeCargoLabel);
+    const sharedQualifiers: string[] = [];
+    const roleDescriptorSignatures = segmentTexts.map((segment) => {
+      const tokens = segment.split(/\s+/);
+      const anchorIndex = tokens.findIndex((token) => availableAnchors.includes(token));
+      return anchorIndex < 0 ? "" : cargoAnchorAndDetails(tokens.slice(anchorIndex).join(" ")).details.sort().join(" ");
+    });
+    const sameExplicitCargo = roleAnchors.length === 1 && roleDescriptorSignatures.every((signature) => signature === roleDescriptorSignatures[0]);
+    if (requestedSpecificLevels.length === 1 && sameExplicitCargo
+      && segmentTexts.filter((segment) => specificLevels.some((level) => segment.includes(level))).length < segments.length) {
+      sharedQualifiers.push(requestedSpecificLevels[0]);
+    }
+    if (sharedQualifiers.length) segments = segments.map((segment) => `${segment} ${sharedQualifiers.join(" ")}`);
+  }
   let groups: NomenclatorCandidate[][] = [];
   if (compare && segments.length > 1) {
     groups = segments.map((segment) => candidates.filter((candidate) => matchesSegment(candidate, segment)));
@@ -4538,14 +4568,33 @@ function resolveNomenclatorQuery(pregunta: string, chunks: LocalChunk[]): Nomenc
   }
 
   const uniqueCandidates = (items: NomenclatorCandidate[]) => Array.from(new Map(items.map((item) => [String(item.record.id || item.chunk.id), item])).values());
+  const clarificationPrompt = (items: NomenclatorCandidate[]): string => {
+    const dimensions = new Set<string>();
+    if (new Set(items.map((item) => nomenclatorJornada(item)).filter(Boolean)).size > 1) dimensions.add("jornada");
+    if (new Set(items.map((item) => nomenclatorLevel(item)).filter(Boolean)).size > 1) dimensions.add("nivel educativo");
+    if (new Set(items.map((item) => item.sourceKind)).size > 1 || new Set(items.map((item) => item.institution).filter(Boolean)).size > 1) dimensions.add("institución");
+    if (new Set(items.map((item) => item.category)).size > 1) dimensions.add("denominación exacta del cargo");
+    return dimensions.size ? `Precisá ${Array.from(dimensions).join(", ")}.` : "Precisá a qué registro te referís.";
+  };
+  const alternativeLabel = (item: NomenclatorCandidate): string => {
+    const category = String(item.record.categoria || item.record.titulo_articulo || "Cargo");
+    const level = String(item.record.nivel_educativo || item.record.nivel_modalidad || item.record.nivel || "");
+    return `${category}${level ? ` — ${level}` : ""}${item.pof ? " — POF institucional" : ""}`;
+  };
   if (groups.length >= 2) {
     groups = groups.map(uniqueCandidates);
     if (groups.some((group) => group.length !== 1)) {
       const alternatives = uniqueCandidates(groups.flat());
-      return { answer: "No pude identificar de manera unívoca cada cargo de la comparación. Aclará cargo, institución, nivel o jornada.", chunks: alternatives.map((item) => item.chunk), clarification: true };
+      const options = alternatives.slice(0, 8).map(alternativeLabel);
+      const more = alternatives.length > 8 ? ` y ${alternatives.length - 8} alternativas más` : "";
+      const missingSegments = segments.filter((_, index) => groups[index].length === 0);
+      const clarification = missingSegments.length
+        ? `No encontré registros compatibles para ${missingSegments.map((segment) => `«${segment}»`).join(" y ")}. Confirmá el cargo y, si corresponde, la institución o el nivel educativo.`
+        : clarificationPrompt(alternatives);
+      return { answer: `No pude identificar de manera unívoca cada cargo de la comparación. Alternativas documentadas: ${options.join("; ")}${more}. ${clarification}`, chunks: alternatives.map((item) => item.chunk), clarification: true };
     }
     const selected = groups.map((group) => group[0]);
-    const label = (item: NomenclatorCandidate) => `${item.record.categoria || item.record.titulo_articulo || "Cargo"} (${item.chunk.referencia})`;
+    const label = (item: NomenclatorCandidate) => String(item.record.categoria || item.record.titulo_articulo || "Cargo");
     const metrics = [
       { label: "Horas reloj semanales", keys: ["horas_reloj_semanales"], unit: "" },
       { label: "Horas cátedra semanales", keys: ["horas_catedra_semanales", "horas_catedra"], unit: "" },
@@ -4561,14 +4610,34 @@ function resolveNomenclatorQuery(pregunta: string, chunks: LocalChunk[]): Nomenc
       const higher = values[0]! > values[1]! ? 0 : 1;
       return `${metric.label}: ${label(selected[higher])} registra ${difference} más que ${label(selected[1 - higher])}.`;
     });
-    const answer = selected.map((item) => `${label(item)}\n${renderNomenclatorRecord(item.chunk, item.record)}`).join("\n\n") + `\n\nDiferencias registradas:\n${comparisons.join("\n")}`;
+    const answer = selected.map((item) => renderNomenclatorRecord(item.chunk, item.record, false)).join("\n\n") + `\n\nDiferencias registradas:\n${comparisons.join("\n")}`;
     return { answer, chunks: selected.map((item) => item.chunk) };
   }
 
   const selected = uniqueCandidates(candidates.filter((candidate) => matchesSegment(candidate, pregunta)));
-  if (selected.length === 1) return { answer: renderNomenclatorRecord(selected[0].chunk, selected[0].record), chunks: [selected[0].chunk] };
+  if (selected.length === 1) return { answer: renderNomenclatorRecord(selected[0].chunk, selected[0].record, false), chunks: [selected[0].chunk] };
   if (selected.length > 1) {
-    return { answer: `Encontré ${selected.length} registros compatibles; necesito que aclares cargo, jornada, nivel, modalidad o institución.\n${selected.map(({ chunk, record }) => `- ${renderNomenclatorRecord(chunk, record)}`).join("\n")}`, chunks: selected.map(({ chunk }) => chunk), clarification: true };
+    const requestedMetricPatterns: Array<{ label: string; keys: string[]; requested: boolean }> = [
+      { label: "Horas reloj semanales", keys: ["horas_reloj_semanales"], requested: /horas? reloj|carga horaria/.test(text) },
+      { label: "Horas cátedra semanales", keys: ["horas_catedra_semanales", "horas_catedra"], requested: /horas? catedra/.test(text) },
+      { label: "Minutos reloj semanales", keys: ["minutos_reloj_semanales", "minutos_reloj"], requested: /minutos? reloj/.test(text) },
+      { label: "Puntos salariales", keys: ["puntos_salariales", "puntos_nomenclador", "puntaje_salarial", "puntos"], requested: /\bpuntos? salariales?\b|\bpuntaje salarial\b|\bpuntos? de (?:sueldo|salario|nomenclador)\b|\bpuntos?\b(?!\s+(?:de\s+)?incompatibilidad\b)/.test(text) },
+      { label: "Puntos de incompatibilidad", keys: ["puntaje_incompatibilidad", "puntos_incompatibilidad", "puntaje_compatibilidad"], requested: /incompatibilidad/.test(text) },
+    ].filter((metric) => metric.requested);
+    const identicalRequestedMetrics = requestedMetricPatterns.length > 0 && requestedMetricPatterns.every((metric) => {
+      const values = selected.map((item) => getNomenclatorNumber(item.record, metric.keys));
+      return values.every((value) => value !== null) && new Set(values).size === 1;
+    });
+    if (identicalRequestedMetrics) {
+      const categories = Array.from(new Set(selected.map((item) => `${item.category}${item.record.nivel_educativo ? ` — ${item.record.nivel_educativo}` : item.record.nivel_modalidad ? ` — ${item.record.nivel_modalidad}` : ""}`)));
+      const metrics = requestedMetricPatterns.map((metric) => `${metric.label}: ${getNomenclatorNumber(selected[0].record, metric.keys)}`);
+      const norms = Array.from(new Set(selected.map((item) => String(item.record.normativa || item.record.documento || item.chunk.referencia))));
+      const cargo = selected[0].roleAnchor === "vicedirector" ? "Vicedirector" : selected[0].roleAnchor;
+      return { answer: [`Cargo: ${cargo}`, `Registros compatibles: ${categories.join("; ")}`, ...metrics, `Base normativa: ${norms.join("; ")}`].join("\n"), chunks: selected.map(({ chunk }) => chunk) };
+    }
+    const options = selected.slice(0, 8).map(alternativeLabel);
+    const more = selected.length > 8 ? ` y ${selected.length - 8} alternativas más` : "";
+    return { answer: `Encontré ${selected.length} registros compatibles. Alternativas: ${options.join("; ")}${more}. ${clarificationPrompt(selected)}`, chunks: selected.map(({ chunk }) => chunk), clarification: true };
   }
   return null;
 }
@@ -5053,7 +5122,13 @@ function buildOutput(params: {
   error?: string;
 }): ChatbotWorkflowOutput {
   const referencias = Array.from(
-    new Set([...params.chunks.map((chunk) => chunk.referencia), ...(params.referenciasAdicionales || [])].filter(Boolean))
+    new Set([
+      ...params.chunks.map((chunk) => {
+        const record = chunk.dominio === "nomenclador" ? getNomenclatorRecord(chunk) : null;
+        return `${chunk.referencia}${record?.id ? ` — Registro ${record.id}` : ""}`;
+      }),
+      ...(params.referenciasAdicionales || []),
+    ].filter(Boolean))
   );
 
   return {
@@ -5176,6 +5251,44 @@ export async function runGroqWorkflow(
     const chunks = await searchLocalFragments(searchInput, dominio, documentos);
     console.log("[chatbot] retrieval_complete", { dominio, motor: "local_rag", fragmentos: chunks.length,
       corpusFingerprint: cachedChunksVersion.slice(0, 12), duracionMs: Date.now() - workflowStartedAt });
+
+    const normalizedLocalQuery = normalizeText(input.pregunta);
+    const comparesParticularLeaveTypes = dominio === "licencias"
+      && /razones particulares/.test(normalizedLocalQuery)
+      && /asuntos particulares/.test(normalizedLocalQuery)
+      && /\b(?:compar|diferenc|entre|vs)\w*/.test(normalizedLocalQuery);
+    if (comparesParticularLeaveTypes) {
+      const article45 = chunks.find((chunk) => chunk.kind === "articulo" && articleMatches(chunk, "45"));
+      const article52 = chunks.find((chunk) => chunk.kind === "articulo" && articleMatches(chunk, "52"));
+      if (article45 && article52 && article45.sourceId === article52.sourceId) {
+        const textOf = (chunk: LocalChunk) => {
+          const full = buildVerbatimArticleAnswer(chunk);
+          const separator = full.indexOf("\n\n");
+          return separator >= 0 ? full.slice(separator + 2) : full;
+        };
+        return buildOutput({ ok: true, tipo: "respuesta_local", origen: "local_rag", dominio, consulta: input.pregunta,
+          respuesta: ["Comparación documental: los artículos regulan figuras distintas. A continuación se reproducen sus condiciones expresas, sin inferir requisitos adicionales.",
+            `Asuntos particulares — artículo 45:\n${textOf(article45)}`,
+            `Razones particulares — artículo 52:\n${textOf(article52)}`].join("\n\n"), chunks: [article45, article52] });
+      }
+    }
+
+    const queryArticles = extractArticleNumbersFromQuery(input.pregunta);
+    const asksExactMobilityArticleSix = dominio === "coberturas"
+      && /\b533(?:\s*\/\s*|\s+)2021\b/.test(normalizedLocalQuery)
+      && /\bque establece\b/.test(normalizedLocalQuery)
+      && queryArticles.length === 1 && queryArticles[0] === "6";
+    const asksAutomaticSubstituteChange = dominio === "coberturas"
+      && /533/.test(normalizedLocalQuery)
+      && /cambio automatico|primer docente suplente|a quien corresponde/.test(normalizedLocalQuery);
+    if (asksExactMobilityArticleSix || asksAutomaticSubstituteChange) {
+      const mobilityArticle = chunks.find((chunk) => chunk.kind === "articulo" && articleMatches(chunk, "6")
+        && /533/.test(normalizeText(`${chunk.sourceId} ${chunk.referencia} ${chunk.norma || ""} ${chunk.text}`)));
+      if (mobilityArticle) {
+        return buildOutput({ ok: true, tipo: "respuesta_local", origen: "local_rag", dominio, consulta: input.pregunta,
+          respuesta: buildVerbatimArticleAnswer(mobilityArticle), chunks: [mobilityArticle] });
+      }
+    }
 
     if (dominio === "nomenclador") {
       const resolved = resolveNomenclatorQuery(input.pregunta, documentos);
