@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 export type RagSource = { id?: string; dominio?: string; url?: string; activo?: boolean; referencia?: string };
 export type RagChunk = { sourceId: string; source: string; norm: string; article?: string; jurisdiction?: string; domain?: string; title?: string; text: string; status?: string; metadata?: Record<string, unknown> };
 export type NormativeReference = { kind: string; number: string; year?: string; qualifier?: string; jurisdiction?: string };
+export type NormativeReferenceRole = "original" | "modifier" | "unspecified";
 
 export function activeSources(manifest: { fuentes?: RagSource[] }): RagSource[] {
   return (manifest.fuentes || []).filter((source) => source.activo === true && Boolean(source.url));
@@ -59,9 +60,25 @@ export function normativeReferenceMatches(requested: NormativeReference, candida
 }
 
 export function chunkMatchesNormativeReference(chunk: RagChunk, requested: NormativeReference): boolean {
-  const candidates = [chunk.norm, chunk.source, chunk.title || "", String(chunk.metadata?.documento || ""), chunk.sourceId]
-    .flatMap((identity) => parseNormativeReferences(identity));
-  return normativeReferenceMatches(requested, candidates, chunk.jurisdiction || String(chunk.metadata?.jurisdiccion || ""));
+  return chunkNormativeReferenceRole(chunk, requested) !== null;
+}
+
+export function chunkNormativeReferenceRole(chunk: RagChunk, requested: NormativeReference): NormativeReferenceRole | null {
+  const jurisdiction = chunk.jurisdiction || String(chunk.metadata?.jurisdiccion || "");
+  const originalIdentities = [chunk.norm, String(chunk.metadata?.documento || ""),
+    String(chunk.metadata?.documento_normativo || ""), String(chunk.metadata?.norma_original || "")].filter(Boolean);
+  const modifierIdentities = [String(chunk.metadata?.norma_modificatoria || ""),
+    String(chunk.metadata?.normativa_modificatoria || "")].filter(Boolean);
+  const hasExplicitRoles = originalIdentities.some((identity) => parseNormativeReferences(identity).length > 0)
+    || modifierIdentities.some((identity) => parseNormativeReferences(identity).length > 0);
+  if (modifierIdentities.some((identity) => normativeReferenceMatches(requested, parseNormativeReferences(identity), jurisdiction))) return "modifier";
+  if (originalIdentities.some((identity) => normativeReferenceMatches(requested, parseNormativeReferences(identity), jurisdiction))) return "original";
+  if (hasExplicitRoles) return null;
+
+  const fallbackIdentities = [chunk.source, chunk.title || "", String(chunk.metadata?.referencia_normativa || ""), chunk.sourceId];
+  return fallbackIdentities.some((identity) => normativeReferenceMatches(requested, parseNormativeReferences(identity), jurisdiction))
+    ? "unspecified"
+    : null;
 }
 
 export function sourceFingerprint(manifest: unknown, documents: unknown): string {

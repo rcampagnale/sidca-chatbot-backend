@@ -1,7 +1,7 @@
 import OpenAI from "openai";
 import { readFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
-import { chunkMatchesNormativeReference, parseNormativeReferences, rankNormative, type RagChunk } from "./ragCore.js";
+import { chunkMatchesNormativeReference, chunkNormativeReferenceRole, parseNormativeReferences, rankNormative, type RagChunk } from "./ragCore.js";
 
 export type DominioBackend =
   | "licencias"
@@ -1474,6 +1474,26 @@ function classifyDomain(
   const text = normalizeText(intentQuestion);
   const hasExplicitNormReference = parseNormativeReferences(intentQuestion).length > 0;
 
+  if (hasExplicitNormReference && cachedManifestSources.length) {
+    const requestedNorms = parseNormativeReferences(intentQuestion);
+    const sourceDomains = new Set<DominioBackend>();
+    for (const requestedNorm of requestedNorms) {
+      for (const source of cachedManifestSources.filter((candidate) => manifestSourceMatchesNorm(candidate, requestedNorm))) {
+        const sourceId = String(source.id || "");
+        const inferred = sourceId.includes("nomenclador") ? "nomenclador"
+          : sourceId.startsWith("ley_26058") ? "educacion_tecnico_profesional"
+          : sourceId.startsWith("ley_26206") ? "educacion_nacional"
+          : sourceId.startsWith("ley_5381") ? "educacion_provincial"
+          : sourceId.includes("educacion_privada") ? "educacion_privada"
+          : sourceId.includes("sumarios") ? "sumarios"
+          : isDominioBackend(source.dominio) ? source.dominio : undefined;
+        if (inferred) sourceDomains.add(inferred);
+      }
+    }
+    if (sourceDomains.size === 1) return Array.from(sourceDomains)[0];
+    if (sourceDomains.size > 1) return "general";
+  }
+
   if (/\b533\s*(?:\/\s*)?(?:21|2021)\b/.test(text)) return "coberturas";
   if (/\b636\s*(?:\/\s*)?2021\b/.test(text)) return "coberturas";
   if (/\b(?:2431\s*(?:\/\s*)?2016|2453\s*(?:\/\s*)?2019|1480\s*(?:\/\s*)?2019)\b/.test(text) || (!hasExplicitNormReference && text.includes("nomenclador"))) return "nomenclador";
@@ -1498,7 +1518,7 @@ function classifyDomain(
   const teacherRoleAliases = ["director", "directora", "vicedirector", "vicedirectora", "secretario", "secretaria", "prosecretario", "prosecretaria", "maestro", "maestra", "profesor", "profesora", "preceptor", "preceptora", "bibliotecario", "bibliotecaria", "supervisor", "supervisora", "rector", "rectora", "vicerrector", "vicerrectora", "regente", "regenta", "bedel", "tutor", "tutora", "coordinador", "coordinadora", "ayudante", "maestro de sala", "maestro especial", "cargo docente"];
   const teachingRole = teacherRoleAliases.some((alias) => new RegExp(`(?:^|\\s)${alias.replace(/\s+/g, "\\s+")}(?:$|\\s)`).test(text));
   const coverageIntent = /\b(?:cobertura|asamblea|designaci[oó]n|vacante|suplencia|interinato|cabecera|lom|optar|tomar el cargo)\b/.test(text);
-  const licenseIntent = /\b(?:licencia|licencias|rendir|examen|curso|capacitacion|tratamiento|asuntos? particulares|razones? particulares|familiar enfermo|fallecimiento|duelo|violencia|donacion)\b/.test(text);
+  const licenseIntent = /\b(?:licencia|licencias|rendir|examen|curso|capacitacion|tratamiento|asuntos? particulares|razones? particulares|familiar enfermo|fallecimiento|duelo|violencia|donacion|paternidad|nacimiento|progenitor varon)\b/.test(text);
   const normativeTrainingIntent = licenseIntent
     && /\b(?:auspicio oficial|regimen|articulo|docente|docentes)\b/.test(text)
     && /\b(?:capacitacion|congreso|perfeccionamiento|curso|simposio)\b/.test(text);
@@ -2496,6 +2516,7 @@ function explicitNormativeCorpusLimitation(question: string, chunks: LocalChunk[
   ])).values());
   if (!norms.length) return null;
   const requestedArticles = extractArticleNumbersFromQuery(question);
+  const articleAssociations = extractNormArticleAssociations(question);
   const limits: string[] = [];
   for (const norm of norms) {
     const matchingManifestSources = cachedManifestSources.filter((source) => manifestSourceMatchesNorm(source, norm));
@@ -2523,7 +2544,9 @@ function explicitNormativeCorpusLimitation(question: string, chunks: LocalChunk[
       continue;
     }
     if (requestedArticles.length) {
-      const missing = requestedArticles.filter((article) => !matchingLoadedChunks.some((chunk) => chunk.kind === "articulo" && articleMatches(chunk, article)));
+      const associatedArticles = Array.from(new Set(articleAssociations.filter((pair) => normativeIdentityKey(pair.norm) === normativeIdentityKey(norm)).map((pair) => pair.article)));
+      const articlesForThisNorm = associatedArticles.length ? associatedArticles : isNormReferencedAsModifier(question, norm) ? [] : requestedArticles;
+      const missing = articlesForThisNorm.filter((article) => !matchingLoadedChunks.some((chunk) => chunk.kind === "articulo" && chunkMatchesNormativeArticle(chunk, norm, article)));
       if (missing.length) limits.push(`${label}: la fuente está disponible, pero no contiene el/los artículo/s solicitado/s: ${missing.join(", ")}.`);
     }
   }
@@ -2565,14 +2588,74 @@ function extractArticleNumbersFromQuery(pregunta: string): string[] {
   return Array.from(results);
 }
 
-function articleMatches(chunk: LocalChunk, articleNumber: string): boolean {
+type NormArticleAssociation = { norm: ReturnType<typeof parseNormativeReferences>[number]; article: string };
+
+function normativeIdentityKey(norm: ReturnType<typeof parseNormativeReferences>[number]): string {
+  return [norm.kind, norm.number, norm.year || "", norm.qualifier || "", norm.jurisdiction || ""].join("|");
+}
+
+function extractNormArticleAssociations(question: string): NormArticleAssociation[] {
+  const locatedNorms: Array<{ norm: ReturnType<typeof parseNormativeReferences>[number]; start: number; end: number }> = [];
+  const normPattern = /\b(ley(?:\s+(?:nacional|provincial))?|decreto(?:\s*[-–]\s*ley|\s+acuerdo|\s+ecyt)?|dcto\.?\s*acdo\.?|resoluci[oó]n(?:\s+(?:nacional|provincial))?)\s*(?:(?:n(?:ro)?|numero)\s*(?:[º°ª]\.?|\.\s*[º°ª]?|)?\s*)?(\d[\d.]*(?:\s*\/\s*\d{2,4})?)/gi;
+  let normMatch: RegExpExecArray | null;
+  while ((normMatch = normPattern.exec(question)) !== null) {
+    const norm = parseNormativeReferences(normMatch[0])[0];
+    if (norm) locatedNorms.push({ norm, start: normMatch.index, end: normMatch.index + normMatch[0].length });
+  }
+  if (!locatedNorms.length) return [];
+  if (locatedNorms.length === 1) return extractArticleNumbersFromQuery(question).map((article) => ({ norm: locatedNorms[0].norm, article }));
+
+  const associations: NormArticleAssociation[] = [];
+  const articlePattern = /\b(?:art(?:í|i)culos?|arts?)\.?\s*(\d+(?:\s*(?:,|y|e)\s*\d+)*)/gi;
+  let articleMatch: RegExpExecArray | null;
+  while ((articleMatch = articlePattern.exec(question)) !== null) {
+    const articleNumbers = articleMatch[1].match(/\d+/g) || [];
+    const articleStart = articleMatch.index;
+    const articleEnd = articleStart + articleMatch[0].length;
+    const followingNorm = locatedNorms.find((located) => located.start >= articleEnd
+      && located.start - articleEnd <= 40
+      && /^\s*(?:(?:de|del)\s+(?:la\s+|el\s+)?|de\s+)?$/i.test(question.slice(articleEnd, located.start)));
+    const ranked = locatedNorms.map((located) => ({
+      ...located,
+      distance: located.start >= articleEnd ? located.start - articleEnd : located.end <= articleStart ? articleStart - located.end : 0,
+    })).sort((a, b) => a.distance - b.distance);
+    const nearest = followingNorm || ranked[0];
+    if (!nearest || (!followingNorm && ranked[0]?.distance > 100)) continue;
+    if (!followingNorm && ranked[1]?.distance === ranked[0]?.distance && normativeIdentityKey(ranked[1].norm) !== normativeIdentityKey(ranked[0].norm)) continue;
+    for (const article of articleNumbers) associations.push({ norm: nearest.norm, article });
+  }
+  return associations;
+}
+
+function isNormReferencedAsModifier(question: string, norm: ReturnType<typeof parseNormativeReferences>[number]): boolean {
+  const modifierReferences = /\bmodificad[oa]s?\s+por\s+(?:el\s+)?((?:ley(?:\s+(?:nacional|provincial))?|decreto(?:\s*[-–]\s*ley|\s+acuerdo|\s+ecyt)?|resoluci[oó]n(?:\s+(?:nacional|provincial))?)\s*(?:(?:n(?:ro)?|numero)\s*(?:[º°ª]\.?|\.\s*[º°ª]?|)?\s*)?\d[\d.]*(?:\s*\/\s*\d{2,4})?)/gi;
+  let match: RegExpExecArray | null;
+  while ((match = modifierReferences.exec(question)) !== null) {
+    if (parseNormativeReferences(match[1]).some((candidate) => normativeIdentityKey(candidate) === normativeIdentityKey(norm))) return true;
+  }
+  return false;
+}
+
+function articleMatches(chunk: LocalChunk, articleNumber: string, role: "original" | "modifier" = "original"): boolean {
   if (!articleNumber) return false;
 
-  const article = normalizeText(chunk.articulo || "");
   const target = normalizeText(articleNumber);
+  if (role === "modifier") {
+    return normalizeText(String(chunk.metadata?.articulo_modificatorio || "")) === target;
+  }
+  const article = normalizeText(chunk.articulo || "");
   const refs = chunk.articleRefs.map((ref) => normalizeText(ref));
 
   return article === target || refs.includes(target);
+}
+
+function chunkMatchesNormativeArticle(chunk: LocalChunk, norm: ReturnType<typeof parseNormativeReferences>[number], articleNumber: string): boolean {
+  const role = chunkNormativeReferenceRole({
+    sourceId: chunk.sourceId || chunk.filename, source: chunk.referencia, norm: chunk.norma || chunk.referencia,
+    jurisdiction: String(chunk.metadata?.jurisdiccion || ""), metadata: chunk.metadata, text: chunk.text,
+  }, norm);
+  if (!role) return false;
+  return articleMatches(chunk, articleNumber, role === "modifier" ? "modifier" : "original");
 }
 
 function isGenericLicenseArticle(chunk: LocalChunk): boolean {
@@ -2726,6 +2809,21 @@ function isMaternityQuestion(pregunta: string): boolean {
     compact.includes("soymam") ||
     compact.includes("licenciaparamam")
   );
+}
+
+function isPaternityQuestion(pregunta: string): boolean {
+  const text = normalizeText(pregunta);
+  if (/guarda con fines de adopcion|adopcion/.test(text) && !/nacimiento|paternidad|progenitor varon/.test(text)) return false;
+  return /\bpaternidad\b|\bprogenitor varon\b|\b(?:licencia por nacimiento|por nacimiento)\b|\bnacimiento (?:de )?(?:hijo|hija|hijo\/a)\b|\bmi hijo nacio\b|\bnacio mi hijo\b/.test(text);
+}
+
+function isSimplePaternityAnswerQuery(pregunta: string): boolean {
+  const normalized = normalizeText(pregunta);
+  return isPaternityQuestion(pregunta)
+    && extractArticleNumbersFromQuery(pregunta).length <= 1
+    && parseNormativeReferences(pregunta).length <= 1
+    && !/\b(?:compar|diferencias?|entre|versus|vs)\w*/.test(normalized)
+    && !/guarda con fines de adopcion|adopcion/.test(normalized);
 }
 
 function isFamilyCareQuestion(pregunta: string): boolean {
@@ -2910,6 +3008,7 @@ function isSuperpositionQuestion(pregunta: string): boolean {
 
 function isGenericLicenseQuestion(pregunta: string): boolean {
   const text = normalizeText(pregunta);
+  if (isPaternityQuestion(pregunta)) return false;
   const tokens = tokenize(text);
 
   const genericPatterns = [
@@ -3190,7 +3289,7 @@ const SERVICE_EXPANSIONS: ServiceExpansion[] = [
     preferredIds: ["sidca_capacitaciones", "sidca_contactos_institucionales"],
   },
   {
-    triggers: ["certificado", "certificados", "entrega de certificados", "retiro de certificados", "curso aprobado", "imprimir certificado"],
+    triggers: ["certificado", "certificados", "entrega de certificados", "retiro de certificados", "curso aprobado", "imprimir certificado", "constancia de asistencia presencial", "constancias de asistencia presencial"],
     terms: ["certificados cursos aprobados entrega de certificados whatsapp"],
     preferredIds: ["sidca_certificados", "sidca_contactos_institucionales"],
   },
@@ -3316,6 +3415,8 @@ function getMatchedServiceExpansions(pregunta: string): ServiceExpansion[] {
 
 function isServicesQuestion(pregunta: string): boolean {
   const text = normalizeText(pregunta);
+
+  if (/\bconstancias?\b/.test(text) && /asistencia presencial/.test(text)) return true;
 
   const mentionsLicense =
     text.includes("licencia") ||
@@ -3994,21 +4095,55 @@ async function searchLocalFragments(
     [reference.kind, reference.number, reference.year || "", reference.qualifier || "", reference.jurisdiction || ""].join("|"), reference,
   ])).values());
   const requestedArticles = extractArticleNumbersFromQuery(input.pregunta);
+  const articleAssociations = extractNormArticleAssociations(input.pregunta);
   const asksReasonsAndAffairs = /\brazones? particulares\b/.test(normalizeText(input.pregunta)) && /\basuntos? particulares\b/.test(normalizeText(input.pregunta));
   const withOptionArticleChunks = (base: LocalChunk[]): LocalChunk[] => {
     const mainChunks = Array.from(new Map(base.map((chunk) => [chunk.id, chunk])).values());
     if (!contrastText) return requestedArticles.length > 1 ? mainChunks : mainChunks.slice(0, maxResults);
     const optionArticles = extractArticleNumbersFromQuery(contrastText);
     const optionChunks = optionArticles.flatMap((article) => chunks.filter((chunk) => chunk.dominio === dominio
-      && chunk.kind === "articulo" && articleMatches(chunk, article)
-      && (!explicitlyRequestedNorms.length || explicitlyRequestedNorms.some((norm) => chunkMatchesNormativeReference({
-        sourceId: chunk.sourceId || chunk.filename, source: chunk.referencia, norm: chunk.norma || chunk.referencia,
-        jurisdiction: String(chunk.metadata?.jurisdiccion || ""), metadata: chunk.metadata, text: chunk.text,
-      }, norm)))));
+      && chunk.kind === "articulo"
+      && (!explicitlyRequestedNorms.length ? articleMatches(chunk, article)
+        : explicitlyRequestedNorms.some((norm) => chunkMatchesNormativeArticle(chunk, norm, article)))));
     const optionOnlyChunks = Array.from(new Map(optionChunks.filter((chunk) => !mainChunks.some((main) => main.id === chunk.id))
       .map((chunk) => [chunk.id, chunk])).values());
     return [...mainChunks, ...optionOnlyChunks.slice(0, Math.max(0, maxResults - mainChunks.length))];
   };
+
+  if (explicitlyRequestedNorms.length && /\b(?:modifica|modifico|reemplaza|reemplazo|sustituye|sustituyo)\b/.test(normalizeText(input.pregunta))) {
+    const amendmentChunks = chunks.filter((chunk) => chunk.kind === "articulo" && explicitlyRequestedNorms.some((norm) => chunkNormativeReferenceRole({
+      sourceId: chunk.sourceId || chunk.filename, source: chunk.referencia, norm: chunk.norma || chunk.referencia,
+      jurisdiction: String(chunk.metadata?.jurisdiccion || ""), metadata: chunk.metadata, text: chunk.text,
+    }, norm) === "modifier") && chunk.metadata?.norma_modificatoria);
+    if (amendmentChunks.length) return withOptionArticleChunks(amendmentChunks);
+  }
+
+  if (explicitlyRequestedNorms.length && requestedArticles.length) {
+    const modifierArticleChunks = explicitlyRequestedNorms.flatMap((norm) => requestedArticles.flatMap((article) =>
+      chunks.filter((chunk) => chunk.kind === "articulo" && chunkMatchesNormativeArticle(chunk, norm, article)
+        && chunkNormativeReferenceRole({ sourceId: chunk.sourceId || chunk.filename, source: chunk.referencia, norm: chunk.norma || chunk.referencia,
+          jurisdiction: String(chunk.metadata?.jurisdiccion || ""), metadata: chunk.metadata, text: chunk.text }, norm) === "modifier")));
+    if (modifierArticleChunks.length) return withOptionArticleChunks(modifierArticleChunks);
+  }
+
+  if (dominio === "licencias" && isSimplePaternityAnswerQuery(input.pregunta)) {
+    const paternityChunks = chunks.filter((chunk) => chunk.dominio === "licencias" && chunk.kind === "articulo"
+      && /paternidad|nacimiento de hijo/i.test(String(chunk.metadata?.titulo_articulo || chunk.titulo || ""))
+      && explicitlyRequestedNorms.every((norm) => {
+        const role = chunkNormativeReferenceRole({ sourceId: chunk.sourceId || chunk.filename, source: chunk.referencia,
+          norm: chunk.norma || chunk.referencia, jurisdiction: String(chunk.metadata?.jurisdiccion || ""), metadata: chunk.metadata, text: chunk.text }, norm);
+        return role === "original" || role === "unspecified";
+      }));
+    if (paternityChunks.length) return withOptionArticleChunks(paternityChunks);
+  }
+
+  const paternityAdoptionComparison = /\b(?:compar|diferencias?|entre|versus|vs)\w*/.test(normalizeText(input.pregunta))
+    && /paternidad/.test(normalizeText(input.pregunta)) && /adopcion|guarda con fines/.test(normalizeText(input.pregunta));
+  if (dominio === "licencias" && paternityAdoptionComparison) {
+    const comparativeChunks = chunks.filter((chunk) => chunk.dominio === "licencias" && chunk.kind === "articulo"
+      && /paternidad|nacimiento de hijo|guarda con fines adoptivos|adopcion/i.test(String(chunk.metadata?.titulo_articulo || chunk.titulo || "")));
+    if (comparativeChunks.length) return withOptionArticleChunks(comparativeChunks);
+  }
 
   if (dominio === "licencias" && explicitlyRequestedNorms.length === 0) {
     if (requestedArticles.length > 1) {
@@ -4027,6 +4162,24 @@ async function searchLocalFragments(
       const targetChunks = chunks.filter((chunk) => chunk.dominio === dominio && chunk.kind === "articulo" && articleMatches(chunk, targetArticle));
       if (targetChunks.length) return withOptionArticleChunks(targetChunks);
     }
+  }
+
+  if (explicitlyRequestedNorms.length > 1 && articleAssociations.length) {
+    const associationsByNorm = new Map(explicitlyRequestedNorms.map((norm) => [normativeIdentityKey(norm),
+      articleAssociations.filter((pair) => normativeIdentityKey(pair.norm) === normativeIdentityKey(norm)).map((pair) => pair.article)]));
+    if (Array.from(associationsByNorm.values()).every((articles) => articles.length > 0)) {
+      const requestedPairs = explicitlyRequestedNorms.flatMap((norm) => (associationsByNorm.get(normativeIdentityKey(norm)) || [])
+        .map((article) => ({ norm, article })));
+      const pairScopedChunks = requestedPairs.flatMap(({ norm, article }) => chunks.filter((chunk) => chunk.kind === "articulo"
+        && chunkMatchesNormativeArticle(chunk, norm, article)));
+      return withOptionArticleChunks(Array.from(new Map(pairScopedChunks.map((chunk) => [chunk.id, chunk])).values()));
+    }
+  }
+
+  if (explicitlyRequestedNorms.length && requestedArticles.length > 1 && articleAssociations.length) {
+    const pairScopedChunks = articleAssociations.flatMap(({ norm, article }) => chunks.filter((chunk) => chunk.kind === "articulo"
+      && chunkMatchesNormativeArticle(chunk, norm, article)));
+    return withOptionArticleChunks(Array.from(new Map(pairScopedChunks.map((chunk) => [chunk.id, chunk])).values()));
   }
 
   const isMultiNormComparison = /\b(?:comparar|comparacion|compara|comparan|comparando|comparado|diferencias?|relacion|entre|versus|vs)\b/i.test(normalizeText(input.pregunta)) && explicitlyRequestedNorms.length > 1;
@@ -4058,8 +4211,12 @@ async function searchLocalFragments(
         jurisdiction: String(chunk.metadata?.jurisdiccion || ""), metadata: chunk.metadata, text: chunk.text,
       }, norm)))
       : chunks.filter((chunk) => chunk.dominio === dominio);
-    return withOptionArticleChunks(Array.from(new Map(requestedArticles.flatMap((article) => normScopedChunks.filter((chunk) =>
-      chunk.kind === "articulo" && articleMatches(chunk, article))).map((chunk) => [chunk.id, chunk])).values()));
+    const scopedArticles = requestedArticles.flatMap((article) => normScopedChunks
+      .filter((chunk) => chunk.kind === "articulo" && (!explicitlyRequestedNorms.length
+        ? articleMatches(chunk, article)
+        : explicitlyRequestedNorms.some((norm) => chunkMatchesNormativeArticle(chunk, norm, article))))
+      .map((chunk) => [chunk.id, chunk] as const));
+    return withOptionArticleChunks(Array.from(new Map(scopedArticles).values()));
   }
 
   const decreeAndModification = input.pregunta.match(/\b(?:decreto(?:\s+acuerdo)?|dcto\.?\s*acdo\.?)\s*(?:n(?:ro)?[º°.]?\s*)?(\d{2,5})\s*\/\s*(\d{4})/i);
@@ -4392,6 +4549,21 @@ function buildLocalFallbackAnswer(
 ): string {
   if (!chunks.length) return NO_ENCONTRADO;
 
+  const requestedNorms = Array.from(new Map(parseNormativeReferences(pregunta).map((norm) => [normativeIdentityKey(norm), norm])).values());
+  if (requestedNorms.length) {
+    const associations = extractNormArticleAssociations(pregunta);
+    const relevant = chunks.filter((chunk) => requestedNorms.some((norm) => chunkMatchesNormativeReference({
+      sourceId: chunk.sourceId || chunk.filename, source: chunk.referencia, norm: chunk.norma || chunk.referencia,
+      jurisdiction: String(chunk.metadata?.jurisdiccion || ""), metadata: chunk.metadata, text: chunk.text,
+    }, norm)));
+    if (!relevant.length) return `No hay fragmentos documentales identificables de ${requestedNorms.map((norm) => `${norm.kind} ${norm.number}${norm.year ? `/${norm.year}` : ""}`).join(" ni ")} para respaldar esta respuesta. No se sustituirá por información de otra temática.`;
+    if (requestedNorms.length > 1 && associations.length) {
+      const paired = relevant.filter((chunk) => associations.some((pair) => chunkMatchesNormativeArticle(chunk, pair.norm, pair.article)));
+      if (paired.length) return buildLocalFallbackAnswer(paired, "");
+    }
+    if (relevant.length !== chunks.length) return buildLocalFallbackAnswer(relevant, pregunta);
+  }
+
   const requestedArticles = extractArticleNumbersFromQuery(pregunta);
   const multiNormOrArticleQuery = parseNormativeReferences(pregunta).length > 1 || requestedArticles.length > 1;
   const directArticle = requestedArticles.length === 1
@@ -4474,6 +4646,7 @@ function buildDocumentedLicenseAuthorityAnswer(question: string, chunks: LocalCh
   const askedArticles = extractArticleNumbersFromQuery(question);
   const topicArticle = askedArticles.length === 1 ? askedArticles[0]
     : /donacion de sangre/.test(text) ? "50"
+      : /fenomenos meteorologicos|razones extraordinarias|fuerza mayor|crecida/.test(text) ? "49"
       : /violencia de genero/.test(text) ? "26"
         : /fallecimiento|muerte del padre|padre.*fallec/.test(text) ? "48"
           : /grupo familiar|familiar.*enferm/.test(text) ? "30"
@@ -4498,9 +4671,153 @@ function buildDocumentedLicenseAuthorityAnswer(question: string, chunks: LocalCh
   return sections.join("\n\n");
 }
 
+function buildPaternityAnswer(question: string, chunks: LocalChunk[], parsedQuestion?: ParsedQuestion): { answer: string; chunk: LocalChunk } | null {
+  if (!isSimplePaternityAnswerQuery(question)) return null;
+  const target = chunks.find((chunk) => chunk.dominio === "licencias" && chunk.kind === "articulo"
+    && /paternidad|nacimiento de hijo/i.test(String(chunk.metadata?.titulo_articulo || chunk.titulo || ""))
+    && extractArticleNumbersFromQuery(question).every((article) => articleMatches(chunk, article))
+    && parseNormativeReferences(question).every((norm) => {
+      const role = chunkNormativeReferenceRole({ sourceId: chunk.sourceId || chunk.filename, source: chunk.referencia,
+        norm: chunk.norma || chunk.referencia, jurisdiction: String(chunk.metadata?.jurisdiccion || ""), metadata: chunk.metadata, text: chunk.text }, norm);
+      return role === "original" || role === "unspecified";
+    }));
+  if (!target) return null;
+  const raw = target.raw && typeof target.raw === "object" ? target.raw as Record<string, any> : {};
+  const content = String(raw.contenido || target.text || "");
+  const summary = content.match(/S[ií]ntesis documental:\s*([\s\S]*?)(?=\s+Nota documental:|$)/i)?.[1]?.trim();
+  const note = content.match(/Nota documental:\s*([\s\S]*?)(?=\s+R[eé]gimen general|$)/i)?.[1]?.trim();
+  const scope = String(raw.ambito_aplicacion || "").trim();
+  const document = String(raw.documento || target.norma || target.referencia).trim();
+  const amendment = String(raw.norma_modificatoria || "").trim();
+  const amendmentArticle = raw.articulo_modificatorio ? `, modificado por el artículo ${raw.articulo_modificatorio} del ${amendment}` : amendment ? `, modificado por ${amendment}` : "";
+  const extractNotice = raw.transcripcion_literal === false
+    ? "Advertencia documental: este registro es un extracto y no constituye una transcripción literal completa."
+    : "";
+  let answer = [
+    `Artículo ${target.articulo} del ${document}${amendmentArticle}.`,
+    summary || buildVerbatimArticleAnswer(target),
+    extractNotice,
+    note ? `Nota documental: ${note}` : "",
+    scope ? `Alcance: ${scope}` : "",
+  ].filter(Boolean).join("\n\n");
+  if (parsedQuestion?.options.length) {
+    const principalFact = summary?.split(/[.;]/)[0] || "";
+    const optionFacts = getOptionFacts(`Artículo ${target.articulo}. ${principalFact}`, parsedQuestion.options);
+    const candidates = parsedQuestion.options.filter((option) => optionContainsFacts(option, optionFacts));
+    if (candidates.length === 1) answer = `Opción ${candidates[0].label}) ${answer}`;
+  }
+  return { answer, chunk: target };
+}
+
+function buildNormativeModificationAnswer(question: string, chunks: LocalChunk[]): { answer: string; chunks: LocalChunk[] } | null {
+  const requestedNorms = parseNormativeReferences(question);
+  const asksModification = /\b(?:que )modifica\b|\bmodificaciones? introduce\b|\bque cambios introduce\b/i.test(normalizeText(question));
+  if (!requestedNorms.length) return null;
+  const requestedArticles = extractArticleNumbersFromQuery(question);
+  const amendments = chunks.filter((chunk) => chunk.kind === "articulo" && chunk.metadata?.norma_modificatoria
+    && requestedNorms.some((norm) => chunkNormativeReferenceRole({
+      sourceId: chunk.sourceId || chunk.filename, source: chunk.referencia, norm: chunk.norma || chunk.referencia,
+      jurisdiction: String(chunk.metadata?.jurisdiccion || ""), metadata: chunk.metadata, text: chunk.text,
+    }, norm) === "modifier")
+    && (!requestedArticles.length || requestedArticles.some((article) => articleMatches(chunk, article, "modifier"))));
+  if (!asksModification && !amendments.length) return null;
+  if (!amendments.length) return null;
+  const ordered = Array.from(new Map(amendments.map((chunk) => [chunk.id, chunk])).values())
+    .sort((a, b) => Number(a.metadata?.articulo_modificatorio || 0) - Number(b.metadata?.articulo_modificatorio || 0));
+  const groups = new Map<string, LocalChunk[]>();
+  for (const chunk of ordered) {
+    const modifier = String(chunk.metadata?.norma_modificatoria || "la norma modificatoria");
+    groups.set(modifier, [...(groups.get(modifier) || []), chunk]);
+  }
+  const sections = Array.from(groups, ([modifier, group]) => {
+    const clauses = group.map((chunk) => `el artículo ${chunk.metadata?.articulo_modificatorio || ""} de ${modifier} modifica el artículo ${chunk.articulo} de ${String(chunk.metadata?.documento || chunk.norma || "la norma de base")}, relativo a ${String(chunk.metadata?.titulo_articulo || chunk.titulo || "la materia indicada en el registro")}`);
+    const scopes = Array.from(new Set(group.map((chunk) => String(chunk.metadata?.ambito_aplicacion || "").trim()).filter(Boolean)));
+    const scopeText = scopes.map((scope) => `Alcance documental: ${scope}`).join("\n");
+    const extractNotice = group.some((chunk) => (chunk.raw as any)?.transcripcion_literal === false)
+      ? "Fuente: extracto documental; no es una transcripción literal completa."
+      : "";
+    if (!asksModification && group.length === 1) return [`El artículo ${group[0].metadata?.articulo_modificatorio} de ${modifier} modifica el artículo ${group[0].articulo} de ${String(group[0].metadata?.documento || group[0].norma)}, relativo a ${String(group[0].metadata?.titulo_articulo || group[0].titulo || "la materia indicada en el registro")}.`, extractNotice, scopeText].filter(Boolean).join("\n\n");
+    return [`${modifier} modifica ${clauses.join("; y ")}.`, extractNotice, scopeText].filter(Boolean).join("\n\n");
+  });
+  return { answer: sections.join("\n\n"), chunks: ordered };
+}
+
+function getOptionFacts(text: string, options: ParsedQuestion["options"]): { articles: string[]; norms: string[]; periods: string[]; authorities: string[] } {
+  const normalized = normalizeText(text);
+  const articles = extractArticleNumbersFromQuery(text);
+  const norms = parseNormativeReferences(text).map(normativeIdentityKey);
+  const numberWords: Record<string, string> = { un: "1", uno: "1", una: "1", dos: "2", tres: "3", cuatro: "4", cinco: "5", seis: "6", siete: "7", ocho: "8", nueve: "9", diez: "10", quince: "15", veinte: "20", veinticinco: "25", treinta: "30" };
+  const periods = Array.from(normalized.matchAll(/\b(\d+(?:[.,]\d+)?|un[oa]?|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|quince|veinte|veinticinco|treinta)\s*(dias?|horas?|minutos?|meses?|anos?|semanas?)(?:\s*(habiles?|corridos?|laborables?|semanales?))?\b/g), (match) => {
+    const amount = numberWords[match[1]] || match[1].replace(",", ".");
+    return `${amount} ${match[2]}${match[3] ? ` ${match[3]}` : ""}`;
+  });
+  const authorityPatterns = [
+    /\bdirector(?:a)?\s+(?:de\s+)?(?:la\s+)?unidad escolar\b/gi,
+    /\bdirector(?:a)?\s+(?:de\s+)?nivel\b/gi,
+    /\bsecretario(?:a)?\s+(?:de\s+)?(?:la\s+)?unidad escolar\b/gi,
+    /\bdireccion provincial de recursos humanos\b/gi,
+    /\bdprh\b/gi,
+    /\bministerio de educacion(?:, ciencia y tecnologia)?\b/gi,
+  ];
+  const authorities = authorityPatterns.flatMap((pattern) => Array.from(text.matchAll(pattern), (match) => normalizeText(match[0])));
+  const optionAuthorities = options.flatMap((option) => authorityPatterns.flatMap((pattern) => Array.from(option.text.matchAll(pattern), (match) => normalizeText(match[0]))));
+  return { articles, norms, periods, authorities: Array.from(new Set([...authorities, ...optionAuthorities.filter((authority) => normalized.includes(authority))]))
+    .filter((authority) => normalized.includes(authority)) };
+}
+
+function optionContainsFacts(option: ParsedQuestion["options"][number], facts: ReturnType<typeof getOptionFacts>): boolean {
+  const optionFacts = getOptionFacts(option.text, []);
+  return facts.articles.every((article) => optionFacts.articles.includes(article))
+    && facts.norms.every((norm) => optionFacts.norms.includes(norm))
+    && facts.periods.every((period) => optionFacts.periods.includes(period))
+    && facts.authorities.every((authority) => optionFacts.authorities.includes(authority));
+}
+
+function reconcileAnswerOptions(answer: string, question: string, parsed: ParsedQuestion): { answer: string; ambiguous: boolean } {
+  if (parsed.options.length < 2) return { answer, ambiguous: false };
+  const optionLabelsOnly = parsed.selectionMode === "multiple"
+    && /^(?:(?:las? )?(?:opciones? )?(?:correctas? )?(?:son|:)?\s*)?[A-E](?:\s*(?:,|y|e|&)\s*[A-E]){1,4}[.!]?$/i.test(answer.trim());
+  if (optionLabelsOnly) return { answer, ambiguous: true };
+
+  let reconciled = answer;
+  let ambiguous = false;
+  const answerClaim = /(?:^|[\s([{])([A-E])([).:\-])\s*([^;\r\n.!?]{1,220})/g;
+  let match: RegExpExecArray | null;
+  const changes: Array<{ start: number; end: number; replacement: string }> = [];
+  while ((match = answerClaim.exec(answer)) !== null) {
+    const label = match[1];
+    const claim = match[3];
+    const facts = getOptionFacts(claim, parsed.options);
+    if (!facts.articles.length && !facts.norms.length && !facts.periods.length && !facts.authorities.length) continue;
+    const labeled = parsed.options.find((option) => option.label === label);
+    if (!labeled) continue;
+    const candidates = parsed.options.filter((option) => optionContainsFacts(option, facts));
+    if (optionContainsFacts(labeled, facts)) {
+      if (candidates.length > 1 && ((/\b(?:quien|autoridad|otorga|autoriz|interviniente|otorgante)\b/i.test(normalizeText(question)) && !facts.authorities.length)
+        || (/\b(?:cuantos?|cuantas?|dias?|horas?|plazo|duracion)\b/i.test(normalizeText(question)) && !facts.periods.length))) ambiguous = true;
+      continue;
+    }
+    if (candidates.length === 1) {
+      const absoluteLabelStart = match.index + match[0].indexOf(label);
+      changes.push({ start: absoluteLabelStart, end: absoluteLabelStart + label.length, replacement: candidates[0].label });
+    } else {
+      ambiguous = true;
+    }
+  }
+  for (const change of changes.sort((a, b) => b.start - a.start)) {
+    reconciled = `${reconciled.slice(0, change.start)}${change.replacement}${reconciled.slice(change.end)}`;
+  }
+  return { answer: reconciled, ambiguous };
+}
+
 function buildDocumentedServiceAnswer(chunks: LocalChunk[], pregunta: string): { answer: string; chunk: LocalChunk | null } | null {
   const normalizedQuestion = normalizeText(pregunta);
-  const isCertificateRequest = /\bcertificados?\b/.test(normalizedQuestion) && !/certificado medico/.test(normalizedQuestion);
+  const attendanceProofRequest = /\bconstancias?\b/.test(normalizedQuestion) && /\basistencia presencial\b/.test(normalizedQuestion);
+  const isCertificateRequest = !attendanceProofRequest && /\bcertificados?\b/.test(normalizedQuestion) && !/certificado medico/.test(normalizedQuestion);
+  if (attendanceProofRequest) {
+    const sourceChunk = chunks.find((chunk) => getServiceItemId(chunk) === normalizeText("sidca_certificados")) || null;
+    return { answer: "La documentación distingue los certificados de capacitación de las constancias de asistencia presencial, pero no describe en esta ficha el procedimiento para solicitar una constancia. No puedo inferirlo a partir del trámite de certificados de cursos.", chunk: sourceChunk };
+  }
   const primary = isCertificateRequest
     ? chunks.find((chunk) => getServiceItemId(chunk) === normalizeText("sidca_certificados"))
     : undefined;
@@ -4514,6 +4831,11 @@ function buildDocumentedServiceAnswer(chunks: LocalChunk[], pregunta: string): {
   if (!suggested) return { answer: `La documentación identifica ${title}, pero no incluye una respuesta_sugerida con instrucciones suficientes. Hace falta documentar el procedimiento confirmado antes de orientar al usuario.`, chunk: service };
   const asksDownload = /\b(?:descarg|imprim|obten|baj[aá]r?)\w*\b/.test(normalizedQuestion);
   if (isCertificateRequest && asksDownload) {
+    const normalizedDocument = normalizeText(`${suggested} ${service.text} ${getObjectField(service.raw, ["contenido", "content"])}`);
+    const sourceConfirmsDownloadDisabled = /descarga (?:de )?certificados?[^.]{0,100}no se encuentra habilitada/.test(normalizedDocument)
+      || /descarga (?:de )?certificados?[^.]{0,100}no esta habilitada/.test(normalizedDocument)
+      || /descarga (?:de )?certificados?[^.]{0,100}no disponible/.test(normalizedDocument);
+    if (sourceConfirmsDownloadDisabled) return { answer: suggested.trim(), chunk: service };
     return { answer: `La ficha documental “${title}” indica: ${suggested.trim()}\n\nLa fuente no confirma que la ruta ni el estado de impresión reflejen la versión actual de la APP SIDCA. No puedo confirmar el procedimiento vigente; hace falta actualizar y validar esta ficha antes de orientar la descarga.`, chunk: service };
   }
   return { answer: suggested.trim(), chunk: service };
@@ -5219,25 +5541,9 @@ function citedNormsAreSupported(answer: string, chunks: LocalChunk[]): boolean {
 }
 
 function citedNormArticlePairsAreSupported(answer: string, chunks: LocalChunk[]): boolean {
-  const pairs: Array<{ norm: ReturnType<typeof parseNormativeReferences>[number]; article: string }> = [];
-  const normFirst = /\b(?:ley(?:\s+(?:nacional|provincial))?|decreto(?:\s*[-–]\s*ley|\s+acuerdo|\s+ecyt)?|resoluci[oó]n(?:\s+(?:nacional|provincial))?)\s*(?:(?:n(?:ro)?|numero)\s*(?:[º°ª]\.?|\.\s*[º°ª]?|)?\s*)?\d[\d.]*(?:\s*\/\s*\d{2,4})?[^\n.;]{0,80}?\b(?:art(?:i|í)culo|art)\.?\s*(\d+)\b/gi;
-  for (const match of answer.matchAll(normFirst)) {
-    const norm = parseNormativeReferences(match[0])[0];
-    const article = match[1];
-    if (norm && article) pairs.push({ norm, article });
-  }
-  const articleFirst = /\b(?:art(?:i|í)culo|art)\.?\s*(\d+)\s+(?:de\s+)?(?:la\s+)?((?:ley(?:\s+(?:nacional|provincial))?|decreto(?:\s*[-–]\s*ley|\s+acuerdo|\s+ecyt)?|resoluci[oó]n(?:\s+(?:nacional|provincial))?)\s*(?:(?:n(?:ro)?|numero)\s*(?:[º°ª]\.?|\.\s*[º°ª]?|)?\s*)?\d[\d.]*(?:\s*\/\s*\d{2,4})?)/gi;
-  for (const match of answer.matchAll(articleFirst)) {
-    const norm = parseNormativeReferences(match[2])[0];
-    if (norm && match[1]) pairs.push({ norm, article: match[1] });
-  }
+  const pairs = extractNormArticleAssociations(answer);
   return pairs.every(({ norm, article }) => chunks.some((chunk) => {
-    const exactNorm = chunkMatchesNormativeReference({
-      sourceId: chunk.sourceId || chunk.filename, source: chunk.referencia, norm: chunk.norma || chunk.referencia,
-      jurisdiction: String(chunk.metadata?.jurisdiccion || ""), metadata: chunk.metadata, text: chunk.text,
-    }, norm);
-    const hasArticle = [...(chunk.articleRefs || []).map(String), ...(String(chunk.articulo || "").match(/\d+/g) || [])].includes(article);
-    return exactNorm && hasArticle;
+    return chunkMatchesNormativeArticle(chunk, norm, article);
   }));
 }
 
@@ -5337,6 +5643,9 @@ export async function runGroqWorkflow(
     ? `${input.pregunta}\nContexto conversacional previo del mismo usuario: ${truncateText(input.contextoConversacional, 1200)}`
     : input.pregunta;
   const explicitNormInQuestion = parseNormativeReferences(questionIntent).length > 0;
+  if (explicitNormInQuestion && cachedManifestSources.length === 0) {
+    try { await getSourceConfigs(); } catch { /* la ruta normal devolverá la limitación documental si el manifiesto no está disponible */ }
+  }
   const asksSingleArticle = /\b(?:art(?:i|í)culo|art)\.?\s*\d+\b/i.test(questionIntent) && !explicitNormInQuestion;
   const preliminaryDomain = classifyDomain(intentQuestionEffective, input.dominio);
   if (asksSingleArticle && !input.contextoConversacional && preliminaryDomain === "general") {
@@ -5399,7 +5708,7 @@ export async function runGroqWorkflow(
       chunks: [] });
   }
 
-  if (dominio === "licencias" && isGenericLicenseQuestion(questionIntent)) {
+  if (dominio === "licencias" && isGenericLicenseQuestion(questionIntent) && extractArticleNumbersFromQuery(questionIntent).length === 0) {
     return buildOutput({
       ok: true,
       tipo: "sin_resultados",
@@ -5444,6 +5753,20 @@ export async function runGroqWorkflow(
           || chunk.kind === "resumen" && articleMatches(chunk, article)));
       const response = buildOutput({ ok: true, tipo: "respuesta_local", origen: "local_rag", dominio,
         consulta: input.pregunta, respuesta: authorityAnswer, chunks: authorityChunks });
+      if (useResponseCache) setCachedResponse(cacheKey, response);
+      return response;
+    }
+    const amendmentAnswer = buildNormativeModificationAnswer(questionIntent, chunks);
+    if (amendmentAnswer) {
+      const response = buildOutput({ ok: true, tipo: "respuesta_local", origen: "local_rag", dominio,
+        consulta: input.pregunta, respuesta: amendmentAnswer.answer, chunks: amendmentAnswer.chunks });
+      if (useResponseCache) setCachedResponse(cacheKey, response);
+      return response;
+    }
+    const paternityAnswer = dominio === "licencias" ? buildPaternityAnswer(questionIntent, chunks, parsedQuestion) : null;
+    if (paternityAnswer) {
+      const response = buildOutput({ ok: true, tipo: "respuesta_local", origen: "local_rag", dominio,
+        consulta: input.pregunta, respuesta: paternityAnswer.answer, chunks: [paternityAnswer.chunk] });
       if (useResponseCache) setCachedResponse(cacheKey, response);
       return response;
     }
@@ -5629,13 +5952,21 @@ export async function runGroqWorkflow(
         });
       }
 
+      const optionCheck = reconcileAnswerOptions(generacionGroq.text, questionIntent, parsedQuestion);
+      if (optionCheck.ambiguous) {
+        return buildOutput({ ok: true, tipo: "respuesta_local", origen: "local_rag_fallback", dominio,
+          consulta: input.pregunta,
+          respuesta: "No puedo asociar de manera inequívoca la letra seleccionada con el contenido de las alternativas a partir de la respuesta generada. La documentación se recuperó, pero no voy a atribuir una letra por inferencia; revisá las opciones o precisá cuál comparación querés validar.",
+          chunks, error: "option_mapping_ambiguous" });
+      }
+
       const response = buildOutput({
         ok: true,
         tipo: "respuesta_ia",
         origen: "groq_rag",
         dominio,
         consulta: input.pregunta,
-        respuesta: generacionGroq.text,
+        respuesta: optionCheck.answer,
         chunks,
       });
 

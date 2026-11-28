@@ -1,0 +1,135 @@
+{
+  "version": "1.10.0",
+  "actualizado": "2026-11-28",
+  "descripcion": "Índice central de fuentes documentales que consume el backend del chatbot SiDCa.",
+  "fuentes": [
+    {
+      "id": "licencias_docentes_provincial",
+      "dominio": "licencias",
+      "nombre": "Régimen de Licencias Docentes Provincial",
+      "referencia": "Decreto Acuerdo Nº 1092/2015 – Régimen de Licencias Docentes",
+      "url": "https://raw.githubusercontent.com/rcampagnale/sidca-chatbot-docs/main/regimen_licencias_docentes.json",
+      "activo": true
+    },
+    {
+      "id": "estatuto_docente_provincial",
+      "dominio": "estatuto",
+      "nombre": "Estatuto del Docente Provincial",
+      "referencia": "Ley Nº 3122 – Estatuto del Docente Provincial",
+      "url": "https://raw.githubusercontent.com/rcampagnale/sidca-chatbot-docs/main/texto_provincial_para_firestore.json",
+      "activo": true
+    },
+    {
+      "id": "consultas_generales_sidca",
+      "dominio": "general",
+      "nombre": "Consultas generales SiDCa",
+      "referencia": "Consultas generales SiDCa",
+      "url": "https://raw.githubusercontent.com/rcampagnale/sidca-chatbot-docs/main/consultas_generales.json",
+      "activo": true
+    },
+    {
+      "id": "coberturas_decreto_636",
+      "dominio": "coberturas",
+      "nombre": "Sistema de Asamblea Pública de Coberturas",
+      "referencia": "Decreto Acuerdo Nº 636/2021 actualizado por Resolución RESRH-2021-3335-E-CAT-MTRH – Reemplazo del Anexo II de Educación Secundaria y sus Modalidades",
+      "url": "https://raw.githubusercontent.com/rcampagnale/sidca-chatbot-docs/main/decreto_636_coberturas_actualizado_res3335.json",
+      "activo": true
+    },
+    {
+      "id": "servicios_sidca_app",
+      "dominio": "servicios",
+      "nombre": "Servicios, contactos y beneficios de la App SiDCa",
+      "referencia": "Información institucional disponible en la App SiDCa",
+      "url": "https://raw.githubusercontent.com/rcampagnale/sidca-chatbot-docs/main/servicios_sidca_app.json",
+      "activo": true
+    },
+    {
+      "id": "nomenclador_docente_catamarca",
+      "dominio": "general",
+      "nombre": "Nomenclador de cargos docentes de Catamarca",
+      "referencia": "Decreto Acuerdo Nº 2431/2016 – Anexo Único – Modificación de puntajes del Decreto Acuerdo Nº 1550/95",
+      "url": "https://raw.githubusercontent.com/rcampagnale/sidca-chatbot-docs/main/SIDCA_NOMENCLADOR_DOCENTE.json",
+      "activo": true
+    },
+    {
+      "id": "sumarios_decreto_413_2000",
+      "dominio": "sumarios",
+      "nombre": "Reglamento de Sumarios para el Personal Docente",
+      "referencia": "Decreto C.E. Nº 413/2000",
+      "url": "https://raw.githubusercontent.com/rcampagnale/sidca-chatbot-docs/main/decreto_413_2000_sumarios_docentes.json",
+      "activo": false
+    },
+    {
+      "id": "sumarios_decreto_641_2002",
+      "dominio": "sumarios",
+      "nombre": "Ampliación del Reglamento de Sumarios Docentes",
+      "referencia": "Decreto E. Nº 641/2002 – Incorporación de los artículos 83 a 87",
+      "url": "https://raw.githubusercontent.com/rcampagnale/sidca-chatbot-docs/main/decreto_641_2002_sumarios_docentes.json",
+      "activo": false
+    },
+    {
+      "id": "movilidad_docente_decreto_533",
+      "dominio": "coberturas",
+      "nombre": "Movilidad Docente – Altas, Bajas y Cambios de Situación de Revista",
+      "referencia": "Decreto Acuerdo Nº 533/2021",
+      "url": "https://raw.githubusercontent.com/rcampagnale/sidca-chatbot-docs/main/decreto_533_2021_movilidad_docente.json",
+      "activo": true
+    },
+    {
+      "id": "nomenclador_centros_educativos",
+      "dominio": "general",
+      "nombre": "Nomenclador de cargos docentes de Centros Educativos",
+      "referencia": "Decreto ECyT Nº 2453/2019 – Unidad Institucional – Modificación del Nomenclador Decreto Acuerdo Nº 2431/2016",
+      "url": "https://raw.githubusercontent.com/rcampagnale/sidca-chatbot-docs/main/SIDCA_NOMENCLADOR_CENTROS_EDUCATIVOS.json",
+      "activo": true
+    },
+    {
+      "id": "nomenclador_jardines_maternales",
+      "dominio": "general",
+      "nombre": "Nomenclador de cargos docentes de Jardines Maternales",
+      "referencia": "Decreto ECyT Nº 1480/2019 – Jardines Maternales Pasitos Cuidados I y II – Incorporación de cargos al Decreto Acuerdo Nº 2431/2016",
+      "url": "https://raw.githubusercontent.com/rcampagnale/sidca-chatbot-docs/main/decreto_1480_2019_jardines_maternales.json",
+      "activo": true
+    },
+    {
+      "id": "ley_26058_educacion_tecnico_profesional",
+      "dominio": "general",
+      "nombre": "Ley Nacional de Educación Técnico Profesional",
+      "referencia": "Ley Nacional Nº 26.058 – Educación Técnico Profesional y Formación Profesional",
+      "url": "https://raw.githubusercontent.com/rcampagnale/sidca-chatbot-docs/main/ley_26058_educacion_tecnico_profesional.json",
+      "activo": true
+    },
+    {
+      "id": "ley_26206_educacion_nacional",
+      "dominio": "general",
+      "nombre": "Ley de Educación Nacional",
+      "referencia": "Ley Nacional Nº 26.206 – Ley de Educación Nacional y sus modificaciones",
+      "url": "https://raw.githubusercontent.com/rcampagnale/sidca-chatbot-docs/main/ley_26206_educacion_nacional.json",
+      "activo": false
+    },
+    {
+      "id": "ley_5381_educacion_catamarca",
+      "dominio": "general",
+      "nombre": "Ley de Educación Provincial de Catamarca",
+      "referencia": "Ley Provincial Nº 5381 – Decreto Nº 2269/2013 – Decreto ECyT Nº 650/2015 y Anexo Único",
+      "url": "https://raw.githubusercontent.com/rcampagnale/sidca-chatbot-docs/main/ley_5381_educacion_catamarca.json",
+      "activo": false
+    },
+    {
+      "id": "decreto_ley_3387_educacion_privada",
+      "dominio": "general",
+      "nombre": "Ley de Enseñanza Privada de Catamarca",
+      "referencia": "Decreto-Ley Nº 3387/1978 – Decreto ECyT Nº 448/2009 – Disposición DPEPGeP Nº 871/2007",
+      "url": "https://raw.githubusercontent.com/rcampagnale/sidca-chatbot-docs/main/decreto_ley_3387_educacion_privada.json",
+      "activo": false
+    },
+    {
+      "id": "licencias_generales_decreto_1875_1994_modificado_153_2019",
+      "dominio": "licencias",
+      "nombre": "Régimen general de licencias de la Administración Pública Provincial – nacimiento y guarda adoptiva (extracto)",
+      "referencia": "Decreto Acuerdo Nº 1875/1994 – artículos 36 y 57 modificados por Decreto Acuerdo Nº 153/2019",
+      "url": "https://raw.githubusercontent.com/rcampagnale/sidca-chatbot-docs/main/decreto_153_2019_licencia_paternidad.json",
+      "activo": true
+    }
+  ]
+}
