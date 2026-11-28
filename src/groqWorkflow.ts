@@ -154,6 +154,8 @@ let cachedChunksVersion = "";
 let loadingChunksPromise: Promise<LocalChunk[]> | null = null;
 let cachedSourceConfigs: SourceConfig[] | null = null;
 let cachedInactiveSourceLabels: string[] = [];
+let cachedManifestSources: ManifestFuente[] = [];
+let cachedSourceLoadStatus = new Map<string, boolean>();
 const SOURCE_LOAD_CONCURRENCY = 4;
 // El enfriamiento y la cola viven en memoria por instancia de Cloud Run; no representan una cuota global.
 const GROQ_MAX_QUEUED_REQUESTS = 8;
@@ -177,7 +179,7 @@ let groqQueue: Promise<void> = Promise.resolve();
 let groqQueueDepth = 0;
 export function setWorkflowTestDependencies(dependencies: WorkflowTestDependencies = {}): void {
   workflowTestDependencies = dependencies;
-  cachedChunks = null; cachedChunksComplete = null; cachedAt = 0; cachedChunksVersion = ""; loadingChunksPromise = null; cachedSourceConfigs = null; cachedInactiveSourceLabels = []; responseCache.clear();
+  cachedChunks = null; cachedChunksComplete = null; cachedAt = 0; cachedChunksVersion = ""; loadingChunksPromise = null; cachedSourceConfigs = null; cachedInactiveSourceLabels = []; cachedManifestSources = []; cachedSourceLoadStatus = new Map(); responseCache.clear();
   groqCooldownUntil = 0; groqCooldownReason = ""; groqQueue = Promise.resolve(); groqQueueDepth = 0;
 }
 export function updateWorkflowTestDependencies(dependencies: WorkflowTestDependencies = {}): void {
@@ -1183,6 +1185,57 @@ function normalizeText(str: string): string {
     .trim();
 }
 
+type ParsedQuestion = {
+  main: string;
+  situation: string;
+  effectiveQuestion: string;
+  options: Array<{ label: string; text: string }>;
+  optionsText: string;
+  selectionMode: "single_or_unspecified" | "multiple";
+};
+
+function parseQuestionStructure(question: string): ParsedQuestion {
+  const source = String(question || "").replace(/\r\n?/g, "\n");
+  const markers: Array<{ label: string; index: number; contentIndex: number }> = [];
+  const optionMarker = /(?:^|(?<=\s))(?:\(([A-Ea-e])\)|([A-Ea-e])[).:\-])[\t ]+/g;
+  let match: RegExpExecArray | null;
+  while ((match = optionMarker.exec(source)) !== null) {
+    const label = (match[1] || match[2] || "").toUpperCase();
+    const contentIndex = optionMarker.lastIndex;
+    markers.push({ label, index: contentIndex - match[0].length, contentIndex });
+  }
+
+  const mainCandidate = markers.length ? source.slice(0, markers[0].index).trim() : source.trim();
+  const lowerCaseLabels = markers.some((marker) => {
+    const raw = source.slice(marker.index, marker.contentIndex).match(/[a-e]/i)?.[0] || "";
+    return raw !== raw.toUpperCase();
+  });
+  const hasQuizCue = /\b(?:seleccion(?:e|a|ar)|marque|indique)\b|opciones? correctas?/i.test(mainCandidate);
+  const asksQuestion = /\?/.test(mainCandidate);
+  const labels = markers.map((marker) => marker.label);
+  const uniqueLabels = new Set(labels).size === labels.length;
+  const looksLikeOptions = markers.length >= 2 && uniqueLabels
+    && (asksQuestion || hasQuizCue)
+    && (!lowerCaseLabels || hasQuizCue || !/\b(?:art[ií]culos?|arts?)\s*\d+\b/i.test(mainCandidate));
+  if (!looksLikeOptions) {
+    const parts = mainCandidate.split(/(?<=[?])\s+/);
+    const effectiveQuestion = parts.at(-1) || mainCandidate;
+    return { main: source.trim(), situation: parts.slice(0, -1).join(" ").trim(), effectiveQuestion,
+      options: [], optionsText: "", selectionMode: "single_or_unspecified" };
+  }
+
+  const options = markers.map((marker, index) => ({
+    label: marker.label,
+    text: source.slice(marker.contentIndex, markers[index + 1]?.index ?? source.length).trim(),
+  }));
+  const multiple = /\b(?:tres|dos|varias|m[uú]ltiples)\s+opciones?\b|\bseleccione\s+las?\s+(?:tres|dos|varias)\b/i.test(mainCandidate);
+  const parts = mainCandidate.split(/(?<=[?])\s+/);
+  return { main: mainCandidate, situation: parts.slice(0, -1).join(" ").trim(),
+    effectiveQuestion: parts.at(-1) || mainCandidate, options,
+    optionsText: options.map((option) => `${option.label}. ${option.text}`).join("\n"),
+    selectionMode: multiple ? "multiple" : "single_or_unspecified" };
+}
+
 function tokenize(text: string): string[] {
   const normalized = normalizeText(text);
 
@@ -1408,6 +1461,7 @@ function classifyDomain(
   pregunta: string,
   dominio?: DominioBackend
 ): DominioBackend {
+  const intentQuestion = parseQuestionStructure(pregunta).main;
   if (
     dominio === "licencias" ||
     dominio === "estatuto" ||
@@ -1417,8 +1471,8 @@ function classifyDomain(
     return dominio;
   }
 
-  const text = normalizeText(pregunta);
-  const hasExplicitNormReference = parseNormativeReferences(pregunta).length > 0;
+  const text = normalizeText(intentQuestion);
+  const hasExplicitNormReference = parseNormativeReferences(intentQuestion).length > 0;
 
   if (/\b533\s*(?:\/\s*)?(?:21|2021)\b/.test(text)) return "coberturas";
   if (/\b636\s*(?:\/\s*)?2021\b/.test(text)) return "coberturas";
@@ -1430,7 +1484,7 @@ function classifyDomain(
   if (/\b3122\b/.test(text) || text.includes("estatuto")) return "estatuto";
   if (/\b3387\b/.test(text) || text.includes("educacion privada")) return "educacion_privada";
   if (hasExplicitNormReference) {
-    const explicit = parseNormativeReferences(pregunta)[0];
+    const explicit = parseNormativeReferences(intentQuestion)[0];
     const normalizedNumber = explicit.number.replace(/\D/g, "");
     if (explicit.kind === "ley" && explicit.qualifier === "nacional") return "educacion_nacional";
     if (explicit.kind === "ley" && explicit.qualifier === "provincial") return "educacion_provincial";
@@ -1444,7 +1498,11 @@ function classifyDomain(
   const teacherRoleAliases = ["director", "directora", "vicedirector", "vicedirectora", "secretario", "secretaria", "prosecretario", "prosecretaria", "maestro", "maestra", "profesor", "profesora", "preceptor", "preceptora", "bibliotecario", "bibliotecaria", "supervisor", "supervisora", "rector", "rectora", "vicerrector", "vicerrectora", "regente", "regenta", "bedel", "tutor", "tutora", "coordinador", "coordinadora", "ayudante", "maestro de sala", "maestro especial", "cargo docente"];
   const teachingRole = teacherRoleAliases.some((alias) => new RegExp(`(?:^|\\s)${alias.replace(/\s+/g, "\\s+")}(?:$|\\s)`).test(text));
   const coverageIntent = /\b(?:cobertura|asamblea|designaci[oó]n|vacante|suplencia|interinato|cabecera|lom|optar|tomar el cargo)\b/.test(text);
-  const licenseIntent = /\b(?:licencia|licencias|rendir|examen|curso|capacitacion|tratamiento|asuntos? particulares|razones? particulares|familiar enfermo)\b/.test(text);
+  const licenseIntent = /\b(?:licencia|licencias|rendir|examen|curso|capacitacion|tratamiento|asuntos? particulares|razones? particulares|familiar enfermo|fallecimiento|duelo|violencia|donacion)\b/.test(text);
+  const normativeTrainingIntent = licenseIntent
+    && /\b(?:auspicio oficial|regimen|articulo|docente|docentes)\b/.test(text)
+    && /\b(?:capacitacion|congreso|perfeccionamiento|curso|simposio)\b/.test(text);
+  if (normativeTrainingIntent) return "licencias";
   if ((nomenclatorMetrics || nomenclatorComparison) && teachingRole && !coverageIntent && !licenseIntent) return "nomenclador";
 
   if (isGremialAdviceServiceQuestion(pregunta) || isAppNavigationServicesQuestion(pregunta)) {
@@ -1463,6 +1521,8 @@ function classifyDomain(
   if (isServicesQuestion(pregunta)) {
     return "servicios";
   }
+
+  if (licenseIntent) return "licencias";
 
   if (text.includes("estatuto") || text.includes("ley 3122")) {
     return "estatuto";
@@ -1753,6 +1813,7 @@ async function getSourceConfigs(): Promise<SourceConfig[]> {
   if (manifestUrl) {
     try {
       const manifest = (await loadJsonFromSource(manifestUrl)) as SourcesManifest;
+      cachedManifestSources = Array.isArray(manifest.fuentes) ? manifest.fuentes : [];
       cachedInactiveSourceLabels = (manifest.fuentes || []).filter((fuente) => fuente.activo === false)
         .map((fuente) => [fuente.id, fuente.nombre, fuente.referencia].filter(Boolean).join(" "));
 
@@ -2370,6 +2431,8 @@ async function loadLocalChunks(): Promise<LocalChunk[]> {
       },
     );
 
+    cachedSourceLoadStatus = new Map(sources.map((source, index) => [source.id || source.source, resultados[index]?.ok === true]));
+
     const chunks = resultados.flatMap((resultado) => resultado.chunks);
     const cargaCompleta = resultados.length === sources.length &&
       resultados.every((resultado) => resultado.ok);
@@ -2417,6 +2480,56 @@ async function loadLocalChunks(): Promise<LocalChunk[]> {
   }
 }
 
+function manifestSourceMatchesNorm(source: ManifestFuente, requested: ReturnType<typeof parseNormativeReferences>[number]): boolean {
+  const sourceIdentity = [source.id, source.nombre, source.referencia, source.url]
+    .filter(Boolean).join(" ")
+    .replace(/decreto[_ ]ley/gi, "decreto-ley")
+    .replace(/(decreto(?:\s+acuerdo)?|ley|resoluci[oó]n)[-_ ](\d{2,5})[-_ ](\d{4})\b/gi, "$1 $2/$3")
+    .replace(/_/g, " ");
+  return chunkMatchesNormativeReference({ sourceId: sourceIdentity, source: sourceIdentity, norm: sourceIdentity,
+    jurisdiction: String((source as any).jurisdiccion || ""), metadata: source as Record<string, unknown>, text: sourceIdentity }, requested);
+}
+
+function explicitNormativeCorpusLimitation(question: string, chunks: LocalChunk[]): string | null {
+  const norms = Array.from(new Map(parseNormativeReferences(question).map((norm) => [
+    [norm.kind, norm.number, norm.year || "", norm.qualifier || "", norm.jurisdiction || ""].join("|"), norm,
+  ])).values());
+  if (!norms.length) return null;
+  const requestedArticles = extractArticleNumbersFromQuery(question);
+  const limits: string[] = [];
+  for (const norm of norms) {
+    const matchingManifestSources = cachedManifestSources.filter((source) => manifestSourceMatchesNorm(source, norm));
+    const label = `${norm.kind === "decreto-ley" ? "Decreto-Ley" : norm.kind === "decreto" ? "Decreto" : norm.kind === "ley" ? "Ley" : "Resolución"}${norm.qualifier === "acuerdo" ? " Acuerdo" : norm.qualifier ? ` ${norm.qualifier}` : ""} ${norm.number}${norm.year ? `/${norm.year}` : ""}`;
+    if (!matchingManifestSources.length) {
+      limits.push(`${label}: no está incorporada al manifiesto documental activo; no se sustituirá por una norma de temática similar.`);
+      continue;
+    }
+    const activeSources = matchingManifestSources.filter((source) => source.activo === true && source.url);
+    if (!activeSources.length) {
+      limits.push(`${label}: la fuente está inactiva en el manifiesto y no se utiliza para responder.`);
+      continue;
+    }
+    const sourceKey = (source: ManifestFuente) => String(source.id || source.url || "");
+    const matchingLoadedChunks = chunks.filter((chunk) => chunkMatchesNormativeReference({
+      sourceId: chunk.sourceId || chunk.filename, source: chunk.referencia, norm: chunk.norma || chunk.referencia,
+      jurisdiction: String(chunk.metadata?.jurisdiccion || ""), metadata: chunk.metadata, text: chunk.text,
+    }, norm));
+    const sourceIdsInChunks = new Set(matchingLoadedChunks.map((chunk) => String(chunk.sourceId || "")));
+    const hasUnavailableSource = activeSources.some((source) => cachedSourceLoadStatus.get(sourceKey(source)) === false
+      || cachedSourceLoadStatus.get(sourceKey(source)) === undefined);
+    if (!matchingLoadedChunks.length || !activeSources.some((source) => sourceIdsInChunks.has(String(source.id || "")))) {
+      if (hasUnavailableSource) limits.push(`${label}: la fuente está activa, pero no pudo descargarse temporalmente. Probá nuevamente más tarde.`);
+      else limits.push(`${label}: la fuente activa se descargó, pero no produjo fragmentos normativos identificables; no hay respaldo disponible para responder.`);
+      continue;
+    }
+    if (requestedArticles.length) {
+      const missing = requestedArticles.filter((article) => !matchingLoadedChunks.some((chunk) => chunk.kind === "articulo" && articleMatches(chunk, article)));
+      if (missing.length) limits.push(`${label}: la fuente está disponible, pero no contiene el/los artículo/s solicitado/s: ${missing.join(", ")}.`);
+    }
+  }
+  return limits.length ? `No puedo confirmar la respuesta normativa solicitada. ${limits.join(" ")}` : null;
+}
+
 function expandQuestion(pregunta: string, dominio: DominioBackend): string {
   const expansions = getMatchedExpansions(pregunta, dominio);
   const expandedTerms = expansions.flatMap((item) => item.terms).join(" ");
@@ -2438,6 +2551,11 @@ function expandQuestion(pregunta: string, dominio: DominioBackend): string {
 function extractArticleNumbersFromQuery(pregunta: string): string[] {
   const normalized = normalizeText(pregunta);
   const results = new Set<string>();
+  const originalReferences = /\b(?:art(?:í|i)culos?|arts?)\.?\s*(\d+(?:\s*(?:,|y|e)\s*\d+)*)/gi;
+  let originalMatch: RegExpExecArray | null;
+  while ((originalMatch = originalReferences.exec(pregunta)) !== null) {
+    for (const number of originalMatch[1].match(/\d+/g) || []) results.add(number);
+  }
   const references = /\b(?:articulos?|arts?)\.?\s*(\d+(?:\s*(?:,|y|e)\s*\d+)*)/g;
   let match: RegExpExecArray | null;
   while ((match = references.exec(normalized)) !== null) {
@@ -2857,6 +2975,18 @@ function isGenericLicenseQuestion(pregunta: string): boolean {
     text.includes("duelo") ||
     text.includes("fallecimiento") ||
     text.includes("examen") ||
+    text.includes("medica") ||
+    text.includes("medico") ||
+    text.includes("enfermedad") ||
+    text.includes("salud") ||
+    text.includes("tratamiento") ||
+    text.includes("congreso") ||
+    text.includes("conferencia") ||
+    text.includes("simposio") ||
+    text.includes("taller") ||
+    text.includes("curso") ||
+    text.includes("violencia") ||
+    text.includes("donacion") ||
     text.includes("razones particulares") ||
     text.includes("grupo familiar") ||
     text.includes("lactancia") ||
@@ -3004,18 +3134,11 @@ function isMedicalLicenseAfterAppointmentQuestion(pregunta: string): boolean {
     text.includes("cargo docente") ||
     text.includes("cargo");
 
-  const asksMinimumTime =
-    text.includes("a partir") ||
-    text.includes("cuantos dias") ||
-    text.includes("cuanto dias") ||
-    text.includes("desde cuando") ||
-    text.includes("desde que dia") ||
-    text.includes("despues de") ||
-    text.includes("luego de") ||
-    text.includes("plazo") ||
-    text.includes("antiguedad");
+  const namesAppointmentEvent = /\b(?:haber optado|opto por|opte por|optar por|tomar posesion|tomo posesion|haber tomado posesion|tomar cargo|tome cargo|haber tomado un cargo|designad[oa]|designacion|alta en el cargo|asumir el cargo)\b/.test(text);
+  const asksTemporalRelation = /\b(?:a partir de|desde que|desde el momento|despues de|luego de|plazo minimo entre|cuanto tiempo despues|cuantos dias despues)\b/.test(text);
+  const asksMinimumTime = /\b(?:cuantos dias|cuanto tiempo|desde cuando|a partir de cuando|plazo minimo|antiguedad minima)\b/.test(text);
 
-  return mentionsMedicalLicense && mentionsAppointmentOrPosition && asksMinimumTime;
+  return mentionsMedicalLicense && mentionsAppointmentOrPosition && namesAppointmentEvent && asksTemporalRelation && asksMinimumTime;
 }
 
 
@@ -3309,7 +3432,8 @@ function collectPreferredServiceChunks(
 function scoreChunk(
   chunk: LocalChunk,
   pregunta: string,
-  dominio: DominioBackend
+  dominio: DominioBackend,
+  contrastText = ""
 ): number {
   if (chunk.dominio !== dominio) return -1000;
 
@@ -3341,9 +3465,10 @@ function scoreChunk(
     if (!normativeHit.length) return -100000;
   }
 
-  const expanded = expandQuestion(pregunta, dominio);
+  const lexicalQuestion = [pregunta, contrastText].filter(Boolean).join(" ");
+  const expanded = expandQuestion(lexicalQuestion, dominio);
   const queryTokens = tokenize(expanded);
-  const preguntaTokens = tokenize(pregunta);
+  const preguntaTokens = tokenize(lexicalQuestion);
   const expansions = getMatchedExpansions(pregunta, dominio);
 
   const normalizedPregunta = normalizeText(pregunta);
@@ -3861,6 +3986,7 @@ async function searchLocalFragments(
   input: ChatbotQueryInput,
   dominio: DominioBackend,
   documentos?: LocalChunk[],
+  contrastText = "",
 ): Promise<LocalChunk[]> {
   const chunks = documentos || (await loadLocalChunks());
   const maxResults = Math.min(Math.max(input.maxResults ?? 5, 1), 8);
@@ -3869,23 +3995,37 @@ async function searchLocalFragments(
   ])).values());
   const requestedArticles = extractArticleNumbersFromQuery(input.pregunta);
   const asksReasonsAndAffairs = /\brazones? particulares\b/.test(normalizeText(input.pregunta)) && /\basuntos? particulares\b/.test(normalizeText(input.pregunta));
+  const withOptionArticleChunks = (base: LocalChunk[]): LocalChunk[] => {
+    const mainChunks = Array.from(new Map(base.map((chunk) => [chunk.id, chunk])).values());
+    if (!contrastText) return requestedArticles.length > 1 ? mainChunks : mainChunks.slice(0, maxResults);
+    const optionArticles = extractArticleNumbersFromQuery(contrastText);
+    const optionChunks = optionArticles.flatMap((article) => chunks.filter((chunk) => chunk.dominio === dominio
+      && chunk.kind === "articulo" && articleMatches(chunk, article)
+      && (!explicitlyRequestedNorms.length || explicitlyRequestedNorms.some((norm) => chunkMatchesNormativeReference({
+        sourceId: chunk.sourceId || chunk.filename, source: chunk.referencia, norm: chunk.norma || chunk.referencia,
+        jurisdiction: String(chunk.metadata?.jurisdiccion || ""), metadata: chunk.metadata, text: chunk.text,
+      }, norm)))));
+    const optionOnlyChunks = Array.from(new Map(optionChunks.filter((chunk) => !mainChunks.some((main) => main.id === chunk.id))
+      .map((chunk) => [chunk.id, chunk])).values());
+    return [...mainChunks, ...optionOnlyChunks.slice(0, Math.max(0, maxResults - mainChunks.length))];
+  };
 
   if (dominio === "licencias" && explicitlyRequestedNorms.length === 0) {
     if (requestedArticles.length > 1) {
       const allRequestedArticles = requestedArticles.flatMap((article) =>
         chunks.filter((chunk) => chunk.dominio === dominio && chunk.kind === "articulo" && articleMatches(chunk, article)));
-      return Array.from(new Map(allRequestedArticles.map((chunk) => [chunk.id, chunk])).values());
+      return withOptionArticleChunks(Array.from(new Map(allRequestedArticles.map((chunk) => [chunk.id, chunk])).values()));
     }
     if (asksReasonsAndAffairs) {
-      return ["45", "52"].flatMap((article) => chunks.filter((chunk) => chunk.dominio === dominio && chunk.kind === "articulo" && articleMatches(chunk, article)));
+      return withOptionArticleChunks(["45", "52"].flatMap((article) => chunks.filter((chunk) => chunk.dominio === dominio && chunk.kind === "articulo" && articleMatches(chunk, article))));
     }
   }
 
   if (dominio === "licencias" && explicitlyRequestedNorms.length === 0 && requestedArticles.length <= 1) {
     const targetArticle = getSpecificLicenseArticle(input.pregunta);
-    if (targetArticle && ["30", "35", "40", "45", "49", "52", "55"].includes(targetArticle)) {
+    if (targetArticle && ["20", "21", "22", "30", "35", "40", "45", "49", "52", "55"].includes(targetArticle)) {
       const targetChunks = chunks.filter((chunk) => chunk.dominio === dominio && chunk.kind === "articulo" && articleMatches(chunk, targetArticle));
-      if (targetChunks.length) return targetChunks.slice(0, maxResults);
+      if (targetChunks.length) return withOptionArticleChunks(targetChunks);
     }
   }
 
@@ -3897,7 +4037,7 @@ async function searchLocalFragments(
       const matches = chunks.filter((chunk) => chunkMatchesNormativeReference({
         sourceId: chunk.sourceId || chunk.filename, source: chunk.referencia, norm: chunk.norma || chunk.referencia,
         jurisdiction: String(chunk.metadata?.jurisdiccion || ""), metadata: chunk.metadata, text: chunk.text,
-      }, requestedNorm)).map((chunk) => ({ chunk, score: scoreChunk(chunk, input.pregunta, chunk.dominio) }))
+      }, requestedNorm)).map((chunk) => ({ chunk, score: scoreChunk(chunk, input.pregunta, chunk.dominio, contrastText) }))
         .map((match) => {
           const normalizedQuestion = normalizeText(input.pregunta);
           const normalizedText = normalizeText(match.chunk.text);
@@ -3908,7 +4048,7 @@ async function searchLocalFragments(
         .sort((a, b) => b.score - a.score);
       selected.push(...matches.slice(0, perNorm).map(({ chunk }) => chunk));
     }
-    return selected;
+    return withOptionArticleChunks(selected);
   }
 
   if (requestedArticles.length > 1) {
@@ -3918,8 +4058,8 @@ async function searchLocalFragments(
         jurisdiction: String(chunk.metadata?.jurisdiccion || ""), metadata: chunk.metadata, text: chunk.text,
       }, norm)))
       : chunks.filter((chunk) => chunk.dominio === dominio);
-    return Array.from(new Map(requestedArticles.flatMap((article) => normScopedChunks.filter((chunk) =>
-      chunk.kind === "articulo" && articleMatches(chunk, article))).map((chunk) => [chunk.id, chunk])).values());
+    return withOptionArticleChunks(Array.from(new Map(requestedArticles.flatMap((article) => normScopedChunks.filter((chunk) =>
+      chunk.kind === "articulo" && articleMatches(chunk, article))).map((chunk) => [chunk.id, chunk])).values()));
   }
 
   const decreeAndModification = input.pregunta.match(/\b(?:decreto(?:\s+acuerdo)?|dcto\.?\s*acdo\.?)\s*(?:n(?:ro)?[º°.]?\s*)?(\d{2,5})\s*\/\s*(\d{4})/i);
@@ -3938,7 +4078,7 @@ async function searchLocalFragments(
     const annexChunk = decreeChunks.find((chunk) => /articulo\s*2\b/.test(normalizeText(String(chunk.articulo || ""))) || /como anexo ii/.test(normalizeText(chunk.text)));
     const selected = [annexChunk, ...modifyingChunks.filter((chunk) => /anexo ii|modificacion y reemplazo/i.test(`${chunk.titulo || ""} ${chunk.text}`))]
       .filter((chunk): chunk is LocalChunk => Boolean(chunk));
-    if (selected.length) return selected.slice(0, maxResults);
+    if (selected.length) return withOptionArticleChunks(selected);
   }
 
   if (dominio === "servicios") {
@@ -3949,7 +4089,7 @@ async function searchLocalFragments(
     );
 
     if (preferredServiceChunks.length) {
-      return preferredServiceChunks;
+      return withOptionArticleChunks(preferredServiceChunks);
     }
   }
 
@@ -3962,7 +4102,7 @@ async function searchLocalFragments(
     );
 
     if (onlyArticle49.length) {
-      return onlyArticle49;
+      return withOptionArticleChunks(onlyArticle49);
     }
   }
 
@@ -3975,7 +4115,7 @@ async function searchLocalFragments(
     );
 
     if (longTreatmentChunks.length) {
-      return longTreatmentChunks;
+      return withOptionArticleChunks(longTreatmentChunks);
     }
   }
 
@@ -3988,7 +4128,7 @@ async function searchLocalFragments(
     );
 
     if (bereavementChunks.length) {
-      return bereavementChunks;
+      return withOptionArticleChunks(bereavementChunks);
     }
   }
 
@@ -4001,7 +4141,7 @@ async function searchLocalFragments(
     );
 
     if (familyCareChunks.length) {
-      return familyCareChunks;
+      return withOptionArticleChunks(familyCareChunks);
     }
   }
 
@@ -4014,7 +4154,7 @@ async function searchLocalFragments(
     );
 
     if (absenceChunks.length) {
-      return absenceChunks;
+      return withOptionArticleChunks(absenceChunks);
     }
   }
 
@@ -4027,7 +4167,7 @@ async function searchLocalFragments(
     );
 
     if (maternityChunks.length) {
-      return maternityChunks;
+      return withOptionArticleChunks(maternityChunks);
     }
   }
 
@@ -4040,7 +4180,7 @@ async function searchLocalFragments(
     );
 
     if (illnessDuringWorkChunks.length) {
-      return illnessDuringWorkChunks;
+      return withOptionArticleChunks(illnessDuringWorkChunks);
     }
   }
 
@@ -4053,7 +4193,7 @@ async function searchLocalFragments(
     );
 
     if (superpositionChunks.length) {
-      return superpositionChunks;
+      return withOptionArticleChunks(superpositionChunks);
     }
   }
 
@@ -4066,7 +4206,7 @@ async function searchLocalFragments(
     );
 
     if (examChunks.length) {
-      return examChunks;
+      return withOptionArticleChunks(examChunks);
     }
   }
 
@@ -4079,7 +4219,7 @@ async function searchLocalFragments(
     );
 
     if (bloodDonationChunks.length) {
-      return bloodDonationChunks;
+      return withOptionArticleChunks(bloodDonationChunks);
     }
   }
 
@@ -4092,7 +4232,7 @@ async function searchLocalFragments(
     );
 
     if (trainingChunks.length) {
-      return trainingChunks;
+      return withOptionArticleChunks(trainingChunks);
     }
   }
 
@@ -4114,7 +4254,7 @@ async function searchLocalFragments(
     );
 
     if (shortTreatmentChunks.length) {
-      return shortTreatmentChunks;
+      return withOptionArticleChunks(shortTreatmentChunks);
     }
   }
 
@@ -4127,14 +4267,14 @@ async function searchLocalFragments(
     );
 
     if (superpositionChunks.length) {
-      return superpositionChunks;
+      return withOptionArticleChunks(superpositionChunks);
     }
   }
 
   const scored = chunks
     .map((chunk) => ({
       chunk,
-      score: scoreChunk(chunk, input.pregunta, dominio),
+      score: scoreChunk(chunk, input.pregunta, dominio, contrastText),
     }))
     .filter((item) => item.score > 0)
     .sort((a, b) => {
@@ -4146,14 +4286,14 @@ async function searchLocalFragments(
       return 0;
     });
 
-  if (!scored.length) return [];
+  if (!scored.length) return withOptionArticleChunks([]);
 
   const topScore = scored[0]?.score || 0;
   const hasExpansion = matchedExpansions.length > 0;
   const hasDirectArticle = extractArticleNumbersFromQuery(input.pregunta).length > 0;
 
   if (topScore < 12 && !hasExpansion && !hasDirectArticle) {
-    return [];
+    return withOptionArticleChunks([]);
   }
 
   const selected: LocalChunk[] = [];
@@ -4211,7 +4351,7 @@ async function searchLocalFragments(
     }
   }
 
-  return selected.slice(0, maxResults);
+  return withOptionArticleChunks(selected);
 }
 
 function buildContext(chunks: LocalChunk[]): string {
@@ -4318,12 +4458,44 @@ function buildVerbatimArticleAnswer(chunk: LocalChunk): string {
   const trailingLines = content.split(/\r?\n/);
   const finalLine = trailingLines.at(-1)?.trim() || "";
   const separatorBeforeFinal = trailingLines.length > 1 && /^_{5,}$/.test(trailingLines.at(-2)?.trim() || "");
-  const knownArticle45NextSectionHeader = requestedArticle === "45" && normalizeText(finalLine) === "para acompanar al conyuge/concubino";
+  const knownArticle45NextSectionHeader = requestedArticle === "45" && normalizeText(finalLine) === "para acompanar al conyuge concubino";
   if (finalLine && (separatorBeforeFinal || normalizeText(finalLine) === "superposicion de horarios" || knownArticle45NextSectionHeader)) {
     trailingLines.splice(separatorBeforeFinal ? -2 : -1);
     content = trailingLines.join("\n").trimEnd();
   }
   return `${chunk.referencia}\n\n${content}`.trim();
+}
+
+function buildDocumentedLicenseAuthorityAnswer(question: string, chunks: LocalChunk[]): string | null {
+  const text = normalizeText(question);
+  const asksAuthority = /\b(?:autoridad|funcionario|otorgante|anexo ii)\b|\bquien\s+(?:otorga|autoriza|es responsable)\b|\bque\s+(?:organismo|funcionario)\b/.test(text);
+  if (!asksAuthority) return null;
+
+  const askedArticles = extractArticleNumbersFromQuery(question);
+  const topicArticle = askedArticles.length === 1 ? askedArticles[0]
+    : /donacion de sangre/.test(text) ? "50"
+      : /violencia de genero/.test(text) ? "26"
+        : /fallecimiento|muerte del padre|padre.*fallec/.test(text) ? "48"
+          : /grupo familiar|familiar.*enferm/.test(text) ? "30"
+            : null;
+  if (!topicArticle) return null;
+
+  const article = chunks.find((chunk) => chunk.dominio === "licencias" && chunk.kind === "articulo" && articleMatches(chunk, topicArticle));
+  if (!article) return null;
+  const summary = chunks.find((chunk) => chunk.dominio === "licencias" && chunk.kind === "resumen" && articleMatches(chunk, topicArticle));
+  const sections = [
+    `Texto del artículo ${topicArticle}:\n${buildVerbatimArticleAnswer(article).split("\n\n").slice(1).join("\n\n")}`,
+  ];
+
+  if (summary) {
+    sections.unshift(`Autoridad otorgante según la tabla documental “${summary.titulo || "Resumen de Licencia"}”: ${summary.otorgante || "no informado"}. Interviniente: ${summary.interviniente || "no informado"}.`);
+    if (/anexo ii/.test(text)) {
+      sections.push(`La fila consultada figura en “${summary.titulo || "Resumen de Licencia"}” del JSON disponible.`);
+    }
+  } else {
+    sections.push("Información faltante: la tabla “Resumen de Licencia” no contiene una fila del artículo 50 con campos otorgante e interviniente. El texto del artículo 50 indica que debe presentarse el comprobante en el/los establecimiento/s, pero no identifica qué funcionario otorga la justificación. Para documentarlo, hace falta incorporar y validar una fila del artículo 50 en esa tabla con esos campos; no se asigna una autoridad por inferencia.");
+  }
+  return sections.join("\n\n");
 }
 
 function buildDocumentedServiceAnswer(chunks: LocalChunk[], pregunta: string): { answer: string; chunk: LocalChunk | null } | null {
@@ -5156,27 +5328,32 @@ export async function runGroqWorkflow(
   input: ChatbotQueryInput
 ): Promise<ChatbotWorkflowOutput> {
   const workflowStartedAt = Date.now();
+  const parsedQuestion = parseQuestionStructure(input.pregunta);
+  const questionIntent = parsedQuestion.main;
+  const contextIntent = input.contextoConversacional ? parseQuestionStructure(input.contextoConversacional).main : "";
+  const intentQuestionEffective = [questionIntent, contextIntent && `Contexto conversacional previo: ${truncateText(contextIntent, 1200)}`]
+    .filter(Boolean).join("\n");
   const preguntaEfectiva = input.contextoConversacional
     ? `${input.pregunta}\nContexto conversacional previo del mismo usuario: ${truncateText(input.contextoConversacional, 1200)}`
     : input.pregunta;
-  const explicitNormInQuestion = parseNormativeReferences(input.pregunta).length > 0;
-  const asksSingleArticle = /\b(?:art(?:i|í)culo|art)\.?\s*\d+\b/i.test(input.pregunta) && !explicitNormInQuestion;
-  const preliminaryDomain = classifyDomain(preguntaEfectiva, input.dominio);
+  const explicitNormInQuestion = parseNormativeReferences(questionIntent).length > 0;
+  const asksSingleArticle = /\b(?:art(?:i|í)culo|art)\.?\s*\d+\b/i.test(questionIntent) && !explicitNormInQuestion;
+  const preliminaryDomain = classifyDomain(intentQuestionEffective, input.dominio);
   if (asksSingleArticle && !input.contextoConversacional && preliminaryDomain === "general") {
     return buildOutput({ ok: true, tipo: "aclaracion", origen: "local_rag", dominio: input.dominio || "general", consulta: input.pregunta,
       respuesta: "¿De qué norma querés consultar ese artículo? Hay varias normas documentales con artículos de igual numeración; indicá la ley o decreto para evitar una respuesta ambigua.", chunks: [] });
   }
   const dominio = explicitNormInQuestion
-    ? classifyDomain(input.pregunta, input.dominio)
-    : classifyDomain(preguntaEfectiva, input.dominio);
+    ? classifyDomain(questionIntent, input.dominio)
+    : classifyDomain(intentQuestionEffective, input.dominio);
   console.log("[chatbot] request_start", { dominio, conversationContext: Boolean(input.contextoConversacional) });
 
-  if (isStandaloneGreeting(input.pregunta)) {
+  if (isStandaloneGreeting(questionIntent)) {
     return buildOutput({ ok: true, tipo: "respuesta_local", origen: "local_rag", dominio: "general", consulta: input.pregunta,
       respuesta: "¡Hola! ¿En qué puedo ayudarte?", chunks: [] });
   }
 
-  if (isGenericTeacherQuestion(input.pregunta)) {
+  if (isGenericTeacherQuestion(questionIntent)) {
     return buildOutput({
       ok: true,
       tipo: "sin_resultados",
@@ -5189,7 +5366,7 @@ export async function runGroqWorkflow(
     });
   }
 
-  if (isIncompleteTeacherComparisonQuestion(input.pregunta)) {
+  if (isIncompleteTeacherComparisonQuestion(questionIntent)) {
     return buildOutput({
       ok: true,
       tipo: "sin_resultados",
@@ -5202,7 +5379,7 @@ export async function runGroqWorkflow(
     });
   }
 
-  if (isMedicalLicenseAfterAppointmentQuestion(input.pregunta)) {
+  if (isMedicalLicenseAfterAppointmentQuestion(questionIntent)) {
     return buildOutput({
       ok: true,
       tipo: "sin_resultados",
@@ -5215,14 +5392,14 @@ export async function runGroqWorkflow(
     });
   }
 
-  if (dominio === "licencias" && isAmbiguousParticularLicenseQuestion(input.pregunta)) {
+  if (dominio === "licencias" && isAmbiguousParticularLicenseQuestion(questionIntent)) {
     return buildOutput({ ok: true, tipo: "aclaracion", origen: "local_rag", dominio,
       consulta: input.pregunta,
       respuesta: "¿Te referís a la licencia por razones particulares del artículo 52 o a la licencia por asuntos particulares del artículo 45? Son figuras distintas y tienen condiciones diferentes.",
       chunks: [] });
   }
 
-  if (dominio === "licencias" && isGenericLicenseQuestion(input.pregunta)) {
+  if (dominio === "licencias" && isGenericLicenseQuestion(questionIntent)) {
     return buildOutput({
       ok: true,
       tipo: "sin_resultados",
@@ -5235,8 +5412,13 @@ export async function runGroqWorkflow(
     });
   }
 
+  let localDocumentsLoaded = false;
   try {
     const documentos = await loadLocalChunks();
+    localDocumentsLoaded = true;
+    const corpusLimitation = explicitNormativeCorpusLimitation(intentQuestionEffective, documentos);
+    if (corpusLimitation) return buildOutput({ ok: true, tipo: "sin_resultados", origen: "local_rag", dominio,
+      consulta: input.pregunta, respuesta: corpusLimitation, chunks: [] });
     const cacheKey = responseCacheKey(dominio, preguntaEfectiva);
     const useResponseCache = !input.contextoConversacional;
     const cachedResponse = useResponseCache ? getCachedResponse(cacheKey) : null;
@@ -5245,14 +5427,26 @@ export async function runGroqWorkflow(
       return cachedResponse;
     }
 
-    const isComplexRetrieval = isComplexRetrievalQuery(input.pregunta);
-    const adaptiveMaxResults = input.maxResults ?? (isComplexRetrieval ? 5 : 3);
-    const searchInput = { ...input, maxResults: adaptiveMaxResults, pregunta: preguntaEfectiva };
-    const chunks = await searchLocalFragments(searchInput, dominio, documentos);
+    const isComplexRetrieval = isComplexRetrievalQuery(intentQuestionEffective);
+    const adaptiveMaxResults = input.maxResults ?? (isComplexRetrieval || parsedQuestion.options.length ? 5 : 3);
+    const searchInput = { ...input, maxResults: adaptiveMaxResults, pregunta: intentQuestionEffective };
+    const chunks = await searchLocalFragments(searchInput, dominio, documentos, parsedQuestion.optionsText);
     console.log("[chatbot] retrieval_complete", { dominio, motor: "local_rag", fragmentos: chunks.length,
       corpusFingerprint: cachedChunksVersion.slice(0, 12), duracionMs: Date.now() - workflowStartedAt });
 
-    const normalizedLocalQuery = normalizeText(input.pregunta);
+    const normalizedLocalQuery = normalizeText(questionIntent);
+    const authorityAnswer = dominio === "licencias" ? buildDocumentedLicenseAuthorityAnswer(questionIntent, documentos) : null;
+    if (authorityAnswer) {
+      const article = extractArticleNumbersFromQuery(questionIntent)[0]
+        || (/donacion de sangre/.test(normalizedLocalQuery) ? "50" : /violencia de genero/.test(normalizedLocalQuery) ? "26" : "");
+      const authorityChunks = documentos.filter((chunk) => chunk.dominio === "licencias"
+        && (chunk.kind === "articulo" && articleMatches(chunk, article)
+          || chunk.kind === "resumen" && articleMatches(chunk, article)));
+      const response = buildOutput({ ok: true, tipo: "respuesta_local", origen: "local_rag", dominio,
+        consulta: input.pregunta, respuesta: authorityAnswer, chunks: authorityChunks });
+      if (useResponseCache) setCachedResponse(cacheKey, response);
+      return response;
+    }
     const comparesParticularLeaveTypes = dominio === "licencias"
       && /razones particulares/.test(normalizedLocalQuery)
       && /asuntos particulares/.test(normalizedLocalQuery)
@@ -5273,7 +5467,7 @@ export async function runGroqWorkflow(
       }
     }
 
-    const queryArticles = extractArticleNumbersFromQuery(input.pregunta);
+    const queryArticles = extractArticleNumbersFromQuery(questionIntent);
     const asksExactMobilityArticleSix = dominio === "coberturas"
       && /\b533(?:\s*\/\s*|\s+)2021\b/.test(normalizedLocalQuery)
       && /\bque establece\b/.test(normalizedLocalQuery)
@@ -5291,7 +5485,7 @@ export async function runGroqWorkflow(
     }
 
     if (dominio === "nomenclador") {
-      const resolved = resolveNomenclatorQuery(input.pregunta, documentos);
+      const resolved = resolveNomenclatorQuery(questionIntent, documentos);
       if (resolved) {
         const response = buildOutput({ ok: true, tipo: resolved.clarification ? "aclaracion" : "respuesta_local",
           origen: "local_rag", dominio, consulta: input.pregunta, respuesta: resolved.answer, chunks: resolved.chunks });
@@ -5299,9 +5493,9 @@ export async function runGroqWorkflow(
       }
     }
 
-    const requestedArticles = extractArticleNumbersFromQuery(input.pregunta);
+    const requestedArticles = extractArticleNumbersFromQuery(questionIntent);
     const requestedArticle = requestedArticles.length === 1 ? requestedArticles[0] : null;
-    const asksPrivateDecree = /3387/.test(normalizeText(input.pregunta));
+    const asksPrivateDecree = /3387/.test(normalizeText(questionIntent));
     const missingControlChunk = asksPrivateDecree && requestedArticle && documentos.find((chunk) => {
       const control: any = chunk.metadata?.control_documental;
       const refs = Array.isArray(control?.articulos_faltantes) ? control.articulos_faltantes.map(String) : [];
@@ -5323,8 +5517,8 @@ export async function runGroqWorkflow(
     }
 
     if (!chunks.length) {
-      const questionNumbers = (preguntaEfectiva.match(/\d+/g) || []).map((value) => value.replace(/\D/g, ""));
-      const compactQuestionDigits = preguntaEfectiva.replace(/\D/g, "");
+      const questionNumbers = (intentQuestionEffective.match(/\d+/g) || []).map((value) => value.replace(/\D/g, ""));
+      const compactQuestionDigits = intentQuestionEffective.replace(/\D/g, "");
       const inactive = cachedInactiveSourceLabels.find((label) => {
         const normalizedLabel = normalizeText(label).replace(/[^a-z0-9 ]/g, " ");
         const nums = normalizedLabel.match(/\d+/g) || [];
@@ -5377,7 +5571,7 @@ export async function runGroqWorkflow(
         respuesta: `La comparación incluye artículos que la fuente marca como no vigentes; no los presentaré como vigentes ni compararé su texto histórico con disposiciones actuales. ${notices.join(" ")} Consultá por separado los artículos vigentes que quieras analizar.`, chunks: nonCurrentChunks });
     }
 
-    const truncated = requestedArticles.includes("32") && /3387/.test(normalizeText(input.pregunta))
+    const truncated = requestedArticles.includes("32") && /3387/.test(normalizeText(questionIntent))
       ? chunks.find((chunk) => articleMatches(chunk, "32") && /articulo 32 truncado/.test(normalizeText(String((chunk.metadata?.control_documental as any)?.contenido || ""))))
       : undefined;
     if (truncated) {
@@ -5386,7 +5580,7 @@ export async function runGroqWorkflow(
     }
 
     if (dominio === "servicios") {
-      const documented = buildDocumentedServiceAnswer(chunks, input.pregunta);
+      const documented = buildDocumentedServiceAnswer(chunks, questionIntent);
       if (documented) {
         const serviceChunk = documented.chunk;
         const response = buildOutput({ ok: true, tipo: "respuesta_local", origen: "local_rag", dominio,
@@ -5397,10 +5591,11 @@ export async function runGroqWorkflow(
       }
     }
 
-    const requestedArticleForLocalAnswer = extractArticleNumbersFromQuery(input.pregunta);
-    const mappedLicenseArticle = dominio === "licencias" ? getSpecificLicenseArticle(input.pregunta) : null;
-    const deterministicLicenseArticle = dominio === "licencias" && ["45", "52"].includes(mappedLicenseArticle || "");
-    const literalArticleRequest = /\b(?:texto literal|texto completo|transcrib(?:i|ime)|copi(?:a|ame|a)(?:\s+el)?\s+art[ií]culo)\b/i.test(normalizeText(input.pregunta));
+    const requestedArticleForLocalAnswer = extractArticleNumbersFromQuery(questionIntent);
+    const mappedLicenseArticle = dominio === "licencias" ? getSpecificLicenseArticle(questionIntent) : null;
+    const deterministicLicenseArticle = dominio === "licencias" && !parsedQuestion.options.length
+      && ["45", "52"].includes(mappedLicenseArticle || "");
+    const literalArticleRequest = /\b(?:texto literal|texto completo|transcrib(?:i|ime)|copi(?:a|ame|a)(?:\s+el)?\s+art[ií]culo)\b/i.test(normalizeText(questionIntent));
     const explicitArticleQuery = deterministicLicenseArticle || (requestedArticleForLocalAnswer.length === 1 && literalArticleRequest &&
       (explicitNormInQuestion || dominio === "licencias"));
     if (explicitArticleQuery) {
@@ -5428,7 +5623,7 @@ export async function runGroqWorkflow(
           origen: "local_rag_fallback",
           dominio,
           consulta: input.pregunta,
-          respuesta: buildLocalFallbackAnswer(chunks, input.pregunta),
+          respuesta: buildLocalFallbackAnswer(chunks, intentQuestionEffective),
           chunks,
           error: "unsupported_normative_citation_rejected",
         });
@@ -5450,7 +5645,7 @@ export async function runGroqWorkflow(
       const providerErrorCode = String(groqError?.code || "");
       const localAnswer = providerErrorCode === "context_budget_exceeded"
         ? "Los fragmentos completos necesarios exceden el presupuesto estimado para una consulta segura. No recorté artículos ni sus excepciones. Dividí la consulta por artículo o grupo de normas para conservar el texto íntegro."
-        : buildLocalFallbackAnswer(chunks, input.pregunta);
+        : buildLocalFallbackAnswer(chunks, intentQuestionEffective);
       const rateLimit = isRateLimitError(groqError);
 
       console.warn(
@@ -5470,6 +5665,13 @@ export async function runGroqWorkflow(
       });
     }
   } catch {
+    if (!localDocumentsLoaded && cachedSourceLoadStatus.size > 0) {
+      const corpusLimitation = explicitNormativeCorpusLimitation(intentQuestionEffective, []);
+      if (corpusLimitation) {
+        return buildOutput({ ok: true, tipo: "sin_resultados", origen: "local_rag", dominio,
+          consulta: input.pregunta, respuesta: corpusLimitation, chunks: [] });
+      }
+    }
     console.error("[groqWorkflow] workflow_error", {
       code: "workflow_error",
     });

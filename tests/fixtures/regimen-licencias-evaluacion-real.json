@@ -1,0 +1,37 @@
+[
+  {
+    "articulo": 26,
+    "contenido": "[ARTÍCULO 26°]\nARTÍCULO 26°.- En los casos en los que el/la docente víctima de violencia de género deba ausentarse por tal motivo de su puesto de trabajo, esta inasistencia sea total o parcial, contará con la debida justificación emitida por los servicios de atención y asistencia a las víctimas de tal flagelo, los que evaluarán las condiciones y tiempo de la referida licencia.\nAsimismo, el personal víctima de violencia de género, para hacer efectiva su protección o su derecho a ser asistido integralmente, tendrá derecho a la reducción de la jornada o a la reordenación de tiempo de trabajo o del lugar de origen del mismo, mediante la certificación pertinente acreditativa del hecho.\nEl jerárquico inmediatamente superior del docente afectado será el responsable de otorgar la presente licencia.\n________________________________________\nMATERNIDAD"
+  },
+  {
+    "articulo": 30,
+    "contenido": "[ARTÍCULO 30°]\nARTÍCULO 30°.- Para consagrarse a la atención de un miembro del grupo familiar que se encuentre enfermo o accidentado y requiera la atención personal del docente, se otorgará a éste hasta quince (15) días corridos por año calendario, continuos o discontinuos, con goce íntegro de haberes.\nEsta licencia podrá ampliarse hasta cuarenta y cinco (45) días corridos más sin goce de haberes.\nSolo en casos excepcionales, a pedido fundado de parte, el plazo previsto podrá ampliarse hasta la finalización del calendario escolar, por períodos continuos, siempre que el informe de Junta Médica y del Área de Asistencia Social así lo justifique.\nA los efectos de esta licencia, se determina que el grupo familiar lo constituyen: cónyuge e hijo/s, padre, madre, hermanos menores o incapaces, nietos (cuando estén a cargo o sean convivientes debidamente comprobados).\nToda tercera persona a cargo del docente podrá ser considerada por tenencia, guarda o tutela que se acredite fehacientemente por autoridad judicial o sentencia firme ante la autoridad escolar inmediata.\n________________________________________\nMATRIMONIO DEL DOCENTE"
+  },
+  {
+    "articulo": 35,
+    "contenido": "[ARTÍCULO 35°]\nARTÍCULO 35°.- Para rendir examen, se concederá licencia remunerada hasta un total de treinta (30) días anuales, laborables continuos o discontinuos, para rendir exámenes finales de nivel superior, universitario o de post-grado, por año calendario, siempre que los mismos se rindan en establecimientos de enseñanza oficial o incorporados o en universidades privadas reconocidas por el Gobierno de la Nación o de la Provincia.\nAl presentar la solicitud de licencia, el docente deberá indicar la fecha de examen, siendo suficiente esta declaración, que tendrá el carácter de jurada, para que la licencia se conceda.\nEste beneficio será acordado en plazos de hasta cinco (5) días por cada examen de nivel superior, universitario o postgrado.\nEl agente tendrá la obligación de reintegrarse el día inmediato posterior al examen, aunque no hubiera agotado el término establecido.\nEn caso de coincidencia de más de una materia en el mismo día, el docente tendrá derecho a licencia por cada materia.\nEn el caso de producirse la postergación de la mesa examinadora, se justificará la presente licencia mediante la presentación de constancia correspondiente.\nNo se considerarán exámenes las pruebas cuatrimestrales o parciales.\nSi no hubiere rendido examen por causa que le fuera imputable o no presente el certificado respectivo, el otorgamiento quedará sin efecto, los días de inasistencia serán injustificados y sin goce de haberes.\nNo podrá concederse esta licencia a los docentes en los primeros y últimos quince (15) días hábiles del ciclo lectivo."
+  },
+  {
+    "articulo": 41,
+    "contenido": "[ARTÍCULO 41°]\nARTÍCULO 41°.- Los docentes contarán con DIEZ (10) días hábiles anuales, continuos o discontinuos para realizar Capacitación y/o Perfeccionamiento en: Talleres, Congresos, Cursos, Conferencias, Simposios, o cualquier otra actividad cultural organizada por organismos públicos de Auspicio Oficial, tendientes a propender el perfeccionamiento de su capacidad pedagógica.\nPara hacer uso de la presente licencia, los docentes deberán comunicar mediante nota, con mención de lugar y fecha en que se realizará la misma, y de los temas a considerar a las Autoridades de los establecimientos donde preste servicio, con CINCO (5) días de anticipación del inicio del encuentro.\nCuando el beneficio sea utilizado por los Directores o Rectores, estos deberán efectuar la comunicación en igual plazo al superior jerárquico del cual dependan.\nLICENCIAS EXTRAORDINARIAS SIN GOCE DE HABERES\nCANDIDATURA A CARGOS ELECTIVOS"
+  },
+  {
+    "articulo": 48,
+    "contenido": "[ARTÍCULO 48°]\nARTICULO 48°.- El docente tendrá derecho a licencia remunerada por los términos que a continuación se detallan, en los casos de fallecimiento de parientes consanguíneos o afines:\na) Diez (10) días por fallecimiento de cónyuge/conviviente, padres e hijos del docente.\nb) Cinco (5) días por fallecimiento de hermanos, abuelos, nietos, suegros, hermanos políticos, hijastros, hijos políticos o personas a cargo.\nc) Un (1) día (el día del sepelio) por fallecimiento de parientes de 3er. y 4to. grado: primos hermanos, tíos, sobrinos, bisabuelos, bisnietos, tíos abuelos.\n________________________________________"
+  },
+  {
+    "articulo": 49,
+    "contenido": "[ARTÍCULO 49°]\nARTICULO 49°.- La justificación de inasistencia motivadas por fenómenos meteorológicos y casos de fuerza mayor debidamente comprobados serán acordadas conforme el presente artículo.\n________________________________________\nCAPITULO VI - JUSTIFICACIÓN DE INASISTENCIAS"
+  },
+  {
+    "articulo": 50,
+    "contenido": "[ARTÍCULO 50°]\nARTICULO 50°.- Toda inasistencia motivada por donación de sangre será justificada por UN (01) día con goce de haberes, siempre que el docente presente el comprobante respectivo en el/los establecimiento/s que correspondiere.\nEsta inasistencia justificada no será tenida en cuenta para la calificación anual.\n________________________________________\nDONACIÓN DE ÓRGANOS"
+  },
+  {
+    "titulo": "Resumen de Licencia",
+    "tipo": "tabla",
+    "contenido": [
+      { "articulo": "26", "descripcion": "Por Violencia de Género", "otorgante": "Director de Nivel", "interviniente": "Director Unidad Escolar" }
+    ]
+  }
+]
