@@ -155,6 +155,11 @@ let loadingChunksPromise: Promise<LocalChunk[]> | null = null;
 let cachedSourceConfigs: SourceConfig[] | null = null;
 let cachedInactiveSourceLabels: string[] = [];
 const SOURCE_LOAD_CONCURRENCY = 4;
+// El enfriamiento y la cola viven en memoria por instancia de Cloud Run; no representan una cuota global.
+const GROQ_MAX_QUEUED_REQUESTS = 8;
+const GROQ_QUEUE_WAIT_TIMEOUT_MS = 1500;
+// Presupuesto estimado local: 1.000 tokens de margen sobre el TPM observado de 8.000.
+const GROQ_ESTIMATED_TPM_BUDGET = 7000;
 const RESPONSE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const RESPONSE_CACHE_MAX_ENTRIES = 500;
 
@@ -166,9 +171,14 @@ type CachedChatbotResponse = {
 const responseCache = new Map<string, CachedChatbotResponse>();
 type WorkflowTestDependencies = { fetchJson?: (url: string) => Promise<unknown>; now?: () => number; groqClient?: OpenAI | null };
 let workflowTestDependencies: WorkflowTestDependencies = {};
+let groqCooldownUntil = 0;
+let groqCooldownReason = "";
+let groqQueue: Promise<void> = Promise.resolve();
+let groqQueueDepth = 0;
 export function setWorkflowTestDependencies(dependencies: WorkflowTestDependencies = {}): void {
   workflowTestDependencies = dependencies;
   cachedChunks = null; cachedChunksComplete = null; cachedAt = 0; cachedChunksVersion = ""; loadingChunksPromise = null; cachedSourceConfigs = null; cachedInactiveSourceLabels = []; responseCache.clear();
+  groqCooldownUntil = 0; groqCooldownReason = ""; groqQueue = Promise.resolve(); groqQueueDepth = 0;
 }
 export function updateWorkflowTestDependencies(dependencies: WorkflowTestDependencies = {}): void {
   workflowTestDependencies = { ...workflowTestDependencies, ...dependencies };
@@ -1408,15 +1418,34 @@ function classifyDomain(
   }
 
   const text = normalizeText(pregunta);
+  const hasExplicitNormReference = parseNormativeReferences(pregunta).length > 0;
 
   if (/\b533\s*(?:\/\s*)?(?:21|2021)\b/.test(text)) return "coberturas";
   if (/\b636\s*(?:\/\s*)?2021\b/.test(text)) return "coberturas";
-  if (/\b(?:2431\s*(?:\/\s*)?2016|2453\s*(?:\/\s*)?2019|1480\s*(?:\/\s*)?2019)\b/.test(text) || text.includes("nomenclador")) return "nomenclador";
-  if (text.includes("centro educativo") || text.includes("centros educativos") || text.includes("jardin maternal") || text.includes("jardines maternales") || text.includes("pasitos cuidados")) return "nomenclador";
+  if (/\b(?:2431\s*(?:\/\s*)?2016|2453\s*(?:\/\s*)?2019|1480\s*(?:\/\s*)?2019)\b/.test(text) || (!hasExplicitNormReference && text.includes("nomenclador"))) return "nomenclador";
+  if (!hasExplicitNormReference && (text.includes("centro educativo") || text.includes("centros educativos") || text.includes("jardin maternal") || text.includes("jardines maternales") || text.includes("pasitos cuidados"))) return "nomenclador";
   if (/\b26\s*\.?\s*058\b/.test(text)) return "educacion_tecnico_profesional";
   if (/\b26\s*\.?\s*206\b/.test(text)) return "educacion_nacional";
   if (/\b5381\b/.test(text)) return "educacion_provincial";
+  if (/\b3122\b/.test(text) || text.includes("estatuto")) return "estatuto";
   if (/\b3387\b/.test(text) || text.includes("educacion privada")) return "educacion_privada";
+  if (hasExplicitNormReference) {
+    const explicit = parseNormativeReferences(pregunta)[0];
+    const normalizedNumber = explicit.number.replace(/\D/g, "");
+    if (explicit.kind === "ley" && explicit.qualifier === "nacional") return "educacion_nacional";
+    if (explicit.kind === "ley" && explicit.qualifier === "provincial") return "educacion_provincial";
+    if (explicit.kind === "decreto-ley" && normalizedNumber === "3387") return "educacion_privada";
+    if (explicit.kind === "decreto" && normalizedNumber === "1092") return "licencias";
+    if (/\b(?:licencia|licencias|inasistencia|maternidad|tratamiento|franquicia)\b/.test(text)) return "licencias";
+    return "general";
+  }
+  const nomenclatorMetrics = /\b(?:horas? (?:reloj|catedra)|minutos? reloj|carga horaria|punt(?:os?|aje)|incompatibilidad|jornada)\b/.test(text);
+  const nomenclatorComparison = /\b(?:comparar|comparacion|compara|compar[aá]|diferencias?|versus|vs|contra)\b/.test(text);
+  const teacherRoleAliases = ["director", "directora", "vicedirector", "vicedirectora", "secretario", "secretaria", "prosecretario", "prosecretaria", "maestro", "maestra", "profesor", "profesora", "preceptor", "preceptora", "bibliotecario", "bibliotecaria", "supervisor", "supervisora", "rector", "rectora", "vicerrector", "vicerrectora", "regente", "regenta", "bedel", "tutor", "tutora", "coordinador", "coordinadora", "ayudante", "maestro de sala", "maestro especial", "cargo docente"];
+  const teachingRole = teacherRoleAliases.some((alias) => new RegExp(`(?:^|\\s)${alias.replace(/\s+/g, "\\s+")}(?:$|\\s)`).test(text));
+  const coverageIntent = /\b(?:cobertura|asamblea|designaci[oó]n|vacante|suplencia|interinato|cabecera|lom|optar|tomar el cargo)\b/.test(text);
+  const licenseIntent = /\b(?:licencia|licencias|rendir|examen|curso|capacitacion|tratamiento|asuntos? particulares|razones? particulares|familiar enfermo)\b/.test(text);
+  if ((nomenclatorMetrics || nomenclatorComparison) && teachingRole && !coverageIntent && !licenseIntent) return "nomenclador";
 
   if (isGremialAdviceServiceQuestion(pregunta) || isAppNavigationServicesQuestion(pregunta)) {
     return "servicios";
@@ -2409,15 +2438,10 @@ function expandQuestion(pregunta: string, dominio: DominioBackend): string {
 function extractArticleNumbersFromQuery(pregunta: string): string[] {
   const normalized = normalizeText(pregunta);
   const results = new Set<string>();
-
-  const regexes = [/articulo\s+(\d+)/g, /art\s+(\d+)/g, /art\s*(\d+)/g];
-
-  for (const regex of regexes) {
-    let match: RegExpExecArray | null;
-
-    while ((match = regex.exec(normalized)) !== null) {
-      if (match[1]) results.add(match[1]);
-    }
+  const references = /\b(?:articulos?|arts?)\.?\s*(\d+(?:\s*(?:,|y|e)\s*\d+)*)/g;
+  let match: RegExpExecArray | null;
+  while ((match = references.exec(normalized)) !== null) {
+    for (const number of match[1].match(/\d+/g) || []) results.add(number);
   }
 
   return Array.from(results);
@@ -2719,6 +2743,35 @@ function isTrainingLicenseQuestion(pregunta: string): boolean {
     text.includes("simposio") ||
     text.includes("actualizacion profesional")
   );
+}
+
+function getSpecificLicenseArticle(pregunta: string): string | null {
+  const requestedArticles = extractArticleNumbersFromQuery(pregunta);
+  if (requestedArticles.length > 1) return null;
+  const text = normalizeText(pregunta);
+  if (/\brazones? particulares\b/.test(text) && /\basuntos? particulares\b/.test(text)) return null;
+  const explicitArticle = pregunta.match(/\b(?:art(?:i|í)culo|art)\.?\s*(\d+)\b/i)?.[1];
+  if (explicitArticle) return explicitArticle;
+  if (/\brazones? particulares\b/.test(text)) return "52";
+  if (/\basuntos? particulares\b/.test(text)) return "45";
+  if (isLongTreatmentQuestion(pregunta)) return "20";
+  if (isShortTreatmentQuestion(pregunta)) return "16";
+  if (isFamilyCareQuestion(pregunta)) return "30";
+  if (isExamLicenseQuestion(pregunta)) return "35";
+  if (isTrainingLicenseQuestion(pregunta)) return "41";
+  if (isGremialRepresentationLicenseQuestion(pregunta)) return "40";
+  if (isClimateQuestion(pregunta)) return "49";
+  if (/\b(?:festividad(?:es)? religiosa(?:s)?|credo no catolico|religiones? no catolicas?)\b/.test(text)) return "55";
+  return null;
+}
+
+function isAmbiguousParticularLicenseQuestion(pregunta: string): boolean {
+  const text = normalizeText(pregunta);
+  if (!/\bparticular(?:es)?\b/.test(text)) return false;
+  if (/\brazones? particulares\b/.test(text) && /\basuntos? particulares\b/.test(text)) return false;
+  if (/\brazones? particulares\b|\basuntos? particulares\b/.test(text)) return false;
+  const article = pregunta.match(/\b(?:art(?:i|í)culo|art)\.?\s*(\d+)\b/i)?.[1];
+  return article !== "45" && article !== "52";
 }
 
 function isSuperpositionQuestion(pregunta: string): boolean {
@@ -3230,6 +3283,12 @@ function collectPreferredServiceChunks(
   const preferredIds = Array.from(
     new Set(matched.flatMap((item) => item.preferredIds).map(normalizeText))
   );
+  const isCertificateRequest = /\bcertificados?\b/.test(normalizeText(pregunta)) && !/certificado medico/.test(normalizeText(pregunta));
+  if (isCertificateRequest) {
+    const certificateId = normalizeText("sidca_certificados");
+    const contactId = normalizeText("sidca_contactos_institucionales");
+    preferredIds.splice(0, preferredIds.length, ...[certificateId, contactId].filter((id) => preferredIds.includes(id)));
+  }
 
   if (!preferredIds.length) return [];
 
@@ -3265,7 +3324,7 @@ function scoreChunk(
   if (explicitCommonSchool && sourceIdNormalized.includes("centros educativos")) return -100000;
   if (explicitCommonSchool && sourceIdNormalized.includes("jardines maternales")) return -100000;
   const normativeQuery = !comparativeNorms && /\b(?:ley|decreto(?:[- ]ley)?|resoluci[oó]n)\s*(?:n(?:ro)?[º°.]?\s*)?\d[\d.]*(?:\s*\/\s*\d{2,4})?/i.test(pregunta);
-  const requestedArticle = /\b(?:art(?:i|í)culo|art)\.?\s*\d+/i.test(pregunta);
+  const requestedArticle = extractArticleNumbersFromQuery(pregunta).length > 0;
   if (normativeQuery || requestedArticle) {
     const normativeHit = rankNormative([{
       sourceId: chunk.sourceId || chunk.filename,
@@ -3805,11 +3864,32 @@ async function searchLocalFragments(
 ): Promise<LocalChunk[]> {
   const chunks = documentos || (await loadLocalChunks());
   const maxResults = Math.min(Math.max(input.maxResults ?? 5, 1), 8);
-
   const explicitlyRequestedNorms = Array.from(new Map(parseNormativeReferences(input.pregunta).map((reference) => [
     [reference.kind, reference.number, reference.year || "", reference.qualifier || "", reference.jurisdiction || ""].join("|"), reference,
   ])).values());
-  const isMultiNormComparison = /diferencias|comparar|comparaci[oó]n|relaci[oó]n|entre/i.test(input.pregunta) && explicitlyRequestedNorms.length > 1;
+  const requestedArticles = extractArticleNumbersFromQuery(input.pregunta);
+  const asksReasonsAndAffairs = /\brazones? particulares\b/.test(normalizeText(input.pregunta)) && /\basuntos? particulares\b/.test(normalizeText(input.pregunta));
+
+  if (dominio === "licencias" && explicitlyRequestedNorms.length === 0) {
+    if (requestedArticles.length > 1) {
+      const allRequestedArticles = requestedArticles.flatMap((article) =>
+        chunks.filter((chunk) => chunk.dominio === dominio && chunk.kind === "articulo" && articleMatches(chunk, article)));
+      return Array.from(new Map(allRequestedArticles.map((chunk) => [chunk.id, chunk])).values());
+    }
+    if (asksReasonsAndAffairs) {
+      return ["45", "52"].flatMap((article) => chunks.filter((chunk) => chunk.dominio === dominio && chunk.kind === "articulo" && articleMatches(chunk, article)));
+    }
+  }
+
+  if (dominio === "licencias" && explicitlyRequestedNorms.length === 0 && requestedArticles.length <= 1) {
+    const targetArticle = getSpecificLicenseArticle(input.pregunta);
+    if (targetArticle && ["30", "35", "40", "45", "49", "52", "55"].includes(targetArticle)) {
+      const targetChunks = chunks.filter((chunk) => chunk.dominio === dominio && chunk.kind === "articulo" && articleMatches(chunk, targetArticle));
+      if (targetChunks.length) return targetChunks.slice(0, maxResults);
+    }
+  }
+
+  const isMultiNormComparison = /\b(?:comparar|comparacion|compara|comparan|comparando|comparado|diferencias?|relacion|entre|versus|vs)\b/i.test(normalizeText(input.pregunta)) && explicitlyRequestedNorms.length > 1;
   if (isMultiNormComparison) {
     const perNorm = Math.max(1, Math.floor(maxResults / explicitlyRequestedNorms.length));
     const selected: LocalChunk[] = [];
@@ -3828,7 +3908,18 @@ async function searchLocalFragments(
         .sort((a, b) => b.score - a.score);
       selected.push(...matches.slice(0, perNorm).map(({ chunk }) => chunk));
     }
-    return selected.slice(0, maxResults);
+    return selected;
+  }
+
+  if (requestedArticles.length > 1) {
+    const normScopedChunks = explicitlyRequestedNorms.length
+      ? chunks.filter((chunk) => explicitlyRequestedNorms.some((norm) => chunkMatchesNormativeReference({
+        sourceId: chunk.sourceId || chunk.filename, source: chunk.referencia, norm: chunk.norma || chunk.referencia,
+        jurisdiction: String(chunk.metadata?.jurisdiccion || ""), metadata: chunk.metadata, text: chunk.text,
+      }, norm)))
+      : chunks.filter((chunk) => chunk.dominio === dominio);
+    return Array.from(new Map(requestedArticles.flatMap((article) => normScopedChunks.filter((chunk) =>
+      chunk.kind === "articulo" && articleMatches(chunk, article))).map((chunk) => [chunk.id, chunk])).values());
   }
 
   const decreeAndModification = input.pregunta.match(/\b(?:decreto(?:\s+acuerdo)?|dcto\.?\s*acdo\.?)\s*(?:n(?:ro)?[º°.]?\s*)?(\d{2,5})\s*\/\s*(\d{4})/i);
@@ -4126,6 +4217,10 @@ async function searchLocalFragments(
 function buildContext(chunks: LocalChunk[]): string {
   return chunks
     .map((chunk, index) => {
+      const structuredRecord = chunk.dominio === "nomenclador" ? getNomenclatorRecord(chunk) : null;
+      const content = structuredRecord && (structuredRecord.categoria || structuredRecord.titulo_articulo)
+        ? renderNomenclatorRecord(chunk, structuredRecord)
+        : chunk.kind === "articulo" ? buildVerbatimArticleAnswer(chunk) : truncateText(chunk.text, 1200);
       const parts = [
         `### Fragmento ${index + 1}`,
         `Archivo: ${chunk.filename}`,
@@ -4143,7 +4238,7 @@ function buildContext(chunks: LocalChunk[]): string {
         chunk.interviniente
           ? `Funcionario interviniente: ${chunk.interviniente}`
           : "",
-        `Contenido:\n${truncateText(chunk.text, 2400)}`,
+        `Contenido:\n${content}`,
       ];
 
       return parts.filter(Boolean).join("\n");
@@ -4156,6 +4251,16 @@ function buildLocalFallbackAnswer(
   pregunta: string,
 ): string {
   if (!chunks.length) return NO_ENCONTRADO;
+
+  const requestedArticles = extractArticleNumbersFromQuery(pregunta);
+  const multiNormOrArticleQuery = parseNormativeReferences(pregunta).length > 1 || requestedArticles.length > 1;
+  const directArticle = requestedArticles.length === 1
+    ? chunks.find((chunk) => chunk.kind === "articulo" && articleMatches(chunk, requestedArticles[0]))
+    : undefined;
+  if (!multiNormOrArticleQuery && directArticle) return buildVerbatimArticleAnswer(directArticle);
+  if (!multiNormOrArticleQuery && chunks[0]?.kind === "articulo" && scoreChunk(chunks[0], pregunta, chunks[0].dominio) >= 20) {
+    return buildVerbatimArticleAnswer(chunks[0]);
+  }
 
   if (chunks[0]?.dominio === "servicios") {
     const primary = chunks[0];
@@ -4196,6 +4301,276 @@ function buildLocalFallbackAnswer(
       : "La documentación disponible identifica el artículo relacionado. Podés abrirlo para consultar el texto completo.",
     `Base normativa: ${title}.`,
   ].join("\n\n");
+}
+
+function buildVerbatimArticleAnswer(chunk: LocalChunk): string {
+  let content = getObjectField(chunk.raw, ["contenido", "content", "texto", "text"]) || chunk.text;
+  const requestedArticle = String(chunk.articulo || "").match(/\d+/)?.[0];
+  const headings = Array.from(content.matchAll(/^[\t ]*\[?ART[IÍ]CULO[\t ]*(\d+)(?=\D|$)[^\n]*/gim));
+  const firstHeadingIndex = headings.findIndex((heading) => !requestedArticle || heading[1] === requestedArticle);
+  if (firstHeadingIndex >= 0) {
+    const firstHeading = headings[firstHeadingIndex];
+    const nextHeading = headings.slice(firstHeadingIndex + 1).find((heading) => heading[1] !== requestedArticle);
+    const startIndex = firstHeading.index ?? 0;
+    const endIndex = nextHeading?.index ?? content.length;
+    content = content.slice(startIndex, endIndex).trim();
+  }
+  return `${chunk.referencia}\n\n${content}`.trim();
+}
+
+function buildDocumentedServiceAnswer(chunks: LocalChunk[], pregunta: string): { answer: string; chunk: LocalChunk | null } | null {
+  const normalizedQuestion = normalizeText(pregunta);
+  const isCertificateRequest = /\bcertificados?\b/.test(normalizedQuestion) && !/certificado medico/.test(normalizedQuestion);
+  const primary = isCertificateRequest
+    ? chunks.find((chunk) => getServiceItemId(chunk) === normalizeText("sidca_certificados"))
+    : undefined;
+  if (isCertificateRequest && !primary) {
+    return { answer: "No encontré una ficha documental específica de certificados con instrucciones confirmadas. La información disponible sobre capacitaciones no permite inferir el procedimiento para obtener o descargar un certificado; hace falta actualizar la documentación de certificados antes de orientar el trámite.", chunk: null };
+  }
+  const service = primary || chunks.find((chunk) => chunk.dominio === "servicios");
+  if (!service) return null;
+  const suggested = getObjectField(service.raw, ["respuesta_sugerida"]);
+  const title = service.titulo || getObjectField(service.raw, ["titulo_articulo", "categoria", "titulo"]) || "el servicio";
+  if (!suggested) return { answer: `La documentación identifica ${title}, pero no incluye una respuesta_sugerida con instrucciones suficientes. Hace falta documentar el procedimiento confirmado antes de orientar al usuario.`, chunk: service };
+  const asksDownload = /\b(?:descarg|imprim|obten|baj[aá]r?)\w*\b/.test(normalizedQuestion);
+  if (isCertificateRequest && asksDownload) {
+    return { answer: `La ficha documental “${title}” indica: ${suggested.trim()}\n\nLa fuente no confirma que la ruta ni el estado de impresión reflejen la versión actual de la APP SIDCA. No puedo confirmar el procedimiento vigente; hace falta actualizar y validar esta ficha antes de orientar la descarga.`, chunk: service };
+  }
+  return { answer: suggested.trim(), chunk: service };
+}
+
+type NomenclatorResolution = { answer: string; chunks: LocalChunk[]; clarification?: boolean };
+
+type NomenclatorCandidate = {
+  chunk: LocalChunk;
+  record: Record<string, any>;
+  category: string;
+  identity: string;
+  sourceKind: "common" | "centers" | "gardens" | "other";
+  roleAnchor: string;
+  roleDetails: string[];
+  pof: boolean;
+  institution: string;
+};
+
+function getNomenclatorRecord(chunk: LocalChunk): Record<string, any> | null {
+  return chunk.raw && typeof chunk.raw === "object" && !Array.isArray(chunk.raw)
+    ? chunk.raw as Record<string, any>
+    : null;
+}
+
+function nomenclatorRecordIdentity(chunk: LocalChunk, record: Record<string, any>): string {
+  return normalizeText(`${chunk.sourceId || ""} ${chunk.filename} ${chunk.referencia} ${record.normativa || ""} ${record.documento || ""} ${record.titulo_documento || ""}`);
+}
+
+function isNomenclatorPof(record: Record<string, any>): boolean {
+  return /pof|anexo unico\s*[–-]?\s*escuela|planta organica/.test(normalizeText(`${record.tipo || ""} ${record.alcance || ""} ${record.titulo_articulo || ""} ${record.articulo || ""}`));
+}
+
+function normalizeCargoLabel(value: string): string {
+  return normalizeText(value)
+    .replace(/\b(director|vicedirector|maestro|profesor|secretario|prosecretario|preceptor|bibliotecario|supervisor|rector|vicerrector) a\b/g, "$1")
+    .replace(/\b(vicedirector|vicerrector)\s+de\b/g, "$1 de");
+}
+
+function cargoAnchorAndDetails(value: string): { anchor: string; details: string[] } {
+  const normalized = normalizeCargoLabel(value).replace(/\bjornada\b.*$/i, "");
+  const tokens = normalized.split(/\s+/).filter(Boolean);
+  const ignored = new Set(["cargo", "docente", "nivel", "categoria", "de", "del", "la", "el", "las", "los", "y", "en", "para", "con"]);
+  const roleIndex = tokens.findIndex((token) => !ignored.has(token));
+  if (roleIndex < 0) return { anchor: "", details: [] };
+  const anchor = tokens[roleIndex];
+  const detailIgnored = new Set([...ignored, "educacion", "comun", "unidad", "institucional", "jardin", "maternal", "escuela", "inicial", "primario", "primaria", "secundario", "secundaria", "superior", "artistica", "tecnico", "tecnica", "jornada", "completa", "extendida", "simple", "js", "jc"]);
+  return { anchor, details: tokens.slice(roleIndex + 1).filter((token) => !detailIgnored.has(token) && token.length > 2) };
+}
+
+function nomenclatorSourceKind(identity: string): NomenclatorCandidate["sourceKind"] {
+  if (/2453|centros educativos/.test(identity)) return "centers";
+  if (/1480|jardines maternales|pasitos cuidados/.test(identity)) return "gardens";
+  if (/2431|nomenclador docente/.test(identity)) return "common";
+  return "other";
+}
+
+function nomenclatorJornada(candidate: NomenclatorCandidate): string {
+  const normalized = normalizeText(`${candidate.record.jornada || ""} ${candidate.category}`);
+  if (/jornada completa|\bjc\b/.test(normalized)) return "completa";
+  if (/jornada extendida/.test(normalized)) return "extendida";
+  if (/jornada simple|\bjs\b/.test(normalized)) return "simple";
+  return "";
+}
+
+function nomenclatorLevel(candidate: NomenclatorCandidate): string {
+  return normalizeText(`${candidate.record.nivel_modalidad || ""} ${candidate.record.nivel_educativo || ""} ${candidate.record.nivel || ""} ${candidate.record.modalidad || ""}`);
+}
+
+function nomenclatorComparisonSegments(question: string, roleAnchors: string[]): string[] {
+  const normalized = normalizeCargoLabel(question);
+  const explicit = normalized.split(/\s+\b(?:vs\.?|versus|contra)\b\s+/i).map((part) => part.trim()).filter(Boolean);
+  if (explicit.length > 1) return explicit;
+  const anchors = roleAnchors.sort((left, right) => right.length - left.length).map((value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  if (!anchors.length) return [normalized];
+  const anchorPattern = `(?:${anchors.join("|")})`;
+  const separator = new RegExp(`\\s+(?:con|y)\\s+(?=(?:(?:un|una|el|la)\\s+)?${anchorPattern}\\b)`, "i");
+  return normalized.split(separator).map((part) => part.trim()).filter(Boolean);
+}
+
+function getNomenclatorNumber(record: Record<string, any>, keys: string[]): number | null {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (typeof value === "string" && /^\d+(?:\.\d+)?$/.test(value.trim())) return Number(value);
+  }
+  return null;
+}
+
+function renderNomenclatorRecord(chunk: LocalChunk, record: Record<string, any>): string {
+  const category = String(record.categoria || record.titulo_articulo || record.titulo || record.nombre || "Cargo sin denominación");
+  const norm = String(record.normativa || record.documento || record.fuente || chunk.referencia);
+  const normalizedCategory = normalizeText(category);
+  const jornada = record.jornada || (normalizedCategory.includes("jornada completa") || /\bjc\b/.test(normalizedCategory) ? "Completa" : normalizedCategory.includes("jornada extendida") ? "Extendida" : normalizedCategory.includes("jornada simple") || /\bjs\b/.test(normalizedCategory) ? "Simple" : "");
+  const hours = getNomenclatorNumber(record, ["horas_reloj_semanales"]);
+  const chairHours = getNomenclatorNumber(record, ["horas_catedra_semanales", "horas_catedra"]);
+  const clockMinutes = getNomenclatorNumber(record, ["minutos_reloj_semanales", "minutos_reloj"]);
+  const salary = getNomenclatorNumber(record, ["puntos_salariales", "puntos_nomenclador", "puntaje_salarial", "puntos"]);
+  const incompatibility = getNomenclatorNumber(record, ["puntaje_incompatibilidad", "puntos_incompatibilidad", "puntaje_compatibilidad"]);
+  const fields = [
+    `Cargo: ${category}`,
+    record.nivel_modalidad || record.nivel_educativo || record.nivel ? `Nivel/modalidad: ${record.nivel_modalidad || record.nivel_educativo || record.nivel}` : "",
+    record.modalidad ? `Modalidad: ${record.modalidad}` : "",
+    record.institucion || record.tipo_institucion ? `Institución: ${record.institucion || record.tipo_institucion}` : "",
+    jornada ? `Jornada: ${jornada}` : "",
+    `Horas reloj semanales: ${hours === null ? "sin dato en el registro" : hours}`,
+    chairHours === null ? "" : `Horas cátedra semanales: ${chairHours}`,
+    clockMinutes === null ? "" : `Minutos reloj semanales: ${clockMinutes}`,
+    `Puntos salariales/nomenclador: ${salary === null ? "sin dato en el registro" : salary}`,
+    `Puntos de incompatibilidad: ${incompatibility === null ? "sin dato en el registro" : incompatibility}`,
+    record.unidad ? `Unidad: ${record.unidad}` : "",
+    record.tipo ? `Tipo de registro: ${record.tipo}` : "",
+    record.alcance ? `Alcance: ${record.alcance}` : "",
+    `Norma: ${norm}`,
+    record.articulo ? `Artículo/registro: ${record.articulo}` : "",
+    record.id ? `ID documental: ${record.id}` : "",
+    record.pagina_pdf ? `Página PDF: ${record.pagina_pdf}` : "",
+  ].filter(Boolean);
+  return fields.join("; ");
+}
+
+function resolveNomenclatorQuery(pregunta: string, chunks: LocalChunk[]): NomenclatorResolution | null {
+  const text = normalizeText(pregunta);
+  const compare = /\b(?:comparar|comparacion|compara|comparan|comparando|comparado|diferencias?|entre|versus|vs|contra)\b/.test(text);
+  const pofAsked = /\bpof\b|planta organica funcional/.test(text);
+  const explicitlyRequestedNorms = parseNormativeReferences(pregunta);
+  const asksMetrics = /\b(?:horas?|carga horaria|puntos?|puntaje|incompatibilidad|jornada)\b/.test(text);
+  const candidates = chunks.flatMap((chunk): NomenclatorCandidate[] => {
+    if (chunk.dominio !== "nomenclador") return [];
+    const record = getNomenclatorRecord(chunk);
+    if (!record) return [];
+    const identity = nomenclatorRecordIdentity(chunk, record);
+    const category = normalizeText(String(record.categoria || record.titulo_articulo || record.titulo || ""));
+    const institution = normalizeText(String(record.institucion || record.establecimiento || record.escuela || record.nombre_institucion || record.unidad_institucional || ""));
+    const signature = cargoAnchorAndDetails(category);
+    const sourceKind = nomenclatorSourceKind(identity);
+    const pof = isNomenclatorPof(record);
+    if (!signature.anchor || (pof && !pofAsked) || (!pof && pofAsked)) return [];
+    if (explicitlyRequestedNorms.length && !explicitlyRequestedNorms.some((norm) => chunkMatchesNormativeReference({
+      sourceId: chunk.sourceId || chunk.filename, source: chunk.referencia, norm: chunk.norma || chunk.referencia,
+      jurisdiction: String(chunk.metadata?.jurisdiccion || ""), metadata: chunk.metadata, text: chunk.text,
+    }, norm))) return [];
+    return [{ chunk, record, category, identity, sourceKind, roleAnchor: signature.anchor, roleDetails: signature.details, pof, institution }];
+  });
+  if (!asksMetrics && !compare || !candidates.length) return null;
+
+  const availableAnchors = Array.from(new Set(candidates.map((candidate) => candidate.roleAnchor)));
+  const explicitAnchors = availableAnchors.filter((anchor) => new RegExp(`(?:^|\\s)${anchor.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:$|\\s)`).test(text));
+  const candidateDetails = new Set(candidates.flatMap((candidate) => candidate.roleDetails));
+  const explicitDetails = Array.from(candidateDetails).filter((detail) => new RegExp(`(?:^|\\s)${detail.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:$|\\s)`).test(text));
+  const requestedJornadas = ["completa", "extendida", "simple"].filter((jornada) =>
+    new RegExp(`\\bjornada\\s+${jornada}\\b|\\b${jornada}\\b`).test(text));
+  const specificLevels = ["primario comun", "primario especial", "primario adulto", "educacion inicial", "nivel inicial", "educacion tecnica", "nivel secundario"];
+  const requestedSpecificLevels = specificLevels.filter((level) => text.includes(level));
+  const requestedLevels = requestedSpecificLevels.length ? requestedSpecificLevels : ["inicial", "primaria", "primario", "secundaria", "secundario", "superior"].filter((level) => new RegExp(`\\b${level}\\b`).test(text));
+  const requestedInstitutions: NomenclatorCandidate["sourceKind"][] = [];
+  if (/centros? educativos?/.test(text)) requestedInstitutions.push("centers");
+  if (/jardines? maternales?|pasitos cuidados?/.test(text)) requestedInstitutions.push("gardens");
+  if (/escuela comun|escuela primaria|escuela secundaria/.test(text)) requestedInstitutions.push("common");
+
+  const matchesSegment = (candidate: NomenclatorCandidate, segment: string, dimension?: { kind: string; value: string }): boolean => {
+    const segmentText = normalizeCargoLabel(segment);
+    const segmentAnchors = availableAnchors.filter((anchor) => new RegExp(`(?:^|\\s)${anchor.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:$|\\s)`).test(segmentText));
+    if (segmentAnchors.length && !segmentAnchors.includes(candidate.roleAnchor)) return false;
+    const segmentDetails = Array.from(candidateDetails).filter((detail) => new RegExp(`(?:^|\\s)${detail.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:$|\\s)`).test(segmentText));
+    const detailsForRole = new Set(candidates.filter((item) => item.roleAnchor === candidate.roleAnchor).flatMap((item) => item.roleDetails));
+    if (segmentDetails.some((detail) => detailsForRole.has(detail) && !candidate.roleDetails.includes(detail))) return false;
+    const centers = /centros? educativos?/.test(segmentText);
+    const gardens = /jardines? maternales?|pasitos cuidados?/.test(segmentText);
+    const common = /escuela comun|escuela primaria|escuela secundaria/.test(segmentText);
+    if (centers && candidate.sourceKind !== "centers" || gardens && candidate.sourceKind !== "gardens" || common && candidate.sourceKind !== "common") return false;
+    const namedInstitutions = Array.from(new Set(candidates.map((item) => item.institution).filter(Boolean)));
+    const requestedNamedInstitutions = namedInstitutions.filter((institution) => segmentText.includes(institution));
+    if (requestedNamedInstitutions.length && !requestedNamedInstitutions.includes(candidate.institution)) return false;
+    const journeyOptions = ["completa", "extendida", "simple"].filter((journey) => new RegExp(`\\bjornada\\s+${journey}\\b|\\b${journey}\\b`).test(segmentText));
+    const specificLevelOptions = specificLevels.filter((level) => segmentText.includes(level));
+    const levelOptions = specificLevelOptions.length ? specificLevelOptions : ["inicial", "primaria", "primario", "secundaria", "secundario", "superior"].filter((level) => new RegExp(`\\b${level}\\b`).test(segmentText));
+    const jornada = nomenclatorJornada(candidate);
+    const level = nomenclatorLevel(candidate);
+    if (journeyOptions.length && !journeyOptions.includes(jornada)) return false;
+    if (levelOptions.length && !levelOptions.some((option) => level.includes(option))) return false;
+    if (dimension?.kind === "role" && candidate.roleAnchor !== dimension.value) return false;
+    if (dimension?.kind === "journey" && jornada !== dimension.value) return false;
+    if (dimension?.kind === "level" && !level.includes(dimension.value)) return false;
+    if (dimension?.kind === "institution" && candidate.sourceKind !== dimension.value) return false;
+    return true;
+  };
+
+  const roleAnchors = explicitAnchors.length ? explicitAnchors : availableAnchors.filter((anchor) => new RegExp(`(?:^|\\s)${anchor.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:$|\\s)`).test(text));
+  const segments = compare ? nomenclatorComparisonSegments(pregunta, roleAnchors) : [pregunta];
+  let groups: NomenclatorCandidate[][] = [];
+  if (compare && segments.length > 1) {
+    groups = segments.map((segment) => candidates.filter((candidate) => matchesSegment(candidate, segment)));
+  } else if (compare && requestedJornadas.length > 1) {
+    groups = requestedJornadas.map((journey) => candidates.filter((candidate) => matchesSegment(candidate, text, { kind: "journey", value: journey })));
+  } else if (compare && roleAnchors.length > 1) {
+    groups = roleAnchors.map((role) => candidates.filter((candidate) => matchesSegment(candidate, text, { kind: "role", value: role })));
+  } else if (compare && requestedLevels.length > 1) {
+    groups = Array.from(new Set(requestedLevels.map((level) => level.replace(/o$/, "a")))).map((level) => candidates.filter((candidate) => matchesSegment(candidate, text, { kind: "level", value: level })));
+  } else if (compare && requestedInstitutions.length > 1) {
+    groups = requestedInstitutions.map((institution) => candidates.filter((candidate) => matchesSegment(candidate, text, { kind: "institution", value: institution })));
+  }
+
+  const uniqueCandidates = (items: NomenclatorCandidate[]) => Array.from(new Map(items.map((item) => [String(item.record.id || item.chunk.id), item])).values());
+  if (groups.length >= 2) {
+    groups = groups.map(uniqueCandidates);
+    if (groups.some((group) => group.length !== 1)) {
+      const alternatives = uniqueCandidates(groups.flat());
+      return { answer: "No pude identificar de manera unívoca cada cargo de la comparación. Aclará cargo, institución, nivel o jornada.", chunks: alternatives.map((item) => item.chunk), clarification: true };
+    }
+    const selected = groups.map((group) => group[0]);
+    const label = (item: NomenclatorCandidate) => `${item.record.categoria || item.record.titulo_articulo || "Cargo"} (${item.chunk.referencia})`;
+    const metrics = [
+      { label: "Horas reloj semanales", keys: ["horas_reloj_semanales"], unit: "" },
+      { label: "Horas cátedra semanales", keys: ["horas_catedra_semanales", "horas_catedra"], unit: "" },
+      { label: "Minutos reloj semanales", keys: ["minutos_reloj_semanales", "minutos_reloj"], unit: "" },
+      { label: "Puntos salariales", keys: ["puntos_salariales", "puntos_nomenclador", "puntaje_salarial", "puntos"], unit: "" },
+      { label: "Puntos de incompatibilidad", keys: ["puntaje_incompatibilidad", "puntos_incompatibilidad", "puntaje_compatibilidad"], unit: "" },
+    ];
+    const comparisons = metrics.map((metric) => {
+      const values = selected.map((item) => getNomenclatorNumber(item.record, metric.keys));
+      if (values.length !== 2 || values.some((value) => value === null)) return `${metric.label}: no hay datos compatibles en todos los registros para comparar.`;
+      const difference = Math.abs(values[0]! - values[1]!);
+      if (values[0] === values[1]) return `${metric.label}: mismo valor (${values[0]}).`;
+      const higher = values[0]! > values[1]! ? 0 : 1;
+      return `${metric.label}: ${label(selected[higher])} registra ${difference} más que ${label(selected[1 - higher])}.`;
+    });
+    const answer = selected.map((item) => `${label(item)}\n${renderNomenclatorRecord(item.chunk, item.record)}`).join("\n\n") + `\n\nDiferencias registradas:\n${comparisons.join("\n")}`;
+    return { answer, chunks: selected.map((item) => item.chunk) };
+  }
+
+  const selected = uniqueCandidates(candidates.filter((candidate) => matchesSegment(candidate, pregunta)));
+  if (selected.length === 1) return { answer: renderNomenclatorRecord(selected[0].chunk, selected[0].record), chunks: [selected[0].chunk] };
+  if (selected.length > 1) {
+    return { answer: `Encontré ${selected.length} registros compatibles; necesito que aclares cargo, jornada, nivel, modalidad o institución.\n${selected.map(({ chunk, record }) => `- ${renderNomenclatorRecord(chunk, record)}`).join("\n")}`, chunks: selected.map(({ chunk }) => chunk), clarification: true };
+  }
+  return null;
 }
 
 function toSearchHits(
@@ -4244,53 +4619,63 @@ function getGroqClient(): OpenAI | null {
 
 function buildGroqSystemPrompt(): string {
   return [
-    "Sos el Asistente Virtual de SiDCa.",
-    "Tu función no es copiar normativa: es ayudar a un docente afiliado a comprenderla y orientarse con prudencia.",
-    "Respondé únicamente con la información incluida en los fragmentos normativos proporcionados.",
-    "No inventes requisitos, plazos, formularios, autoridades, organismos, trámites ni procedimientos.",
-    "Si la información no está en los fragmentos, indicá que no se encontró información suficiente.",
-    "Si preguntan cómo hacer un trámite, qué presentar, dónde ir, cuántos días corresponden o quién autoriza, sólo afirmalo si está expresamente respaldado por los fragmentos.",
-    "Si falta el procedimiento concreto, decilo claramente y recomendá comunicarse con SiDCa sin inventar pasos.",
-    "Cuando falte el procedimiento, podés decir: La normativa consultada encuadra esta situación, pero la información disponible en el asistente no detalla el trámite que debés realizar. Para indicarte el procedimiento correcto, comunicate con SiDCa.",
-    "No uses conocimiento general para completar datos faltantes.",
-    "Respondé primero la pregunta concreta en lenguaje español argentino claro, con párrafos breves.",
-    "Usá esta estructura sólo cuando corresponda: Respuesta breve; Qué establece la normativa; Qué podés hacer; Base normativa.",
-    "Omití una sección si los fragmentos no permiten sostenerla.",
-    "No repitas el mismo artículo ni copies bloques extensos del contexto.",
-    "Preferí una respuesta de hasta cinco párrafos breves y aproximadamente 180 palabras.",
-    "No menciones Groq, OpenAI, RAG, embeddings, prompts, modelos ni proveedores.",
-    "Si el dominio detectado es servicios, respondé sobre servicios, contactos, beneficios y secciones de la App SiDCa. Priorizá la respuesta_sugerida, la ubicación en la app, el WhatsApp, la dirección, el aula virtual o el enlace que aparezca en los fragmentos. No inventes números, direcciones, horarios ni enlaces.",
-    "Para consultas de servicios como viajes, turismo, Casa del Docente, hotelería, convenios, certificados, capacitaciones, Oficina de Gestión, soporte técnico, asesoramiento gremial o legal, indicá el camino dentro de la app cuando esté disponible y el contacto correspondiente si figura en los fragmentos.",
-    "Si el usuario pide asesoramiento gremial, contacto gremial, número gremial o con quién comunicarse por asesoramiento gremial del sindicato, respondé con el servicio de Asesoramiento Gremial y el WhatsApp de Asesoramiento General si aparece en los fragmentos. No lo confundas con licencia por representación gremial, delegados gremiales ni franquicias gremiales.",
-    "Si el usuario pregunta en qué parte de la app debe ingresar, dónde buscar o dónde encontrar decretos, resoluciones, leyes o normativa, respondé con la sección Asesoramiento > Legal. Si además menciona titularización, trámite, documentación o formularios, agregá también Asesoramiento > Oficina de Gestión.",
-    "Cuando respondas sobre contactos, escribí el número de WhatsApp completo y, si aparece, el área a la que corresponde. No mezcles contactos de áreas no relacionadas salvo que el fragmento principal los incluya como medios generales de contacto.",
-
-    "Si la consulta es por razones climáticas o fenómenos meteorológicos, respondé solo con el Artículo 49 si ese es el fragmento disponible; no mezcles el Artículo 52 ni menciones plazos de razones particulares.",
-    "Si la consulta es por enfermedad de largo tratamiento, tratamiento prolongado o reposo de varios meses, priorizá el Artículo 20 y sus artículos complementarios 21 y 22; no confundas la licencia sustantiva con los artículos 72 a 76 de trámite, reconocimiento o control médico.",
-    "Si la consulta es por cuidar o atender a una madre, padre, hijo o familiar enfermo o accidentado, priorizá el Artículo 30; no lo confundas con maternidad del Artículo 27.",
-    "Si la consulta es por fallecimiento de un padre, madre u otro familiar, duelo o sepelio, priorizá el Artículo 48 y no reemplaces la licencia por el Artículo 30 u otra causal distinta.",
-    "Si la consulta es por afecciones, lesiones o licencia de corto tratamiento, respondé solo con los artículos 16 y 17 y el resumen correspondiente si están disponibles. No desarrolles el Artículo 20 de largo tratamiento ni el Artículo 27 de maternidad salvo que el usuario los pregunte expresamente.",
-    "Si la consulta es por superposición de horarios, respondé solo con los artículos 53 y 54 y el resumen correspondiente si están disponibles. No desarrolles el Artículo 36 salvo que el usuario pregunte expresamente por prácticas obligatorias.",
-    "Si la consulta es por maternidad, mamá, madre, embarazo o parto, respondé con el Artículo 27 y el resumen correspondiente si está disponible. No mezcles artículos de corto o largo tratamiento salvo que el fragmento del Artículo 27 los mencione como referencia accesoria.",
-
-    "Si la consulta trata sobre faltas sin justificar, inasistencias injustificadas o abandono de servicio, priorizá los artículos 85 y 86, y usá los artículos 80 y 84 como contexto de descuento y sanciones si están presentes.",
-    "REGLA NUMÉRICA OBLIGATORIA: cuando una norma establece un umbral mínimo, por ejemplo cinco (5) días, cualquier cantidad igual o superior cumple ese umbral. Ejemplo: si la consulta dice que faltó 6 días y el artículo establece abandono de servicio por cinco (5) días laborales consecutivos injustificados, debe interpretarse que 6 días sí supera el umbral de 5 días.",
-    "Para inasistencias injustificadas: si son cinco (5) o más días laborales consecutivos, corresponde analizar el Artículo 85 sobre abandono de servicio. Si son no consecutivas, corresponde analizar el Artículo 86, que establece abandono al llegar a diez (10) días injustificados en el año calendario. Siempre considerar el Artículo 80 para descuento del día no trabajado y el Artículo 84 para sanciones acumulativas por ausencia injustificada.",
-    "Si la pregunta no aclara si las inasistencias fueron consecutivas o no consecutivas, no afirmes una sola consecuencia como definitiva. Respondé diferenciando ambos escenarios: 1) si fueron consecutivas; 2) si no fueron consecutivas.",
-    "No uses la expresión 'pagar el descuento'. Cuando corresponda, indicá que se aplicará el descuento de la remuneración del día no trabajado.",
-
-    "Usá lenguaje claro, formal y útil para docentes afiliados.",
-    "Cuando corresponda, mencioná artículos, puntos, anexos, niveles, días, requisitos, funcionarios otorgantes e intervinientes presentes en los fragmentos.",
-    "Si la consulta menciona secundaria, priorizá fragmentos del Anexo II o nivel Secundario.",
-    "Si la consulta menciona inicial o primaria, priorizá fragmentos del Anexo I o nivel Inicial y Primaria.",
-    "Si el fragmento de resumen indica funcionario otorgante o interviniente, incluilo al final de la respuesta.",
-    "No confundas encabezados de secciones siguientes con el contenido del artículo consultado.",
-    "Para Capacitación y Perfeccionamiento Docente, si aparece el Artículo 34 junto al Artículo 41, debe considerarse licencia extraordinaria con goce de haberes.",
-    "No infieras diferencias entre docente suplente, interino o titular si los fragmentos no contienen una definición explícita. Si la consulta está incompleta, pedí que se aclare qué situaciones de revista desea comparar.",
-    "Si la consulta pregunta desde cuándo o a partir de cuántos días después de optar, tomar o ser designado en un cargo se puede solicitar licencia médica, no respondas con el Artículo 52 de razones particulares. Si no hay un fragmento con ese plazo específico, indicá que no se encontró una regla específica sobre ese plazo.",
-    "No digas que algo no existe si en los fragmentos aparece información relacionada y suficiente.",
-    "Mencioná el artículo o la norma en Base normativa; las fuentes completas se mostrarán aparte en la aplicación.",
+    "Sos el Asistente Virtual de SiDCa. Respondé en español argentino claro y directo, usando exclusivamente los fragmentos entregados. No inventes normas, requisitos, plazos, autoridades, trámites, contactos ni datos faltantes; si falta respaldo, explicitalo. No uses conocimiento externo ni menciones proveedores o tecnología. Preferí respuestas breves y citá la norma/artículo respaldados.",
+    "Para trámites, indicá pasos solo si están documentados; si no, reconocé la limitación y recomendá consultar a SiDCa. En servicios, priorizá respuesta_sugerida, ubicación, contactos y enlaces del fragmento, sin alterar números ni mezclar áreas.",
+    "Licencias: razones particulares = art. 52; asuntos particulares = art. 45, no son intercambiables. Corto tratamiento: arts. 16-17; largo: 20-22; familiar: 30; maternidad: 27; duelo: 48; clima: 49; capacitación: 34/41; exámenes: 35; superposición: 53-54. Respetá unidades y condiciones literales; no calcules derechos individuales sin datos suficientes.",
+    "Inasistencias injustificadas: distinguí art. 85 (cinco o más días laborales consecutivos) de art. 86 (diez no consecutivos en el año); considerá descuento del art. 80 y sanciones del 84 si aparecen. Si no se indica continuidad, explicá ambos escenarios. No afirmes que una solicitud individual es requisito si la norma no lo dice.",
+    "Para nomencladores, mantené separados horas reloj, horas cátedra, minutos, puntos salariales e incompatibilidad; no combines instituciones, jornadas ni registros POF. Si la consulta es ambigua, pedí precisión. No confundas suplente, interino y titular; para niveles, priorizá el anexo pertinente. No presentes texto derogado/sustituido como vigente ni reconstruyas fragmentos truncados.",
   ].join(" ");
+}
+
+function parseProviderDelaySeconds(value: unknown): number {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) return value;
+  const text = String(value || "").trim();
+  if (!text) return 0;
+  const numeric = Number(text);
+  if (Number.isFinite(numeric) && numeric > 0) return numeric;
+  const date = Date.parse(text);
+  if (Number.isFinite(date)) return Math.max(0, (date - Date.now()) / 1000);
+  let seconds = 0;
+  for (const match of text.matchAll(/(\d+(?:\.\d+)?)\s*(d|h|m|s)/gi)) {
+    const value = Number(match[1]);
+    const unit = match[2].toLowerCase();
+    seconds += value * (unit === "d" ? 86400 : unit === "h" ? 3600 : unit === "m" ? 60 : 1);
+  }
+  return seconds;
+}
+
+function isComplexRetrievalQuery(pregunta: string): boolean {
+  const text = normalizeText(pregunta);
+  return /\b(?:comparar|comparacion|compara|comparan|comparando|comparado|diferencia|diferencias|relacion|entre|versus|contra|modificar|modifica|modificacion|modificaciones|reemplazar|reemplaza|reemplazo|reemplazado|ademas|por un lado|por otro lado)\b/.test(text) ||
+    parseNormativeReferences(pregunta).length > 1 || extractArticleNumbersFromQuery(pregunta).length > 1;
+}
+
+async function acquireGroqQueueSlot(): Promise<() => void> {
+  if (groqQueueDepth >= GROQ_MAX_QUEUED_REQUESTS) {
+    const error: any = new Error("La cola local de Groq está saturada.");
+    error.code = "provider_queue_saturated";
+    throw error;
+  }
+  const previous = groqQueue;
+  let release!: () => void;
+  groqQueue = new Promise<void>((resolve) => { release = resolve; });
+  groqQueueDepth++;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const acquired = await Promise.race([
+    previous.then(() => true, () => true),
+    new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), GROQ_QUEUE_WAIT_TIMEOUT_MS); }),
+  ]);
+  if (timer) clearTimeout(timer);
+  if (!acquired) {
+    groqQueueDepth--;
+    // Mantiene el orden de los siguientes turnos, sin bloquear esta solicitud.
+    void previous.then(release, release);
+    const error: any = new Error("Se agotó el tiempo máximo de espera en la cola de Groq.");
+    error.code = "provider_queue_timeout";
+    throw error;
+  }
+  groqQueueDepth--;
+  return release;
 }
 
 type GroqGeneration = {
@@ -4395,6 +4780,13 @@ async function askGroq(
   dominio: DominioBackend,
   chunks: LocalChunk[]
 ): Promise<GroqGeneration> {
+  if (groqCooldownUntil > workflowNow()) {
+    const error: any = new Error(`Groq en período de enfriamiento: ${groqCooldownReason || "rate_limit"}`);
+    error.status = 429;
+    error.cooldownUntil = groqCooldownUntil;
+    throw error;
+  }
+
   const client = getGroqClient();
 
   if (!client) {
@@ -4402,20 +4794,47 @@ async function askGroq(
   }
 
   const model = getEnv("GROQ_MODEL") || "openai/gpt-oss-20b";
-  const maxTokens = Number(getEnv("GROQ_MAX_TOKENS") || 900);
+  const configuredMaxTokens = Number(getEnv("GROQ_MAX_TOKENS") || 900);
+  const complexQuery = isComplexRetrievalQuery(pregunta);
+  const maxTokens = complexQuery ? Math.min(Math.max(configuredMaxTokens, 1200), 1800) : Math.min(configuredMaxTokens, 600);
   const context = buildContext(chunks);
   const referencias = Array.from(new Set(chunks.map((chunk) => chunk.referencia)));
-  const first = await solicitarGeneracionGroq(
-    client,
-    model,
-    maxTokens,
-    pregunta,
-    dominio,
-    context,
-    referencias,
-  );
+  const providerStartedAt = Date.now();
+  const estimatedInputTokens = Math.ceil((buildGroqSystemPrompt().length + context.length + pregunta.length + referencias.join(" | ").length + 400) / 4);
+  const estimatedCombinedTokens = estimatedInputTokens + maxTokens;
+  console.log("[groqWorkflow] provider_request", { dominio, model, fragmentos: chunks.length,
+    maxTokens, estimatedInputTokens, estimatedCombinedTokens, estimatedBudget: GROQ_ESTIMATED_TPM_BUDGET, estimatedBy: "chars_div_4" });
+  if (estimatedCombinedTokens > GROQ_ESTIMATED_TPM_BUDGET) {
+    const error: any = new Error("El contexto completo más la salida solicitada excede el presupuesto estimado por solicitud.");
+    error.code = "context_budget_exceeded";
+    throw error;
+  }
+  const release = await acquireGroqQueueSlot();
+  try {
+  if (groqCooldownUntil > workflowNow()) {
+    const error: any = new Error(`Groq en período de enfriamiento: ${groqCooldownReason || "rate_limit"}`);
+    error.status = 429;
+    throw error;
+  }
+  let first: GroqGeneration;
+  try {
+    first = await solicitarGeneracionGroq(client, model, maxTokens, pregunta, dominio, context, referencias);
+  } catch (error: any) {
+    const headers = error?.headers || error?.response?.headers;
+    let retryAfterSeconds = 0;
+    try {
+      retryAfterSeconds = parseProviderDelaySeconds(typeof headers?.get === "function" ? headers.get("retry-after") : headers?.["retry-after"] || error?.retryAfter || 0);
+    } catch { retryAfterSeconds = 0; }
+    if (!isRateLimitError(error) || retryAfterSeconds <= 0 || retryAfterSeconds > 1) throw error;
+    const jitterMs = 100 + Math.floor(Math.random() * 250);
+    console.warn("[groqWorkflow] provider_retry", { reason: "short_rate_limit", retryAfterSeconds, jitterMs, model });
+    await new Promise((resolve) => setTimeout(resolve, retryAfterSeconds * 1000 + jitterMs));
+    first = await solicitarGeneracionGroq(client, model, maxTokens, pregunta, dominio, context, referencias);
+  }
 
   if (!respuestaPareceIncompleta(first.text, first.finishReason)) {
+    console.log("[groqWorkflow] provider_complete", { dominio, model, duracionMs: Date.now() - providerStartedAt,
+      finishReason: first.finishReason });
     return first;
   }
 
@@ -4423,10 +4842,18 @@ async function askGroq(
     reason: first.finishReason === "length" ? "max_tokens" : "incomplete_text",
   });
 
+  const retryMaxTokens = Math.min(Math.max(maxTokens + 300, Math.ceil(maxTokens * 1.5)), 1800);
+  const estimatedRetryTotalTokens = estimatedCombinedTokens + estimatedInputTokens + retryMaxTokens;
+  if (estimatedRetryTotalTokens > GROQ_ESTIMATED_TPM_BUDGET) {
+    const error: any = new Error("El reintento por respuesta incompleta excede el presupuesto estimado acumulado.");
+    error.code = "context_budget_exceeded";
+    throw error;
+  }
+  console.log("[groqWorkflow] generation_retry_budget", { estimatedRetryTotalTokens, estimatedBudget: GROQ_ESTIMATED_TPM_BUDGET, estimatedBy: "chars_div_4" });
   const retry = await solicitarGeneracionGroq(
     client,
     model,
-    maxTokens,
+    retryMaxTokens,
     pregunta,
     dominio,
     context,
@@ -4438,7 +4865,62 @@ async function askGroq(
     throw new Error("Groq devolvió una respuesta incompleta.");
   }
 
+  console.log("[groqWorkflow] provider_complete", { dominio, model, duracionMs: Date.now() - providerStartedAt,
+    finishReason: retry.finishReason, retriedIncomplete: true });
   return retry;
+  } catch (error: any) {
+    if (isRateLimitError(error)) {
+      const message = String(error?.message || "").toLowerCase();
+      const providerCode = String(error?.code || error?.error?.code || error?.type || "").toLowerCase();
+      const headers = error?.headers || error?.response?.headers;
+      const getHeader = (name: string) => {
+        try { return typeof headers?.get === "function" ? headers.get(name) : headers?.[name] ?? headers?.[name.toLowerCase()]; }
+        catch { return undefined; }
+      };
+      const retryAfter = parseProviderDelaySeconds(getHeader("retry-after") || error?.retryAfter || 0);
+      // Groq documenta las cabeceras genéricas requests=RPD y tokens=TPM; las variantes day/minute son opcionales.
+      const dailyRequestRemaining = getHeader("x-ratelimit-remaining-requests-day") ?? getHeader("x-ratelimit-remaining-requests");
+      const dailyTokenRemaining = getHeader("x-ratelimit-remaining-tokens-day");
+      const minuteRequestRemaining = getHeader("x-ratelimit-remaining-requests-minute");
+      const minuteTokenRemaining = getHeader("x-ratelimit-remaining-tokens-minute") ?? getHeader("x-ratelimit-remaining-tokens");
+      const dailyRequestLimit = getHeader("x-ratelimit-limit-requests-day") ?? getHeader("x-ratelimit-limit-requests");
+      const dailyTokenLimit = getHeader("x-ratelimit-limit-tokens-day");
+      const explicitDaily = /(?:requests?|tokens?)\s*(?:per|\/|a)\s*day|daily|requests_per_day|tokens_per_day|quota.*day/.test(`${message} ${providerCode}`);
+      const explicitMinute = /(?:requests?|tokens?)\s*(?:per|\/|a)\s*minute|rpm|tpm|requests_per_minute|tokens_per_minute/.test(`${message} ${providerCode}`);
+      const dailyTokenExhausted = /tokens?\s*(?:per|\/|a)\s*day|tpd|tokens_per_day/.test(`${message} ${providerCode}`) || (dailyTokenRemaining !== undefined && dailyTokenRemaining !== null && Number(dailyTokenRemaining) <= 0);
+      const dailyRequestExhausted = /requests?\s*(?:per|\/|a)\s*day|rpd|requests_per_day/.test(`${message} ${providerCode}`) || (!explicitMinute && dailyRequestRemaining !== undefined && dailyRequestRemaining !== null && Number(dailyRequestRemaining) <= 0);
+      const dailyExhausted = explicitDaily || dailyTokenExhausted || dailyRequestExhausted;
+      const tpmExhausted = /tokens?\s*(?:per|\/|a)\s*minute|tpm|tokens_per_minute/.test(`${message} ${providerCode}`) || (minuteTokenRemaining !== undefined && minuteTokenRemaining !== null && Number(minuteTokenRemaining) <= 0);
+      const rpmExhausted = /requests?\s*(?:per|\/|a)\s*minute|rpm|requests_per_minute/.test(`${message} ${providerCode}`) || (minuteRequestRemaining !== undefined && minuteRequestRemaining !== null && Number(minuteRequestRemaining) <= 0);
+      const rateKind = dailyExhausted
+        ? (dailyTokenExhausted || (/token/.test(`${message} ${providerCode}`) && !dailyRequestExhausted) ? "tpd" : "rpd")
+        : tpmExhausted ? "tpm" : rpmExhausted ? "rpm" : "rate_limit";
+      const rateReset = dailyExhausted
+        ? rateKind === "tpd"
+          ? getHeader("x-ratelimit-reset-tokens-day")
+          : getHeader("x-ratelimit-reset-requests-day") ?? getHeader("x-ratelimit-reset-requests")
+        : tpmExhausted
+          ? getHeader("x-ratelimit-reset-tokens-minute") ?? getHeader("x-ratelimit-reset-tokens")
+          : getHeader("x-ratelimit-reset-requests-minute");
+      const resetSeconds = parseProviderDelaySeconds(rateReset);
+      const dailyLimitValue = Number(rateKind === "tpd" ? dailyTokenLimit : dailyRequestLimit);
+      const providerCooldownSeconds = Math.max(retryAfter, resetSeconds);
+      const safeFallbackSeconds = dailyExhausted ? (providerCooldownSeconds > 0 ? 0 : 24 * 60 * 60) : 2;
+      const cooldownSeconds = Math.max(providerCooldownSeconds, safeFallbackSeconds);
+      const cooldownMs = cooldownSeconds * 1000;
+      groqCooldownUntil = workflowNow() + cooldownMs;
+      groqCooldownReason = rateKind;
+      console.warn("[groqWorkflow] provider_circuit_open", { reason: groqCooldownReason, retryAfterSeconds: Math.ceil(cooldownMs / 1000),
+        limit: Number.isFinite(dailyLimitValue) ? dailyLimitValue : undefined,
+        remaining: rateKind === "tpd" ? Number(dailyTokenRemaining) : rateKind === "rpd" ? Number(dailyRequestRemaining) : rateKind === "tpm" ? Number(minuteTokenRemaining) : Number(minuteRequestRemaining),
+        resetSeconds: resetSeconds || undefined, providerRetryAfterSeconds: retryAfter || undefined, model });
+    } else if (Number(error?.status || error?.response?.status) === 404) {
+      console.warn("[groqWorkflow] provider_model_not_found", { model });
+    }
+    throw error;
+  } finally {
+    release();
+  }
 }
 
 function isRateLimitError(error: any): boolean {
@@ -4566,11 +5048,12 @@ function buildOutput(params: {
   consulta: string;
   respuesta: string;
   chunks: LocalChunk[];
+  referenciasAdicionales?: string[];
   asesoramientoGremial?: BackendServiceContact;
   error?: string;
 }): ChatbotWorkflowOutput {
   const referencias = Array.from(
-    new Set(params.chunks.map((chunk) => chunk.referencia).filter(Boolean))
+    new Set([...params.chunks.map((chunk) => chunk.referencia), ...(params.referenciasAdicionales || [])].filter(Boolean))
   );
 
   return {
@@ -4597,8 +5080,9 @@ function buildOutput(params: {
 export async function runGroqWorkflow(
   input: ChatbotQueryInput
 ): Promise<ChatbotWorkflowOutput> {
+  const workflowStartedAt = Date.now();
   const preguntaEfectiva = input.contextoConversacional
-    ? `${input.pregunta}\nContexto conversacional previo del mismo usuario: ${input.contextoConversacional}`
+    ? `${input.pregunta}\nContexto conversacional previo del mismo usuario: ${truncateText(input.contextoConversacional, 1200)}`
     : input.pregunta;
   const explicitNormInQuestion = parseNormativeReferences(input.pregunta).length > 0;
   const asksSingleArticle = /\b(?:art(?:i|í)culo|art)\.?\s*\d+\b/i.test(input.pregunta) && !explicitNormInQuestion;
@@ -4610,6 +5094,7 @@ export async function runGroqWorkflow(
   const dominio = explicitNormInQuestion
     ? classifyDomain(input.pregunta, input.dominio)
     : classifyDomain(preguntaEfectiva, input.dominio);
+  console.log("[chatbot] request_start", { dominio, conversationContext: Boolean(input.contextoConversacional) });
 
   if (isStandaloneGreeting(input.pregunta)) {
     return buildOutput({ ok: true, tipo: "respuesta_local", origen: "local_rag", dominio: "general", consulta: input.pregunta,
@@ -4655,6 +5140,13 @@ export async function runGroqWorkflow(
     });
   }
 
+  if (dominio === "licencias" && isAmbiguousParticularLicenseQuestion(input.pregunta)) {
+    return buildOutput({ ok: true, tipo: "aclaracion", origen: "local_rag", dominio,
+      consulta: input.pregunta,
+      respuesta: "¿Te referís a la licencia por razones particulares del artículo 52 o a la licencia por asuntos particulares del artículo 45? Son figuras distintas y tienen condiciones diferentes.",
+      chunks: [] });
+  }
+
   if (dominio === "licencias" && isGenericLicenseQuestion(input.pregunta)) {
     return buildOutput({
       ok: true,
@@ -4671,16 +5163,31 @@ export async function runGroqWorkflow(
   try {
     const documentos = await loadLocalChunks();
     const cacheKey = responseCacheKey(dominio, preguntaEfectiva);
-    const cachedResponse = getCachedResponse(cacheKey);
+    const useResponseCache = !input.contextoConversacional;
+    const cachedResponse = useResponseCache ? getCachedResponse(cacheKey) : null;
 
     if (cachedResponse) {
       return cachedResponse;
     }
 
-    const searchInput = { ...input, pregunta: preguntaEfectiva };
+    const isComplexRetrieval = isComplexRetrievalQuery(input.pregunta);
+    const adaptiveMaxResults = input.maxResults ?? (isComplexRetrieval ? 5 : 3);
+    const searchInput = { ...input, maxResults: adaptiveMaxResults, pregunta: preguntaEfectiva };
     const chunks = await searchLocalFragments(searchInput, dominio, documentos);
+    console.log("[chatbot] retrieval_complete", { dominio, motor: "local_rag", fragmentos: chunks.length,
+      corpusFingerprint: cachedChunksVersion.slice(0, 12), duracionMs: Date.now() - workflowStartedAt });
 
-    const requestedArticle = extractArticleNumbersFromQuery(input.pregunta)[0];
+    if (dominio === "nomenclador") {
+      const resolved = resolveNomenclatorQuery(input.pregunta, documentos);
+      if (resolved) {
+        const response = buildOutput({ ok: true, tipo: resolved.clarification ? "aclaracion" : "respuesta_local",
+          origen: "local_rag", dominio, consulta: input.pregunta, respuesta: resolved.answer, chunks: resolved.chunks });
+        return response;
+      }
+    }
+
+    const requestedArticles = extractArticleNumbersFromQuery(input.pregunta);
+    const requestedArticle = requestedArticles.length === 1 ? requestedArticles[0] : null;
     const asksPrivateDecree = /3387/.test(normalizeText(input.pregunta));
     const missingControlChunk = asksPrivateDecree && requestedArticle && documentos.find((chunk) => {
       const control: any = chunk.metadata?.control_documental;
@@ -4690,6 +5197,16 @@ export async function runGroqWorkflow(
     if (missingControlChunk) {
       return buildOutput({ ok: true, tipo: "sin_resultados", origen: "local_rag", dominio, consulta: input.pregunta,
         respuesta: `El artículo ${requestedArticle} del Decreto-Ley 3387 no está disponible en la fuente documental. El control de integridad indica que los artículos 33 a 75 están ausentes y que no deben completarse por inferencia.`, chunks: [missingControlChunk] });
+    }
+
+    if (requestedArticles.length > 1) {
+      const coveredArticles = new Set(chunks.filter((chunk) => chunk.kind === "articulo")
+        .flatMap((chunk) => requestedArticles.filter((article) => articleMatches(chunk, article))));
+      const missingArticles = requestedArticles.filter((article) => !coveredArticles.has(article));
+      if (missingArticles.length) {
+        return buildOutput({ ok: true, tipo: "sin_resultados", origen: "local_rag", dominio, consulta: input.pregunta,
+          respuesta: `La documentación activa no contiene todos los artículos solicitados (${missingArticles.join(", ")}). No voy a responder la comparación como completa ni completar el texto faltante.`, chunks });
+      }
     }
 
     if (!chunks.length) {
@@ -4724,15 +5241,27 @@ export async function runGroqWorkflow(
       });
     }
 
-    const requestedArticles = extractArticleNumbersFromQuery(input.pregunta);
-    const nonCurrent = chunks.find((chunk) => /derogado|sustituido/.test(normalizeText(String(chunk.metadata?.estado_vigencia || ""))) &&
-      (!requestedArticles.length || requestedArticles.some((article) => articleMatches(chunk, article))));
+    const nonCurrentChunks = chunks.filter((chunk) => {
+      const update: any = chunk.metadata?.actualizacion;
+      const status = normalizeText(String(update?.estado || chunk.metadata?.estado_vigencia || ""));
+      return requestedArticles.some((article) => articleMatches(chunk, article)) && /derogado|sustituido/.test(status);
+    });
+    const nonCurrent = requestedArticles.length === 1 ? nonCurrentChunks[0] : undefined;
     if (nonCurrent) {
       const update: any = nonCurrent.metadata?.actualizacion;
       const status = normalizeText(String(update?.estado || nonCurrent.metadata?.estado_vigencia || ""));
       const summary = String(update?.resumen_no_literal || "").trim();
       return buildOutput({ ok: true, tipo: "respuesta_local", origen: "local_rag", dominio, consulta: input.pregunta,
         respuesta: `El artículo solicitado se conserva en la fuente como texto histórico y figura como ${status}. No corresponde presentarlo como disposición vigente. ${update?.norma ? `La ficha atribuye esta actualización a ${update.norma}.` : ""} ${summary ? `La fuente incluye este resumen de actualización, no una transcripción oficial: ${summary}` : ""}`.trim(), chunks: [nonCurrent] });
+    }
+    if (requestedArticles.length > 1 && nonCurrentChunks.length) {
+      const notices = nonCurrentChunks.map((chunk) => {
+        const update: any = chunk.metadata?.actualizacion;
+        const status = normalizeText(String(update?.estado || chunk.metadata?.estado_vigencia || "no verificado"));
+        return `Artículo ${chunk.articulo}: figura como ${status}${update?.norma ? ` según ${update.norma}` : ""}.`;
+      });
+      return buildOutput({ ok: true, tipo: "respuesta_local", origen: "local_rag", dominio, consulta: input.pregunta,
+        respuesta: `La comparación incluye artículos que la fuente marca como no vigentes; no los presentaré como vigentes ni compararé su texto histórico con disposiciones actuales. ${notices.join(" ")} Consultá por separado los artículos vigentes que quieras analizar.`, chunks: nonCurrentChunks });
     }
 
     const truncated = requestedArticles.includes("32") && /3387/.test(normalizeText(input.pregunta))
@@ -4741,6 +5270,35 @@ export async function runGroqWorkflow(
     if (truncated) {
       return buildOutput({ ok: true, tipo: "respuesta_local", origen: "local_rag", dominio, consulta: input.pregunta,
         respuesta: "La fuente del Decreto-Ley 3387 advierte que el artículo 32 está truncado. El fragmento disponible no es íntegro; no puedo reconstruir el texto faltante. La advertencia es un control documental, no parte del texto normativo.", chunks: [truncated] });
+    }
+
+    if (dominio === "servicios") {
+      const documented = buildDocumentedServiceAnswer(chunks, input.pregunta);
+      if (documented) {
+        const serviceChunk = documented.chunk;
+        const response = buildOutput({ ok: true, tipo: "respuesta_local", origen: "local_rag", dominio,
+          consulta: input.pregunta, respuesta: documented.answer, chunks: serviceChunk ? [serviceChunk] : [],
+          referenciasAdicionales: serviceChunk ? [serviceChunk.titulo || getObjectField(serviceChunk.raw, ["titulo_articulo", "categoria", "titulo"])].filter((reference): reference is string => Boolean(reference)) : [] });
+        if (useResponseCache) setCachedResponse(cacheKey, response);
+        return response;
+      }
+    }
+
+    const requestedArticleForLocalAnswer = extractArticleNumbersFromQuery(input.pregunta);
+    const mappedLicenseArticle = dominio === "licencias" ? getSpecificLicenseArticle(input.pregunta) : null;
+    const deterministicLicenseArticle = dominio === "licencias" && ["45", "52"].includes(mappedLicenseArticle || "");
+    const literalArticleRequest = /\b(?:texto literal|texto completo|transcrib(?:i|ime)|copi(?:a|ame|a)(?:\s+el)?\s+art[ií]culo)\b/i.test(normalizeText(input.pregunta));
+    const explicitArticleQuery = deterministicLicenseArticle || (requestedArticleForLocalAnswer.length === 1 && literalArticleRequest &&
+      (explicitNormInQuestion || dominio === "licencias"));
+    if (explicitArticleQuery) {
+      const targetArticle = mappedLicenseArticle || requestedArticleForLocalAnswer[0];
+      const exactArticleChunk = chunks.find((chunk) => chunk.kind === "articulo" && targetArticle && articleMatches(chunk, targetArticle));
+      if (exactArticleChunk) {
+        const response = buildOutput({ ok: true, tipo: "respuesta_local", origen: "local_rag", dominio,
+          consulta: input.pregunta, respuesta: buildVerbatimArticleAnswer(exactArticleChunk), chunks: [exactArticleChunk] });
+        if (useResponseCache) setCachedResponse(cacheKey, response);
+        return response;
+      }
     }
 
     try {
@@ -4773,10 +5331,13 @@ export async function runGroqWorkflow(
         chunks,
       });
 
-      setCachedResponse(cacheKey, response);
+      if (useResponseCache) setCachedResponse(cacheKey, response);
       return response;
     } catch (groqError: any) {
-      const localAnswer = buildLocalFallbackAnswer(chunks, input.pregunta);
+      const providerErrorCode = String(groqError?.code || "");
+      const localAnswer = providerErrorCode === "context_budget_exceeded"
+        ? "Los fragmentos completos necesarios exceden el presupuesto estimado para una consulta segura. No recorté artículos ni sus excepciones. Dividí la consulta por artículo o grupo de normas para conservar el texto íntegro."
+        : buildLocalFallbackAnswer(chunks, input.pregunta);
       const rateLimit = isRateLimitError(groqError);
 
       console.warn(
@@ -4792,7 +5353,7 @@ export async function runGroqWorkflow(
         consulta: input.pregunta,
         respuesta: localAnswer,
         chunks,
-        error: rateLimit ? "provider_rate_limit" : "provider_error",
+        error: rateLimit ? "provider_rate_limit" : providerErrorCode || "provider_error",
       });
     }
   } catch {
