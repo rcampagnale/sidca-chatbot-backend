@@ -1,0 +1,284 @@
+{
+  "version": "1.0",
+  "titulo": "SIDCA - Nomenclador de cargos docentes de Catamarca",
+  "fuente": {
+    "norma": "Decreto Acuerdo 2431/2016",
+    "anexo": "Anexo Único - Modificación puntajes Decreto Acuerdo 1550/95",
+    "url": "https://web.catamarca.edu.ar/sitio/images/2024/junio/Nomenclador.pdf",
+    "paginas_pdf": [
+      6,
+      17
+    ],
+    "vigencia_actual_verificada": false
+  },
+  "notas": [
+    "Transcripción de las categorías y las dos últimas columnas; denominaciones normalizadas en mayúsculas, tildes y abreviaturas sin cambiar su alcance.",
+    "JS: jornada simple; JC: jornada completa; JIN: Jardín de Infantes (sigla conservada).",
+    "Para hora cátedra la fuente consigna 40 minutos por unidad; horas_reloj_semanales es null para evitar confundir horas reloj con horas cátedra.",
+    "La tabla no contiene apartados independientes de EDJA secundaria ni Formación Profesional. No inferir equivalencias.",
+    "La tabla no basta para determinar compatibilidad jurídica: consultar régimen de acumulación y modificaciones vigentes."
+  ],
+  "instrucciones_chatbot": [
+    "Identificar nivel, categoría, jornada y turnos antes de asignar puntaje.",
+    "Solicitar aclaración si hay varias coincidencias. No inventar equivalencias.",
+    "Multiplicar puntaje por cantidad de unidades declaradas y sumar; distinguir cálculo numérico de compatibilidad legal.",
+    "Citar norma y página PDF de cada registro.",
+    "No confundir puntaje salarial, horas reloj y puntaje de incompatibilidad.",
+    "No afirmar vigencia actual ni compatibilidad definitiva sin verificar régimen aplicable, excepciones y horarios."
+  ],
+  "registros": [
+    {
+      "id": "CAT2431-018",
+      "nivel_modalidad": "Educación Inicial",
+      "categoria": "Director JIN 1ra. cat.",
+      "horas_reloj_semanales": 25,
+      "minutos_reloj_semanales": 1500,
+      "unidad": "cargo",
+      "puntaje_incompatibilidad": 24,
+      "normativa": "Decreto Acuerdo 2431/2016, Anexo Único",
+      "pagina_pdf": 7
+    },
+    {
+      "id": "CAT2431-020",
+      "nivel_modalidad": "Educación Inicial",
+      "categoria": "Vicedirector JIN",
+      "horas_reloj_semanales": 25,
+      "minutos_reloj_semanales": 1500,
+      "unidad": "cargo",
+      "puntaje_incompatibilidad": 24,
+      "normativa": "Decreto Acuerdo 2431/2016, Anexo Único",
+      "pagina_pdf": 7
+    },
+    {
+      "id": "CAT2431-023",
+      "nivel_modalidad": "Educación Inicial",
+      "categoria": "Maestro especial Jardín de Infantes",
+      "horas_reloj_semanales": 12,
+      "minutos_reloj_semanales": 720,
+      "unidad": "cargo",
+      "puntaje_incompatibilidad": 12,
+      "normativa": "Decreto Acuerdo 2431/2016, Anexo Único",
+      "pagina_pdf": 7
+    },
+    {
+      "id": "CAT2431-024",
+      "nivel_modalidad": "Educación Inicial",
+      "categoria": "Maestro secretario - JIN",
+      "horas_reloj_semanales": 25,
+      "minutos_reloj_semanales": 1500,
+      "unidad": "cargo",
+      "puntaje_incompatibilidad": 18,
+      "normativa": "Decreto Acuerdo 2431/2016, Anexo Único",
+      "pagina_pdf": 7
+    },
+    {
+      "id": "CAT2431-028",
+      "nivel_modalidad": "Nivel Primario Común",
+      "categoria": "Director común 1ra. cat. Anexo Albergue JC",
+      "horas_reloj_semanales": 40,
+      "minutos_reloj_semanales": 2400,
+      "unidad": "cargo",
+      "puntaje_incompatibilidad": 36,
+      "normativa": "Decreto Acuerdo 2431/2016, Anexo Único",
+      "pagina_pdf": 8
+    },
+    {
+      "id": "CAT2431-031",
+      "nivel_modalidad": "Nivel Primario Común",
+      "categoria": "Director Escuela Común Jornada Extendida 1ra. cat.",
+      "horas_reloj_semanales": 35,
+      "minutos_reloj_semanales": 2100,
+      "unidad": "cargo",
+      "puntaje_incompatibilidad": 30,
+      "normativa": "Decreto Acuerdo 2431/2016, Anexo Único",
+      "pagina_pdf": 8
+    },
+    {
+      "id": "CAT2431-033",
+      "nivel_modalidad": "Nivel Primario Común",
+      "categoria": "Director Escuela JC 1ra. cat.",
+      "horas_reloj_semanales": 40,
+      "minutos_reloj_semanales": 2400,
+      "unidad": "cargo",
+      "puntaje_incompatibilidad": 36,
+      "normativa": "Decreto Acuerdo 2431/2016, Anexo Único",
+      "pagina_pdf": 8
+    },
+    {
+      "id": "CAT2431-046",
+      "nivel_modalidad": "Nivel Primario Común",
+      "categoria": "Maestro de Grado Jornada Extendida",
+      "horas_reloj_semanales": 35,
+      "minutos_reloj_semanales": 2100,
+      "unidad": "cargo",
+      "puntaje_incompatibilidad": 24,
+      "normativa": "Decreto Acuerdo 2431/2016, Anexo Único",
+      "pagina_pdf": 8
+    },
+    {
+      "id": "CAT2431-047",
+      "nivel_modalidad": "Nivel Primario Común",
+      "categoria": "Maestro Secretario JC Anexo Albergue",
+      "horas_reloj_semanales": 40,
+      "minutos_reloj_semanales": 2400,
+      "unidad": "cargo",
+      "puntaje_incompatibilidad": 36,
+      "normativa": "Decreto Acuerdo 2431/2016, Anexo Único",
+      "pagina_pdf": 9
+    },
+    {
+      "id": "CAT2431-052",
+      "nivel_modalidad": "Nivel Primario Común",
+      "categoria": "Maestro de Grado Jornada Completa",
+      "horas_reloj_semanales": 40,
+      "minutos_reloj_semanales": 2400,
+      "unidad": "cargo",
+      "puntaje_incompatibilidad": 36,
+      "normativa": "Decreto Acuerdo 2431/2016, Anexo Único",
+      "pagina_pdf": 9
+    },
+    {
+      "id": "CAT2431-055",
+      "nivel_modalidad": "Nivel Primario Común",
+      "categoria": "Maestro Secretario JC",
+      "horas_reloj_semanales": 40,
+      "minutos_reloj_semanales": 2400,
+      "unidad": "cargo",
+      "puntaje_incompatibilidad": 36,
+      "normativa": "Decreto Acuerdo 2431/2016, Anexo Único",
+      "pagina_pdf": 9
+    },
+    {
+      "id": "CAT2431-057",
+      "nivel_modalidad": "Nivel Primario Común",
+      "categoria": "Secretario Técnico - Escuela Hogar",
+      "horas_reloj_semanales": 35,
+      "minutos_reloj_semanales": 2100,
+      "unidad": "cargo",
+      "puntaje_incompatibilidad": 24,
+      "normativa": "Decreto Acuerdo 2431/2016, Anexo Único",
+      "pagina_pdf": 9
+    },
+    {
+      "id": "CAT2431-059",
+      "nivel_modalidad": "Nivel Primario Común",
+      "categoria": "Vicedirector Común 1ra. cat. JC",
+      "horas_reloj_semanales": 40,
+      "minutos_reloj_semanales": 2400,
+      "unidad": "cargo",
+      "puntaje_incompatibilidad": 36,
+      "normativa": "Decreto Acuerdo 2431/2016, Anexo Único",
+      "pagina_pdf": 9
+    },
+    {
+      "id": "CAT2431-060",
+      "nivel_modalidad": "Nivel Primario Común",
+      "categoria": "Vicedirector Escuela Común Jornada Extendida 1ra. cat.",
+      "horas_reloj_semanales": 35,
+      "minutos_reloj_semanales": 2100,
+      "unidad": "cargo",
+      "puntaje_incompatibilidad": 30,
+      "normativa": "Decreto Acuerdo 2431/2016, Anexo Único",
+      "pagina_pdf": 9
+    },
+    {
+      "id": "CAT2431-065",
+      "nivel_modalidad": "Nivel Primario Común",
+      "categoria": "Maestro Especial Escuela JS - Primario Común",
+      "horas_reloj_semanales": 12,
+      "minutos_reloj_semanales": 720,
+      "unidad": "cargo",
+      "puntaje_incompatibilidad": 12,
+      "normativa": "Decreto Acuerdo 2431/2016, Anexo Único",
+      "pagina_pdf": 9
+    },
+    {
+      "id": "CAT2431-066",
+      "nivel_modalidad": "Nivel Primario Común",
+      "categoria": "Maestro Especial Escuela JC - Primario Común",
+      "horas_reloj_semanales": 15,
+      "minutos_reloj_semanales": 900,
+      "unidad": "cargo",
+      "puntaje_incompatibilidad": 18,
+      "normativa": "Decreto Acuerdo 2431/2016, Anexo Único",
+      "pagina_pdf": 9
+    },
+    {
+      "id": "CAT2431-074",
+      "nivel_modalidad": "Primario Especial",
+      "categoria": "Maestro Especial JS",
+      "horas_reloj_semanales": 15,
+      "minutos_reloj_semanales": 900,
+      "unidad": "cargo",
+      "puntaje_incompatibilidad": 12,
+      "normativa": "Decreto Acuerdo 2431/2016, Anexo Único",
+      "pagina_pdf": 10
+    },
+    {
+      "id": "CAT2431-075",
+      "nivel_modalidad": "Primario Especial",
+      "categoria": "Vicedirector Educación Especial JS",
+      "horas_reloj_semanales": 30,
+      "minutos_reloj_semanales": 1800,
+      "unidad": "cargo",
+      "puntaje_incompatibilidad": 24,
+      "normativa": "Decreto Acuerdo 2431/2016, Anexo Único",
+      "pagina_pdf": 10
+    },
+    {
+      "id": "CAT2431-091",
+      "nivel_modalidad": "Primario Adulto",
+      "categoria": "Maestro de Grado Escuela Nocturna",
+      "horas_reloj_semanales": 15,
+      "minutos_reloj_semanales": 900,
+      "unidad": "cargo",
+      "puntaje_incompatibilidad": 12,
+      "normativa": "Decreto Acuerdo 2431/2016, Anexo Único",
+      "pagina_pdf": 11
+    },
+    {
+      "id": "CAT2431-106",
+      "nivel_modalidad": "Nivel Secundario y Educación Artística",
+      "categoria": "Hora cátedra Nivel Secundario",
+      "horas_reloj_semanales": null,
+      "minutos_reloj_semanales": 40,
+      "unidad": "hora_catedra",
+      "puntaje_incompatibilidad": 1,
+      "normativa": "Decreto Acuerdo 2431/2016, Anexo Único",
+      "pagina_pdf": 12
+    },
+    {
+      "id": "CAT2431-115",
+      "nivel_modalidad": "Nivel Secundario y Educación Artística",
+      "categoria": "Secretario de 2da.",
+      "horas_reloj_semanales": 30,
+      "minutos_reloj_semanales": 1800,
+      "unidad": "cargo",
+      "puntaje_incompatibilidad": 24,
+      "normativa": "Decreto Acuerdo 2431/2016, Anexo Único",
+      "pagina_pdf": 13
+    },
+    {
+      "id": "CAT2431-116",
+      "nivel_modalidad": "Nivel Secundario y Educación Artística",
+      "categoria": "Prosecretario de 2da.",
+      "horas_reloj_semanales": 30,
+      "minutos_reloj_semanales": 1800,
+      "unidad": "cargo",
+      "puntaje_incompatibilidad": 24,
+      "normativa": "Decreto Acuerdo 2431/2016, Anexo Único",
+      "pagina_pdf": 13
+    },
+    {
+      "id": "CAT2431-122",
+      "nivel_modalidad": "Nivel Secundario y Educación Artística",
+      "categoria": "Vicedirector de 1ra.",
+      "horas_reloj_semanales": 30,
+      "minutos_reloj_semanales": 1800,
+      "unidad": "cargo",
+      "puntaje_incompatibilidad": 24,
+      "normativa": "Decreto Acuerdo 2431/2016, Anexo Único",
+      "pagina_pdf": 13
+    }
+  ]
+}

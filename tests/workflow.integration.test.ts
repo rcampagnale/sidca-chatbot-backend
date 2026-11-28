@@ -6,7 +6,9 @@ const { updateWorkflowTestDependencies } = await import("../src/groqWorkflow.js"
 import { readFile } from "node:fs/promises";
 const source = JSON.parse(await readFile(new URL("./fixtures/movilidad.json", import.meta.url), "utf8"));
 const generalList = JSON.parse(await readFile(new URL("./fixtures/nomenclador-general.json", import.meta.url), "utf8"));
+const diverseGeneralList = JSON.parse(await readFile(new URL("./fixtures/nomenclador-general-diversidad.json", import.meta.url), "utf8"));
 const centersList = JSON.parse(await readFile(new URL("./fixtures/nomenclador-centros.json", import.meta.url), "utf8"));
+const completeCentersList = JSON.parse(await readFile(new URL("./fixtures/nomenclador-centros-completo.json", import.meta.url), "utf8"));
 const gardensList = JSON.parse(await readFile(new URL("./fixtures/nomenclador-jardines.json", import.meta.url), "utf8"));
 const nationalLaw = JSON.parse(await readFile(new URL("./fixtures/ley_26206_educacion_nacional.json", import.meta.url), "utf8"));
 const privateLaw = JSON.parse(await readFile(new URL("./fixtures/decreto_ley_3387_educacion_privada.json", import.meta.url), "utf8"));
@@ -18,6 +20,7 @@ const estatutoRegression = JSON.parse(await readFile(new URL("./fixtures/estatut
 const consultasGenerales = JSON.parse(await readFile(new URL("./fixtures/consultas-generales-regresion.json", import.meta.url), "utf8"));
 const serviciosSidca = JSON.parse(await readFile(new URL("./fixtures/servicios-sidca-regresion.json", import.meta.url), "utf8"));
 const decreto533 = JSON.parse(await readFile(new URL("./fixtures/decreto-533-regresion.json", import.meta.url), "utf8"));
+const licenseParticulars = JSON.parse(await readFile(new URL("./fixtures/licencias-particulares-regresion.json", import.meta.url), "utf8"));
 let now = 1000;
 let contents = source;
 let manifest: any = { version: "1", fuentes: [{ id: "movilidad_docente_decreto_533", dominio: "coberturas", referencia: "Decreto Acuerdo 533/2021 Catamarca", url: "mock://movilidad", activo: true }] };
@@ -128,22 +131,30 @@ test("A8 solicitudes concurrentes comparten carga documental", async () => {
   releases(); const results = await Promise.all([first, second]); assert.ok(results.every((result) => result.articulos.length > 0));
 });
 
-async function queryNomencladores(pregunta: string) {
+async function queryNomencladores(pregunta: string, generalData: unknown = generalList, centersData: unknown = centersList) {
   now += 6 * 60_000;
   const sources = [
     { id: "nomenclador_docente_catamarca", dominio: "general", referencia: "Decreto Acuerdo 2431/2016", url: "mock://general", activo: true },
     { id: "nomenclador_centros_educativos", dominio: "general", referencia: "Decreto ECyT 2453/2019, Artículo 2", url: "mock://centros", activo: true },
     { id: "nomenclador_jardines_maternales", dominio: "general", referencia: "Decreto ECyT 1480/2019", url: "mock://jardines", activo: true },
   ];
-  setWorkflowTestDependencies({ now: () => now, fetchJson: async (url) => url === "mock://manifest" ? { version: "1.9.0", fuentes: sources } : url === "mock://general" ? generalList : url === "mock://centros" ? centersList : gardensList, groqClient: mockClient });
+  setWorkflowTestDependencies({ now: () => now, fetchJson: async (url) => url === "mock://manifest" ? { version: "1.9.0", fuentes: sources } : url === "mock://general" ? generalData : url === "mock://centros" ? centersData : gardensList, groqClient: mockClient });
   return runGroqWorkflow({ pregunta });
 }
 
 test("Caso 9: pipeline recupera escuela común del Decreto 2431/2016", async () => {
+  const before = requests.length;
   const result = await queryNomencladores("Maestro de Grado Jornada Extendida de escuela común, nomenclador 2431/2016");
-  const userMessage = requests.at(-1).messages[1].content;
-  assert.match(userMessage, /CAT2431-046/); assert.match(userMessage, /Nivel Primario Común/); assert.match(userMessage, /Decreto Acuerdo 2431\/2016/);
-  assert.doesNotMatch(userMessage, /CAT2453-CE/); assert.equal(result.dominio, "nomenclador");
+  assert.equal(requests.length, before); assert.match(result.respuesta, /Maestro de Grado Jornada Extendida/); assert.match(result.respuesta, /35/); assert.match(result.respuesta, /Decreto Acuerdo 2431\/2016/);
+  assert.doesNotMatch(result.respuesta, /CAT2453-CE|Jardín Maternal/); assert.equal(result.dominio, "nomenclador");
+});
+
+test("v3: maestro de grado de jornada completa usa el registro general de escuela común", async () => {
+  const before = requests.length;
+  const result = await queryNomencladores("¿Cuántas horas reloj semanales y puntos de incompatibilidad tiene un maestro de grado de jornada completa de una escuela común?");
+  assert.equal(requests.length, before); assert.match(result.respuesta, /CAT2431-052/); assert.match(result.respuesta, /Jornada: Completa/);
+  assert.match(result.respuesta, /Horas reloj semanales: 40/); assert.match(result.respuesta, /Puntos de incompatibilidad: 36/);
+  assert.match(result.respuesta, /Nivel Primario Común/); assert.doesNotMatch(result.respuesta, /CAT2453-CE|CAT-1480/);
 });
 
 test("Caso 10: contexto operativo incluye Centros Educativos 2453/2019", async () => {
@@ -159,21 +170,21 @@ test("Caso 11: pipeline recupera la categoría de Jardines Pasitos Cuidados", as
 });
 
 test("Caso 12: prompt identifica horas, incompatibilidad y puntos del director maternal por separado", async () => {
-  await queryNomencladores("¿Cuántas horas reloj semanales, puntos de incompatibilidad y puntos salariales tiene un director de Jardín Maternal Pasitos Cuidados?");
-  const prompt = requests.at(-1).messages[1].content;
-  assert.match(prompt, /horas_reloj_semanales: 30/); assert.match(prompt, /puntaje_incompatibilidad: 30/); assert.match(prompt, /puntos_nomenclador: 436/);
+  const before = requests.length;
+  const result = await queryNomencladores("¿Cuántas horas reloj semanales, puntos de incompatibilidad y puntos salariales tiene un director de Jardín Maternal Pasitos Cuidados?");
+  assert.equal(requests.length, before); assert.match(result.respuesta, /Horas reloj semanales: 30/); assert.match(result.respuesta, /Puntos de incompatibilidad: 30/); assert.match(result.respuesta, /Puntos salariales\/nomenclador: 436/);
 });
 
 test("Caso 13: preceptor usa registro general de Centros, sin mezclar POF", async () => {
-  await queryNomencladores("¿Cuántas horas reloj semanales y puntos de incompatibilidad tiene un preceptor de Centros Educativos?");
-  const prompt = requests.at(-1).messages[1].content;
-  assert.match(prompt, /CAT2453-CE-015/); assert.match(prompt, /horas_reloj_semanales: 30/); assert.match(prompt, /puntaje_incompatibilidad: 18/); assert.match(prompt, /Artículo 2/); assert.doesNotMatch(prompt, /POF específica/);
+  const before = requests.length;
+  const result = await queryNomencladores("¿Cuántas horas reloj semanales y puntos de incompatibilidad tiene un preceptor de Centros Educativos?");
+  assert.equal(requests.length, before); assert.match(result.respuesta, /CAT2453-CE-015/); assert.match(result.respuesta, /Horas reloj semanales: 30/); assert.match(result.respuesta, /Puntos de incompatibilidad: 18/); assert.match(result.respuesta, /Artículo 2/); assert.doesNotMatch(result.respuesta, /POF específica/);
 });
 
 test("Caso 14: comparación recupera y mantiene identidad de ambas instituciones", async () => {
-  await queryNomencladores("¿Qué diferencias existen entre un director de Centro Educativo y un director de Jardín Maternal Pasitos Cuidados?");
-  const prompt = requests.at(-1).messages[1].content;
-  assert.match(prompt, /CAT2453-CE-001/); assert.match(prompt, /CAT-1480-2019-09/); assert.match(prompt, /Decreto ECyT 2453\/2019/); assert.match(prompt, /Decreto ECyT N.º 1480\/2019/);
+  const before = requests.length;
+  const result = await queryNomencladores("¿Qué diferencias existen entre un director de Centro Educativo y un director de Jardín Maternal Pasitos Cuidados?");
+  assert.equal(requests.length, before); assert.match(result.respuesta, /CAT2453-CE-001/); assert.match(result.respuesta, /CAT-1480-2019-09/); assert.match(result.respuesta, /Decreto ECyT 2453\/2019/); assert.match(result.respuesta, /Decreto ECyT N.º 1480\/2019/);
 });
 
 async function queryIntegrity(pregunta: string, id: string, dominio: string, data: unknown) {
@@ -212,9 +223,21 @@ test("Caso 19: artículo 32 truncado entrega advertencia editorial por separado"
   assert.equal(generated, false); assert.match(result.respuesta, /está truncado/); assert.match(result.respuesta, /no es íntegro/); assert.match(result.respuesta, /no puedo reconstruir/); assert.match(JSON.stringify(result.articulos), /control_documental/);
 });
 
+test("auditoría final: comparación no presenta un artículo derogado como vigente", async () => {
+  const { result, generated } = await queryIntegrity("Compará los artículos 8 y 9 de la Ley Nacional 26.206 según su vigencia", "ley_26206_educacion_nacional", "general", nationalLaw);
+  assert.equal(generated, false); assert.match(result.respuesta, /incluye artículos que la fuente marca como no vigentes/i);
+  assert.match(result.respuesta, /Artículo 9: figura como derogado/); assert.doesNotMatch(result.respuesta, /seis por ciento.*vigente/i);
+});
+
+test("auditoría final: artículo truncado bloquea una comparación como si ambos textos fueran completos", async () => {
+  const { result, generated } = await queryIntegrity("Compará los artículos 31 y 32 del Decreto-Ley 3387", "decreto_ley_3387_educacion_privada", "general", privateLaw);
+  assert.equal(generated, false); assert.match(result.respuesta, /artículo 32 está truncado/i); assert.match(result.respuesta, /no puedo reconstruir/);
+  assert.doesNotMatch(result.respuesta, /presentaré.*como vigente/i);
+});
+
 test("Caso 20: Ley 5381 marca vigencia no verificada en contexto Groq", async () => {
   const { prompt, generated } = await queryIntegrity("Ley Provincial 5381 Catamarca artículo 49", "ley_5381_educacion_catamarca", "general", provincialLaw);
-  assert.equal(generated, true); assert.match(prompt, /Ley Provincial 5381 Catamarca/); assert.match(prompt, /jurisdiccion: Catamarca/); assert.match(prompt, /vigencia y modificaciones posteriores no verificadas/);
+  assert.equal(generated, true); assert.match(prompt, /Ley Provincial 5381 Catamarca/); assert.match(prompt, /Jurisdicción: Catamarca/); assert.match(prompt, /vigencia y modificaciones posteriores no verificadas/);
 });
 
 test("Caso 21: Decreto 636 y Resolución 3335 conservan anexo reemplazado", async () => {
@@ -257,7 +280,7 @@ test("regresión: consulta temática de artículo resuelve el régimen de licenc
   const before = requests.length;
   const result = await runGroqWorkflow({ pregunta:"¿Qué establece el artículo 16 del régimen de licencias docentes?" });
   assert.equal(requests.length, before + 1); assert.notEqual(result.tipo, "aclaracion");
-  assert.match(requests.at(-1).messages[1].content, /Artículo\/s: 16/); assert.match(requests.at(-1).messages[1].content, /veinticinco \(25\) días corridos/);
+  assert.match(requests.at(-1).messages[1].content, /Artículo\/s: 16/); assert.match(requests.at(-1).messages[1].content, /veinticinco \(25\) días corridos/); assert.match(requests.at(-1).messages[1].content, /Artículo\/s: 17/);
 });
 
 test("regresión: advertencia del artículo 32 no bloquea artículo completo del Decreto-Ley 3387", async () => {
@@ -393,7 +416,7 @@ test("Caso 26: regresión de corto/largo tratamiento y razones particulares", as
   assert.equal(long.result.dominio,"licencias"); assert.ok(long.result.articulos.some((a:any)=>String(a.articulo)==="20")); assert.match(long.prompt,/Artículo\/s: 20/); assert.match(long.prompt,/seis \(6\) meses/);
 
   const particular = await runWithSources("¿Cuántos días por razones particulares puede solicitar un docente?", fuentes, payloads, "El artículo 52 permite hasta dos días de inasistencia al mes y no más de cinco días hábiles al año.");
-  assert.equal(particular.result.dominio,"licencias"); assert.ok(particular.result.articulos.some((a:any)=>String(a.articulo)==="52")); assert.match(particular.prompt,/Artículo\/s: 52/); assert.match(particular.prompt,/DOS \(2\) días/); assert.match(particular.prompt,/CINCO \(5\) días hábiles/);
+  assert.equal(particular.result.dominio,"licencias"); assert.equal(particular.generated,false); assert.ok(particular.result.articulos.some((a:any)=>String(a.articulo)==="52")); assert.match(particular.result.respuesta,/ART[IÍ]CULO 52/); assert.match(particular.result.respuesta,/DOS \(2\) días/); assert.match(particular.result.respuesta,/CINCO \(5\) días hábiles/);
 });
 
 test("Caso 27: regresión de derechos y deberes bajo Ley Provincial 3122", async () => {
@@ -435,9 +458,38 @@ test("Caso 29: regresión de servicios, beneficios, contactos y app SIDCA", asyn
   ];
   for (const item of scenarios) {
     const outcome = await runWithSources(item.q, fuentes, payloads, item.answer);
-    assert.equal(outcome.result.dominio,"servicios"); assert.equal(outcome.generated,true); assert.ok(outcome.result.articulos.length>0);
-    assert.match(outcome.prompt,new RegExp(item.id)); assert.match(outcome.prompt,item.evidence); assert.equal(outcome.result.respuesta,item.answer);
+    assert.equal(outcome.result.dominio,"servicios"); assert.equal(outcome.generated,false); assert.ok(outcome.result.articulos.length>0);
+    assert.match(outcome.result.respuesta,item.evidence); assert.doesNotMatch(outcome.result.respuesta,/horario.*\d{2}:\d{2}/i);
   }
+});
+
+test("v3 auditoría: descarga de certificado usa su ficha y no sustituye la respuesta por capacitaciones", async () => {
+  const fuentes = [{ id: "servicios_sidca_app", dominio: "servicios", referencia: "Información institucional disponible en la App SiDCa", url: "mock://certificado-especifico", activo: true }];
+  const outcome = await runWithSources("¿Cómo descargo el certificado de una capacitación?", fuentes, { "mock://certificado-especifico": serviciosSidca }, "no debe llamarse");
+  assert.equal(outcome.generated, false); assert.match(outcome.result.respuesta, /La ficha documental “Certificados de cursos y entrega de certificados” indica:/);
+  assert.match(outcome.result.respuesta, /no confirma que la ruta ni el estado de impresión reflejen la versión actual/i);
+  assert.doesNotMatch(outcome.result.respuesta, /Aula Virtual|cursos disponibles/i);
+  assert.ok(outcome.result.referencias.some((reference: string) => /Certificados de cursos y entrega de certificados/.test(reference)));
+});
+
+test("auditoría final: sin sidca_certificados no usa una ficha de capacitaciones como sustituto", async () => {
+  const fuentes = [{ id: "servicios_sidca_app", dominio: "servicios", referencia: "Información institucional disponible en la App SiDCa", url: "mock://solo-capacitaciones", activo: true }];
+  const trainingOnly = { ...serviciosSidca, servicios: serviciosSidca.servicios.filter((item: any) => item.id !== "sidca_certificados") };
+  const outcome = await runWithSources("¿Cómo descargo el certificado de una capacitación?", fuentes, { "mock://solo-capacitaciones": trainingOnly }, "no debe llamarse");
+  assert.equal(outcome.generated, false); assert.match(outcome.result.respuesta, /no encontré una ficha documental específica de certificados/i);
+  assert.match(outcome.result.respuesta, /no permite inferir el procedimiento/); assert.equal(outcome.result.articulos.length, 0); assert.deepEqual(outcome.result.referencias, []);
+  assert.doesNotMatch(outcome.result.respuesta, /Aula Virtual|Cursos Aprobados|botón|sección/);
+});
+
+test("v3 auditoría: certificados sin procedimiento documentado informan la carencia sin inventar navegación", async () => {
+  const fuentes = [{ id: "servicios_sidca_app", dominio: "servicios", referencia: "Información institucional disponible en la App SiDCa", url: "mock://certificado-sin-procedimiento", activo: true }];
+  const incomplete = { ...serviciosSidca, servicios: serviciosSidca.servicios.map((item: any) => {
+    if (item.id !== "sidca_certificados") return item;
+    const { respuesta_sugerida: _omitted, ...withoutProcedure } = item; return withoutProcedure;
+  }) };
+  const outcome = await runWithSources("¿Cómo descargo el certificado de una capacitación?", fuentes, { "mock://certificado-sin-procedimiento": incomplete }, "no debe llamarse");
+  assert.equal(outcome.generated, false); assert.match(outcome.result.respuesta, /no incluye una respuesta_sugerida/i);
+  assert.doesNotMatch(outcome.result.respuesta, /botón|descargar desde|ir a la sección/i);
 });
 
 test("Caso 30: regresión de consultas generales e información sin respaldo", async () => {
@@ -453,6 +505,297 @@ test("Caso 30: regresión de consultas generales e información sin respaldo", a
   assert.equal(schedule.result.dominio,"general"); assert.match(schedule.prompt,/horario de atención/); assert.doesNotMatch(schedule.result.respuesta,/\b(?:08|09|10|11|12|13|14|15|16|17|18):\d{2}\b/);
   const unsupported = await runWithSources("¿Qué dispone la Ley 9999 sobre el régimen docente?", fuentes, payloads, "No hay respaldo para esa norma.");
   assert.equal(unsupported.result.dominio,"general"); assert.equal(unsupported.generated,false); assert.match(unsupported.result.respuesta,/No encontré fragmentos suficientes/); assert.doesNotMatch(unsupported.result.respuesta,/artículo|dispone|establece/i);
+});
+
+test("v3: razones particulares (52) y asuntos particulares (45) se resuelven desde sus textos reales", async () => {
+  const fuentes = [{ id: "licencias_docentes_provincial", dominio: "licencias", referencia: "Decreto Acuerdo 1092/2015 – Régimen de Licencias Docentes", url: "mock://licencias-v3", activo: true }];
+  const reasons = await runWithSources("¿Cuántos días de licencia por razones particulares tiene un docente?", fuentes, { "mock://licencias-v3": licenseParticulars }, "no debe llamarse");
+  assert.equal(reasons.generated, false); assert.match(reasons.result.respuesta, /ART[IÍ]CULO 52/i); assert.match(reasons.result.respuesta, /DOS \(2\) días de inasistencias al mes/); assert.match(reasons.result.respuesta, /CINCO \(5\) días hábiles al año/); assert.doesNotMatch(reasons.result.respuesta, /seis \(6\) meses/);
+  const affairs = await runWithSources("¿Qué condiciones tiene la licencia por asuntos particulares?", fuentes, { "mock://licencias-v3": licenseParticulars }, "no debe llamarse");
+  assert.equal(affairs.generated, false); assert.match(affairs.result.respuesta, /ART[IÍ]CULO 45/i); assert.match(affairs.result.respuesta, /seis \(6\) meses dentro de cada decenio/); assert.match(affairs.result.respuesta, /QUINCE \(15\) días/); assert.doesNotMatch(affairs.result.respuesta, /CINCO \(5\) días hábiles al año/);
+  const ambiguous = await runGroqWorkflow({ pregunta: "¿Cuántos días de licencia particular tiene un docente?" });
+  assert.equal(ambiguous.tipo, "aclaracion"); assert.match(ambiguous.respuesta, /artículo 52.*artículo 45/i);
+});
+
+test("v3 auditoría: comparación de razones y asuntos particulares conserva ambos artículos", async () => {
+  const fuentes = [{ id: "licencias_docentes_provincial", dominio: "licencias", referencia: "Decreto Acuerdo 1092/2015 – Régimen de Licencias Docentes", url: "mock://licencias-particulares-comparison", activo: true }];
+  const outcome = await runWithSources("Compará las licencias por razones particulares y asuntos particulares", fuentes, { "mock://licencias-particulares-comparison": licenseParticulars }, "Las dos licencias tienen condiciones diferentes según los artículos citados.");
+  assert.equal(outcome.generated, true); assert.match(outcome.prompt, /ART[IÍ]CULO 45/); assert.match(outcome.prompt, /ART[IÍ]CULO 52/);
+  assert.match(outcome.result.respuesta, /condiciones diferentes/); assert.equal(outcome.result.dominio, "licencias");
+});
+
+test("v3 auditoría: artículos 16 y 17 se recuperan juntos sin agregar el artículo 20", async () => {
+  const fuentes = [{ id: "licencias_docentes_provincial", dominio: "licencias", referencia: "Decreto Acuerdo 1092/2015", url: "mock://licencias-16-17", activo: true }];
+  const outcome = await runWithSources("¿Qué disponen conjuntamente los artículos 16 y 17 del régimen de licencias?", fuentes, { "mock://licencias-16-17": licenciaRegression }, "Los artículos regulan afecciones comunes y la derivación a junta médica.");
+  assert.equal(outcome.generated, true); assert.match(outcome.prompt, /ART[IÍ]CULO 16/); assert.match(outcome.prompt, /ART[IÍ]CULO 17/); assert.doesNotMatch(outcome.prompt, /ART[IÍ]CULO 20/);
+});
+
+test("v3 auditoría: artículos 20, 21 y 22 conservan las condiciones complementarias", async () => {
+  const fuentes = [{ id: "licencias_docentes_provincial", dominio: "licencias", referencia: "Decreto Acuerdo 1092/2015", url: "mock://licencias-20-22", activo: true }];
+  const outcome = await runWithSources("Explicá los artículos 20, 21 y 22 sobre licencia por largo tratamiento", fuentes, { "mock://licencias-20-22": licenciaRegression }, "Los artículos establecen duración, cómputo y condiciones para una nueva licencia.");
+  assert.equal(outcome.generated, true); for (const article of [20, 21, 22]) assert.match(outcome.prompt, new RegExp(`ART[IÍ]CULO ${article}`));
+  assert.match(outcome.prompt, /cinco \(5\) años/); assert.match(outcome.prompt, /tres \(3\) años/);
+});
+
+test("v3 auditoría: una norma explícita ajena no hereda artículos inferidos de licencias", async () => {
+  const fuentes = [{ id: "licencias_docentes_provincial", dominio: "licencias", referencia: "Decreto Acuerdo 1092/2015", url: "mock://licencias-explicit-mismatch", activo: true }];
+  const outcome = await runWithSources("¿Qué establece la Ley Provincial 5381, artículo 52, sobre razones particulares?", fuentes, { "mock://licencias-explicit-mismatch": licenseParticulars }, "No hay texto aplicable.");
+  assert.equal(outcome.generated, false); assert.doesNotMatch(outcome.result.respuesta, /ART[IÍ]CULO 52/); assert.doesNotMatch(outcome.result.respuesta, /DOS \(2\) días/);
+});
+
+test("v3: nomenclador solicita precisión si hay más de una jornada compatible", async () => {
+  const before = requests.length;
+  const result = await queryNomencladores("¿Cuántas horas reloj semanales tiene un maestro de grado de escuela común?");
+  assert.equal(result.tipo, "aclaracion"); assert.match(result.respuesta, /Jornada Extendida/); assert.match(result.respuesta, /Jornada Completa/); assert.equal(requests.length, before);
+});
+
+test("v3 auditoría: comparación de jornadas resuelve los registros por separado", async () => {
+  const result = await queryNomencladores("Compará Maestro de Grado Jornada Completa vs. Maestro de Grado Jornada Extendida de escuela común");
+  assert.equal(result.dominio, "nomenclador"); assert.match(result.respuesta, /CAT2431-052/); assert.match(result.respuesta, /CAT2431-046/);
+  assert.match(result.respuesta, /Jornada Completa/); assert.match(result.respuesta, /Jornada Extendida/); assert.match(result.respuesta, /2431\/2016/);
+});
+
+test("v3 auditoría: consultas acentuadas y sin acentos mantienen la resolución documental", async () => {
+  const accented = await queryNomencladores("¿Cuántas horas reloj tiene un maestro de grado de jornada completa de escuela común?");
+  const unaccented = await queryNomencladores("Cuantas horas reloj tiene un maestro de grado de jornada completa de escuela comun?");
+  assert.match(accented.respuesta, /CAT2431-052/); assert.match(unaccented.respuesta, /CAT2431-052/);
+  assert.match(accented.respuesta, /Horas reloj semanales: 40/); assert.match(unaccented.respuesta, /Horas reloj semanales: 40/);
+});
+
+test("v3 auditoría: más de cinco registros reales se examinan y diferencia Maestro Especial de Maestro de Grado", async () => {
+  assert.ok(diverseGeneralList.registros.length > 5);
+  const result = await queryNomencladores("¿Cuántas horas reloj tiene un Maestro Especial de Jornada Simple de Nivel Primario Común?", diverseGeneralList);
+  assert.match(result.respuesta, /CAT2431-065/); assert.match(result.respuesta, /Maestro Especial Escuela JS - Primario Común/);
+  assert.match(result.respuesta, /Horas reloj semanales: 12/); assert.doesNotMatch(result.respuesta, /CAT2431-052|Maestro de Grado Jornada Completa/);
+});
+
+test("v3 auditoría: cargos compuestos Secretario y Prosecretario no se confunden", async () => {
+  const result = await queryNomencladores("Compará Secretario de 2da. de Nivel Secundario y Educación Artística con Prosecretario de 2da. de Nivel Secundario y Educación Artística", diverseGeneralList);
+  assert.match(result.respuesta, /CAT2431-115/); assert.match(result.respuesta, /CAT2431-116/);
+  assert.match(result.respuesta, /Secretario de 2da\./); assert.match(result.respuesta, /Prosecretario de 2da\./);
+});
+
+test("v3 auditoría: Director y Vicedirector se comparan como roles independientes", async () => {
+  const result = await queryNomencladores("Compará Director común 1ra. cat. Anexo Albergue JC vs. Vicedirector Común 1ra. cat. JC", diverseGeneralList);
+  assert.match(result.respuesta, /CAT2431-028/); assert.match(result.respuesta, /CAT2431-059/);
+  assert.match(result.respuesta, /Director común/); assert.match(result.respuesta, /Vicedirector Común/);
+});
+
+test("v3 auditoría: comparación entre niveles identifica cada registro y su norma", async () => {
+  const result = await queryNomencladores("Compará Director JIN 1ra. cat. vs Director común 1ra. cat. Anexo Albergue JC", diverseGeneralList);
+  assert.match(result.respuesta, /CAT2431-018/); assert.match(result.respuesta, /CAT2431-028/);
+  assert.match(result.respuesta, /Educación Inicial/); assert.match(result.respuesta, /Nivel Primario Común/); assert.match(result.respuesta, /Decreto Acuerdo 2431\/2016/);
+});
+
+test("v3 auditoría: comparación informa ausencia de horas reloj y compara solo magnitudes presentes", async () => {
+  const result = await queryNomencladores("Compará Maestro de Grado Jornada Completa con Hora Cátedra Nivel Secundario", diverseGeneralList);
+  assert.match(result.respuesta, /CAT2431-052/); assert.match(result.respuesta, /CAT2431-106/);
+  assert.match(result.respuesta, /Horas reloj semanales: no hay datos compatibles en todos los registros/);
+  assert.match(result.respuesta, /Puntos de incompatibilidad:.*registra 35 más que/s);
+});
+
+test("v3 auditoría: una POF se incluye solo si se solicita y aporta el registro institucional", async () => {
+  assert.equal(completeCentersList.registros.length, 20);
+  const result = await queryNomencladores("¿Cuántas horas reloj tiene un Maestro de Grado Jornada Extendida de la POF de Centros Educativos?", generalList, completeCentersList);
+  assert.match(result.respuesta, /CAT2453-CE-017/); assert.match(result.respuesta, /POF Centro Educativo Nº 1 Riberas del Valle/);
+  assert.match(result.respuesta, /Horas reloj semanales: 35/); assert.match(result.respuesta, /Jornada: Extendida/);
+});
+
+test("v3: consulta explicativa de artículo llega a Groq con el artículo aislado", async () => {
+  const before = requests.length;
+  const sources = [{ id: "estatuto_docente_provincial", dominio: "estatuto", referencia: "Ley Provincial 3122 Catamarca", url: "mock://statute-local", activo: true }];
+  setWorkflowTestDependencies({ now: () => now, fetchJson: async (url) => url === "mock://manifest" ? { version: "direct-article", fuentes: sources } : estatutoRegression, groqClient: mockClient });
+  const result = await runGroqWorkflow({ pregunta: "¿Qué establece el artículo 6 de la Ley Provincial 3122?", dominio: "estatuto" });
+  assert.equal(requests.length, before + 1); assert.equal(result.origen, "groq_rag"); assert.match(requests.at(-1).messages[1].content, /ART[IÍ]CULO 6/); assert.match(requests.at(-1).messages[1].content, /estabilidad en el cargo/i); assert.doesNotMatch(requests.at(-1).messages[1].content, /ART[IÍ]CULO 7/); assert.ok(result.referencias.some((reference) => reference.includes("3122")));
+});
+
+test("auditoría final: literal aísla el artículo intermedio y conserva encabezados duplicados del mismo artículo", async () => {
+  const literalDocument = [{
+    articulo: 7, tipo: "articulo", dominio: "estatuto", documento: "Ley Provincial 3122", titulo_articulo: "Artículo 7",
+    contenido: "ARTÍCULO 6°.- TEXTO ANTERIOR QUE NO DEBE APARECER.\n[ARTÍCULO 7°]\nCONTENIDO PERTINENTE A7 UNO.\nARTÍCULO 7°.- CONTENIDO PERTINENTE A7 DOS.\nARTÍCULO 8°.- TEXTO POSTERIOR QUE NO DEBE APARECER.",
+  }];
+  const sources = [{ id: "estatuto_docente_provincial", dominio: "estatuto", referencia: "Ley Provincial 3122 Catamarca", url: "mock://literal-articulo-intermedio", activo: true }];
+  setWorkflowTestDependencies({ now: () => now, fetchJson: async (url) => url === "mock://manifest" ? { version: "literal-middle-article", fuentes: sources } : literalDocument, groqClient: mockClient });
+  const before = requests.length;
+  const result = await runGroqWorkflow({ pregunta: "Solicito el texto literal del artículo 7 de la Ley Provincial 3122" });
+  assert.equal(requests.length, before); assert.equal(result.tipo, "respuesta_local");
+  assert.match(result.respuesta, /CONTENIDO PERTINENTE A7 UNO/); assert.match(result.respuesta, /CONTENIDO PERTINENTE A7 DOS/);
+  assert.doesNotMatch(result.respuesta, /TEXTO ANTERIOR|TEXTO POSTERIOR|ART[IÍ]CULO 6|ART[IÍ]CULO 8/);
+});
+
+test("v3: cuotas por minuto abren enfriamiento y el fallback conserva el texto normativo", async () => {
+  now += 10_000;
+  let providerCalls = 0;
+  const rateLimited: any = { chat: { completions: { create: async () => { providerCalls++; const error: any = new Error("rate limit exceeded per minute"); error.status = 429; error.headers = new Headers({ "retry-after": "30", "x-ratelimit-limit-requests-minute": "30" }); throw error; } } } };
+  const sources = [{ id: "movilidad_docente_decreto_533", dominio: "coberturas", referencia: "Decreto Acuerdo 533/2021 Catamarca", url: "mock://mobility-429", activo: true }];
+  setWorkflowTestDependencies({ now: () => now, fetchJson: async (url) => url === "mock://manifest" ? { version: "429-minute", fuentes: sources } : source, groqClient: rateLimited });
+  const [first, second] = await Promise.all([
+    runGroqWorkflow({ pregunta: "¿Qué regla documental aplica a la movilidad docente? Decreto Acuerdo 533/2021" }),
+    runGroqWorkflow({ pregunta: "¿Qué regla documental aplica a la movilidad docente? Decreto Acuerdo 533/2021" }),
+  ]);
+  assert.equal(first.origen, "local_rag_fallback_429"); assert.equal(second.origen, "local_rag_fallback_429"); assert.match(first.respuesta, /Facúltase.*cambios de Situación de Revista/s); assert.equal(providerCalls, 1);
+});
+
+test("v3: cuota diaria evita reintentos hasta que vence el enfriamiento", async () => {
+  now += 10_000;
+  let providerCalls = 0;
+  const dailyLimited: any = { chat: { completions: { create: async () => { providerCalls++; if (providerCalls === 1) { const error: any = new Error("daily requests per day quota exceeded"); error.status = 429; throw error; } return { choices: [{ message: { content: "La documentación está disponible.", }, finish_reason: "stop" }], usage: {} }; } } } };
+  const sources = [{ id: "movilidad_docente_decreto_533", dominio: "coberturas", referencia: "Decreto Acuerdo 533/2021 Catamarca", url: "mock://mobility-daily", activo: true }];
+  setWorkflowTestDependencies({ now: () => now, fetchJson: async (url) => url === "mock://manifest" ? { version: "429-daily", fuentes: sources } : source, groqClient: dailyLimited });
+  await runGroqWorkflow({ pregunta: "¿Qué regla documental aplica a la movilidad docente? Decreto Acuerdo 533/2021" });
+  await runGroqWorkflow({ pregunta: "¿Qué regla documental aplica a la movilidad docente? Decreto Acuerdo 533/2021" });
+  assert.equal(providerCalls, 1); now += 25 * 60 * 60 * 1000;
+  await runGroqWorkflow({ pregunta: "¿Qué regla documental aplica a la movilidad docente? Decreto Acuerdo 533/2021" });
+  assert.equal(providerCalls, 2);
+});
+
+test("auditoría final: agotamiento diario respeta un reset RPD informado de dos horas", async () => {
+  now += 10_000; let providerCalls = 0;
+  const limited: any = { chat: { completions: { create: async () => {
+    providerCalls++;
+    if (providerCalls === 1) { const error: any = new Error("daily requests per day quota exceeded"); error.status = 429; error.headers = new Headers({ "x-ratelimit-remaining-requests": "0", "x-ratelimit-reset-requests": "2h" }); throw error; }
+    return { choices: [{ message: { content: "La documentación está disponible." }, finish_reason: "stop" }], usage: {} };
+  } } } };
+  const sources = [{ id: "movilidad_docente_decreto_533", dominio: "coberturas", referencia: "Decreto Acuerdo 533/2021 Catamarca", url: "mock://rpd-reset-2h", activo: true }];
+  setWorkflowTestDependencies({ now: () => now, fetchJson: async (url) => url === "mock://manifest" ? { version: "rpd-reset-2h", fuentes: sources } : source, groqClient: limited });
+  const query = "¿Qué regla documental aplica a la movilidad docente? Decreto Acuerdo 533/2021";
+  await runGroqWorkflow({ pregunta: query }); now += 2 * 60 * 60 * 1000 - 1; await runGroqWorkflow({ pregunta: query }); assert.equal(providerCalls, 1);
+  now += 2; await runGroqWorkflow({ pregunta: query }); assert.equal(providerCalls, 2);
+});
+
+test("auditoría final: TPD y RPD eligen su reset sin intercambiar cabeceras", async () => {
+  now += 10_000; let tokenCalls = 0;
+  const tokenLimited: any = { chat: { completions: { create: async () => {
+    tokenCalls++;
+    if (tokenCalls === 1) { const error: any = new Error("daily tokens per day quota exceeded"); error.status = 429; error.headers = new Headers({ "x-ratelimit-remaining-tokens-day": "0", "x-ratelimit-reset-tokens-day": "2h", "x-ratelimit-reset-requests": "12h" }); throw error; }
+    return { choices: [{ message: { content: "Respuesta documentada." }, finish_reason: "stop" }], usage: {} };
+  } } } };
+  const sources = [{ id: "movilidad_docente_decreto_533", dominio: "coberturas", referencia: "Decreto Acuerdo 533/2021 Catamarca", url: "mock://tpd-rpd-reset", activo: true }];
+  setWorkflowTestDependencies({ now: () => now, fetchJson: async (url) => url === "mock://manifest" ? { version: "tpd-reset", fuentes: sources } : source, groqClient: tokenLimited });
+  const query = "¿Qué regla documental aplica a la movilidad docente? Decreto Acuerdo 533/2021";
+  await runGroqWorkflow({ pregunta: query }); now += 2 * 60 * 60 * 1000 + 1; await runGroqWorkflow({ pregunta: query }); assert.equal(tokenCalls, 2);
+
+  now += 10_000; let requestCalls = 0;
+  const requestLimited: any = { chat: { completions: { create: async () => {
+    requestCalls++;
+    if (requestCalls === 1) { const error: any = new Error("daily requests per day quota exceeded"); error.status = 429; error.headers = new Headers({ "x-ratelimit-remaining-requests": "0", "x-ratelimit-reset-requests": "2h", "x-ratelimit-reset-tokens-day": "12h" }); throw error; }
+    return { choices: [{ message: { content: "Respuesta documentada." }, finish_reason: "stop" }], usage: {} };
+  } } } };
+  setWorkflowTestDependencies({ now: () => now, fetchJson: async (url) => url === "mock://manifest" ? { version: "rpd-reset-selection", fuentes: sources.map((item) => ({ ...item, url: "mock://rpd-reset-selection" })) } : source, groqClient: requestLimited });
+  await runGroqWorkflow({ pregunta: query }); now += 2 * 60 * 60 * 1000 + 1; await runGroqWorkflow({ pregunta: query }); assert.equal(requestCalls, 2);
+});
+
+test("auditoría final: agotamiento diario sin Retry-After ni reset conserva 24 horas", async () => {
+  now += 10_000; let providerCalls = 0;
+  const limited: any = { chat: { completions: { create: async () => {
+    providerCalls++;
+    if (providerCalls === 1) { const error: any = new Error("daily requests per day quota exceeded"); error.status = 429; error.headers = new Headers({ "x-ratelimit-remaining-requests": "0" }); throw error; }
+    return { choices: [{ message: { content: "La documentación está disponible." }, finish_reason: "stop" }], usage: {} };
+  } } } };
+  const sources = [{ id: "movilidad_docente_decreto_533", dominio: "coberturas", referencia: "Decreto Acuerdo 533/2021 Catamarca", url: "mock://rpd-no-reset", activo: true }];
+  setWorkflowTestDependencies({ now: () => now, fetchJson: async (url) => url === "mock://manifest" ? { version: "rpd-no-reset", fuentes: sources } : source, groqClient: limited });
+  const query = "¿Qué regla documental aplica a la movilidad docente? Decreto Acuerdo 533/2021";
+  await runGroqWorkflow({ pregunta: query }); now += 23 * 60 * 60 * 1000; await runGroqWorkflow({ pregunta: query }); assert.equal(providerCalls, 1);
+  now += 2 * 60 * 60 * 1000; await runGroqWorkflow({ pregunta: query }); assert.equal(providerCalls, 2);
+});
+
+test("v3 auditoría: cuota RPM prevalece sobre cabeceras diarias y usa el reset por minuto", async () => {
+  now += 10_000; let providerCalls = 0;
+  const limited: any = { chat: { completions: { create: async () => {
+    providerCalls++;
+    if (providerCalls === 1) { const error: any = new Error("requests per minute rate limit"); error.status = 429; error.headers = new Headers({ "retry-after": "5", "x-ratelimit-limit-requests-day": "1000", "x-ratelimit-remaining-requests-day": "0", "x-ratelimit-reset-requests-day": "24h", "x-ratelimit-remaining-requests-minute": "0", "x-ratelimit-reset-requests-minute": "20s" }); throw error; }
+    return { choices: [{ message: { content: "Respuesta documentada." }, finish_reason: "stop" }], usage: {} };
+  } } } };
+  const sources = [{ id: "movilidad_docente_decreto_533", dominio: "coberturas", referencia: "Decreto Acuerdo 533/2021 Catamarca", url: "mock://mobility-rpm-day-headers", activo: true }];
+  setWorkflowTestDependencies({ now: () => now, fetchJson: async (url) => url === "mock://manifest" ? { version: "rpm-day-headers", fuentes: sources } : source, groqClient: limited });
+  const query = "¿Qué regla documental aplica a la movilidad docente? Decreto Acuerdo 533/2021";
+  await runGroqWorkflow({ pregunta: query }); now += 19_000; await runGroqWorkflow({ pregunta: query }); assert.equal(providerCalls, 1);
+  now += 2_000; await runGroqWorkflow({ pregunta: query }); assert.equal(providerCalls, 2);
+});
+
+test("v3 auditoría: Retry-After superior a 60 segundos no se recorta", async () => {
+  now += 10_000; let providerCalls = 0;
+  const limited: any = { chat: { completions: { create: async () => {
+    providerCalls++; if (providerCalls === 1) { const error: any = new Error("rate limit per minute"); error.status = 429; error.headers = new Headers({ "retry-after": "120" }); throw error; }
+    return { choices: [{ message: { content: "Respuesta documentada." }, finish_reason: "stop" }], usage: {} };
+  } } } };
+  const sources = [{ id: "movilidad_docente_decreto_533", dominio: "coberturas", referencia: "Decreto Acuerdo 533/2021 Catamarca", url: "mock://mobility-retry-120", activo: true }];
+  setWorkflowTestDependencies({ now: () => now, fetchJson: async (url) => url === "mock://manifest" ? { version: "retry-120", fuentes: sources } : source, groqClient: limited });
+  const query = "¿Qué regla documental aplica a la movilidad docente? Decreto Acuerdo 533/2021";
+  await runGroqWorkflow({ pregunta: query }); now += 65_000; await runGroqWorkflow({ pregunta: query }); assert.equal(providerCalls, 1);
+  now += 56_000; await runGroqWorkflow({ pregunta: query }); assert.equal(providerCalls, 2);
+});
+
+test("v3 auditoría: cola Groq limita la espera y responde localmente cuando se satura", async () => {
+  now += 10_000; let providerCalls = 0;
+  const slow: any = { chat: { completions: { create: async () => {
+    providerCalls++; await new Promise((resolve) => setTimeout(resolve, 250));
+    return { choices: [{ message: { content: "Respuesta documentada." }, finish_reason: "stop" }], usage: {} };
+  } } } };
+  const sources = [{ id: "movilidad_docente_decreto_533", dominio: "coberturas", referencia: "Decreto Acuerdo 533/2021 Catamarca", url: "mock://mobility-queue", activo: true }];
+  setWorkflowTestDependencies({ now: () => now, fetchJson: async (url) => url === "mock://manifest" ? { version: "queue-bounded", fuentes: sources } : source, groqClient: slow });
+  const started = Date.now();
+  const outcomes = await Promise.all(Array.from({ length: 10 }, (_, index) => runGroqWorkflow({ pregunta: `¿Qué regla aplica a movilidad docente caso ${index}? Decreto Acuerdo 533/2021` })));
+  assert.ok(Date.now() - started < 2_500); assert.equal(outcomes.length, 10); assert.ok(outcomes.some((result) => result.origen === "local_rag_fallback"));
+  assert.ok(providerCalls <= 9);
+});
+
+test("v3: reintenta una sola vez con backoff corto ante Retry-After breve", async () => {
+  now += 10_000;
+  let providerCalls = 0;
+  const transientLimit: any = { chat: { completions: { create: async () => {
+    providerCalls++;
+    if (providerCalls === 1) { const error: any = new Error("rate limit"); error.status = 429; error.headers = new Headers({ "retry-after": "0.01" }); throw error; }
+    return { choices: [{ message: { content: "La movilidad docente se rige por el fragmento recuperado." }, finish_reason: "stop" }], usage: {} };
+  } } } };
+  const sources = [{ id: "movilidad_docente_decreto_533", dominio: "coberturas", referencia: "Decreto Acuerdo 533/2021 Catamarca", url: "mock://mobility-retry", activo: true }];
+  setWorkflowTestDependencies({ now: () => now, fetchJson: async (url) => url === "mock://manifest" ? { version: "429-retry", fuentes: sources } : source, groqClient: transientLimit });
+  const result = await runGroqWorkflow({ pregunta: "¿Qué regla documental aplica a la movilidad docente? Decreto Acuerdo 533/2021" });
+  assert.equal(providerCalls, 2); assert.equal(result.origen, "groq_rag");
+});
+
+test("v3: 404 de modelo no cambia el modelo y responde con fallback documental", async () => {
+  now += 10_000;
+  let providerCalls = 0;
+  const missingModel: any = { chat: { completions: { create: async () => { providerCalls++; const error: any = new Error("model not found"); error.status = 404; throw error; } } } };
+  const sources = [{ id: "movilidad_docente_decreto_533", dominio: "coberturas", referencia: "Decreto Acuerdo 533/2021 Catamarca", url: "mock://mobility-404", activo: true }];
+  setWorkflowTestDependencies({ now: () => now, fetchJson: async (url) => url === "mock://manifest" ? { version: "404", fuentes: sources } : source, groqClient: missingModel });
+  const result = await runGroqWorkflow({ pregunta: "¿Qué regla documental aplica a la movilidad docente? Decreto Acuerdo 533/2021" });
+  assert.equal(providerCalls, 1); assert.equal(result.origen, "local_rag_fallback"); assert.match(result.respuesta, /cambios de Situación de Revista/); assert.doesNotMatch(result.respuesta, /llama-3\.1-8b-instant/);
+});
+
+test("v3: consulta simple mantiene contexto completo con presupuesto de tokens adaptativo", async () => {
+  now += 10_000;
+  const sources = [{ id: "movilidad_docente_decreto_533", dominio: "coberturas", referencia: "Decreto Acuerdo 533/2021 Catamarca", url: "mock://mobility-budget", activo: true }];
+  setWorkflowTestDependencies({ now: () => now, fetchJson: async (url) => url === "mock://manifest" ? { version: "budget", fuentes: sources } : source, groqClient: mockClient });
+  const before = requests.length;
+  await runGroqWorkflow({ pregunta: "¿Qué regla documental aplica a la movilidad docente? Decreto Acuerdo 533/2021" });
+  const request = requests[before]; const serialized = JSON.stringify(request.messages);
+  const estimatedInputTokens = Math.ceil(request.messages.reduce((total: number, message: any) => total + String(message.content || "").length, 0) / 4);
+  assert.ok(request.max_tokens <= 600); assert.ok(estimatedInputTokens <= 900); assert.ok(estimatedInputTokens + request.max_tokens <= 1500);
+  assert.ok(Math.ceil(serialized.length / 4) < 1500); assert.match(serialized, /cambios de Situación de Revista/);
+});
+
+test("auditoría final: el reintento por respuesta incompleta cuenta entrada y salida en el presupuesto combinado", async () => {
+  now += 10_000;
+  const sources = [{ id: "movilidad_docente_decreto_533", dominio: "coberturas", referencia: "Decreto Acuerdo 533/2021 Catamarca", url: "mock://mobility-retry-budget", activo: true }];
+  let providerCalls = 0;
+  const incompleteThenComplete: any = { chat: { completions: { create: async (request: any) => {
+    requests.push(request); providerCalls++;
+    return providerCalls === 1
+      ? { choices: [{ message: { content: "La norma dispone" }, finish_reason: "length" }], usage: {} }
+      : { choices: [{ message: { content: "La documentación indica el cambio de situación de revista según el fragmento recuperado." }, finish_reason: "stop" }], usage: {} };
+  } } } };
+  setWorkflowTestDependencies({ now: () => now, fetchJson: async (url) => url === "mock://manifest" ? { version: "retry-budget", fuentes: sources } : source, groqClient: incompleteThenComplete });
+  const before = requests.length;
+  const result = await runGroqWorkflow({ pregunta: "Explicá la regla documental aplicable a la movilidad docente según el Decreto Acuerdo 533/2021" });
+  const calls = requests.slice(before);
+  const estimatedCombinedTokens = calls.reduce((total, request) => {
+    const estimatedInput = Math.ceil(request.messages.reduce((sum: number, message: any) => sum + String(message.content || "").length, 0) / 4);
+    return total + estimatedInput + request.max_tokens;
+  }, 0);
+  assert.equal(providerCalls, 2); assert.equal(calls.length, 2); assert.equal(result.origen, "groq_rag");
+  assert.ok(estimatedCombinedTokens <= 7000, `estimated combined generation cost ${estimatedCombinedTokens} exceeded the per-request budget`);
 });
 
 test("Contrato HTTP: acepta el cuerpo previo, contexto opcional y los dominios nuevos", async () => {
@@ -472,7 +815,8 @@ test("Contrato HTTP: acepta el cuerpo previo, contexto opcional y los dominios n
   child.stdout.on("data",chunk=>{childOutput+=String(chunk);}); child.stderr.on("data",chunk=>{childOutput+=String(chunk);});
   try {
     let ready=false;
-    for(let attempt=0;attempt<60;attempt++){
+    // El servidor TypeScript puede tardar más en iniciar bajo carga de CI.
+    for(let attempt=0;attempt<180;attempt++){
       if(child.exitCode!==null) throw new Error(`server exited before readiness: ${childOutput}`);
       try { await fetch(`${apiBase}/api/chatbot/query`); ready=true; break; } catch { await new Promise(resolve=>setTimeout(resolve,100)); }
     }
