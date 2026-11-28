@@ -26,6 +26,10 @@ const licenseParticulars = JSON.parse(await readFile(new URL("./fixtures/licenci
 const licenseParticularsReal = JSON.parse(await readFile(new URL("./fixtures/licencias-particulares-real.json", import.meta.url), "utf8"));
 const licenseEvaluationReal = JSON.parse(await readFile(new URL("./fixtures/regimen-licencias-evaluacion-real.json", import.meta.url), "utf8"));
 const examQuestions = JSON.parse(await readFile(new URL("./fixtures/rag-v32-operational-questions.json", import.meta.url), "utf8"));
+const manifestV110 = JSON.parse(await readFile(new URL("./fixtures/manifest-v1.10.0-operational.json", import.meta.url), "utf8"));
+const servicesCertificatesUpdated = JSON.parse(await readFile(new URL("./fixtures/servicios-certificados-actualizado.json", import.meta.url), "utf8"));
+const paternityReal = JSON.parse(await readFile(new URL("./fixtures/decreto-153-paternidad-real.json", import.meta.url), "utf8"));
+const licenseAuthoritiesReal = JSON.parse(await readFile(new URL("./fixtures/regimen-licencias-autoridades-real.json", import.meta.url), "utf8"));
 let now = 1000;
 let contents = source;
 let manifest: any = { version: "1", fuentes: [{ id: "movilidad_docente_decreto_533", dominio: "coberturas", referencia: "Decreto Acuerdo 533/2021 Catamarca", url: "mock://movilidad", activo: true }] };
@@ -406,6 +410,26 @@ async function runWithSources(pregunta: string, fuentes: any[], payloads: Record
   }
 }
 
+async function runWithCurrentManifest(pregunta: string, documentsBySourceId: Record<string, unknown>, answer: string,
+  failSourceIds: string[] = []) {
+  now += 6 * 60_000;
+  const before = requests.length;
+  const previousAnswer = mockAnswer;
+  mockAnswer = answer;
+  setWorkflowTestDependencies({ now: () => now, fetchJson: async (url) => {
+    if (url === "mock://manifest") return manifestV110;
+    const source = manifestV110.fuentes.find((item: any) => item.url === url);
+    if (!source) throw new Error(`unexpected source URL ${url}`);
+    if (failSourceIds.includes(source.id)) throw new Error(`temporary failure for ${source.id}`);
+    return documentsBySourceId[source.id] ?? [];
+  }, groqClient: mockClient });
+  try {
+    const result = await runGroqWorkflow({ pregunta });
+    const prompt = requests.length > before ? requests.at(-1).messages[1].content : "";
+    return { result, prompt, generated: requests.length > before };
+  } finally { mockAnswer = previousAnswer; }
+}
+
 test("v3.2: las diez preguntas completas del DOCX atraviesan el flujo sin codificar la clave", async () => {
   const fuentes = [{ id: "licencias_docentes_provincial", dominio: "licencias", referencia: "Decreto Acuerdo Nº 1092/2015 – Régimen de Licencias Docentes", url: "mock://licencias-evaluacion-real", activo: true }];
   const documentos = [...licenciaRegression, ...licenseEvaluationReal, ...licenseParticularsReal];
@@ -643,6 +667,204 @@ test("v3 auditoría: certificados sin procedimiento documentado informan la care
   const outcome = await runWithSources("¿Cómo descargo el certificado de una capacitación?", fuentes, { "mock://certificado-sin-procedimiento": incomplete }, "no debe llamarse");
   assert.equal(outcome.generated, false); assert.match(outcome.result.respuesta, /no incluye una respuesta_sugerida/i);
   assert.doesNotMatch(outcome.result.respuesta, /botón|descargar desde|ir a la sección/i);
+});
+
+test("v3.3 error 1: ficha actualizada confirma descarga no habilitada sin advertencia obsoleta", async () => {
+  const sources = [{ id: "servicios_sidca_app", dominio: "servicios", referencia: "Información institucional disponible en la App SiDCa", url: "mock://certificado-actual", activo: true }];
+  const question = "Como descargo mi certificado de capacitacion desde la app SIDCA?";
+  const current = await runWithSources(question, sources, { "mock://certificado-actual": servicesCertificatesUpdated }, "no debe llamarse");
+  assert.equal(current.generated, false);
+  assert.equal(current.result.respuesta, "Actualmente, la descarga de certificados de capacitación no se encuentra habilitada en la App SiDCa. Podés consultar tus cursos aprobados en Información > Capacitaciones > Cursos Aprobados. Para consultas sobre la entrega de certificados, comunicate por WhatsApp al 5493834325816.");
+  assert.doesNotMatch(current.result.respuesta, /no puedo confirmar|actualizar y validar|no confirma que la ruta/i);
+  const attendance = await runWithSources("¿Cómo solicito una constancia de asistencia presencial?", sources, { "mock://certificado-actual": servicesCertificatesUpdated }, "no debe llamarse");
+  assert.equal(attendance.generated, false); assert.match(attendance.result.respuesta, /no describe|no encontré una ficha documental/i);
+  assert.doesNotMatch(attendance.result.respuesta, /descarga de certificados.*no se encuentra habilitada|Cursos Aprobados/i);
+  const legacy = await runWithSources("¿Cómo descargo el certificado de una capacitación?", sources, { "mock://certificado-actual": serviciosSidca }, "no debe llamarse");
+  assert.match(legacy.result.respuesta, /no confirma que la ruta ni el estado de impresión reflejen la versión actual/i);
+});
+
+test("v3.3 error 2: reconcilia la letra de una respuesta con el contenido de la opción", async () => {
+  const sources = [{ id: "licencias_docentes_provincial", dominio: "licencias", referencia: "Decreto Acuerdo 1092/2015 – Régimen de Licencias Docentes", url: "mock://opciones-crecida", activo: true }];
+  const labels = ["A)", "A.", "(A)", "A:", "A-"];
+  for (const label of labels) {
+    const question = "Un docente de una escuela rural no puede llegar por una crecida extraordinaria que corta el único acceso. ¿Qué artículo permite justificar la inasistencia? A) Artículo 35. B) Artículo 41. C) Artículo 49. D) Artículo 52.";
+    const before = requests.length;
+    const outcome = await runWithSources(question, sources, { "mock://opciones-crecida": licenseAuthoritiesReal }, `${label} Artículo 49.`);
+    assert.equal(outcome.generated, true);
+    assert.equal(requests.length, before + 1, "la corrección no debe generar una segunda llamada a Groq");
+    assert.match(outcome.result.respuesta, /C[).:\-] Artículo 49\./, label);
+    assert.doesNotMatch(outcome.result.respuesta, /A[).:\-] Artículo 49\./, label);
+  }
+  const reordered = await runWithSources("¿Qué artículo permite justificar la inasistencia por una crecida extraordinaria? C) Artículo 49. A) Artículo 52. B) Artículo 35.", sources,
+    { "mock://opciones-crecida": licenseAuthoritiesReal }, "A) Artículo 49.");
+  assert.match(reordered.result.respuesta, /C\) Artículo 49/);
+  const differentAuthority = await runWithSources("Según el régimen de licencias docentes y las razones extraordinarias del artículo 49, ¿cuál opción coincide con el texto? A) Artículo 49, Secretario de Unidad Escolar. B) Artículo 49, Director de Unidad Escolar.", sources,
+    { "mock://opciones-crecida": licenseAuthoritiesReal }, "A) Artículo 49, Director de Unidad Escolar.");
+  assert.match(differentAuthority.result.respuesta, /B\) Artículo 49, Director de Unidad Escolar/);
+  const differentPeriod = await runWithSources("En la licencia por fallecimiento de familiar, ¿qué plazo indica el artículo 48? A) Artículo 48, cinco días. B) Artículo 48, diez días.", sources,
+    { "mock://opciones-crecida": licenseAuthoritiesReal }, "A) Artículo 48, diez días.");
+  assert.match(differentPeriod.result.respuesta, /B\) Artículo 48, diez días/);
+  const multiBefore = requests.length;
+  const multi = await runWithSources("¿Qué opciones citan artículos del régimen de licencias docentes? Seleccione las dos opciones correctas: A) Artículo 49. B) Artículo 35. C) Artículo 48. D) Artículo 52.", sources,
+    { "mock://opciones-crecida": licenseAuthoritiesReal }, "A y C");
+  assert.equal(multi.generated, true); assert.equal(requests.length, multiBefore + 1);
+  assert.equal(multi.result.error, "option_mapping_ambiguous");
+  assert.match(multi.result.respuesta, /no puedo asociar de manera inequívoca/i);
+});
+
+test("v3.3 error 3 y 5: artículos inequívocos y consultas temáticas de paternidad responden localmente", async () => {
+  const docs = { licencias_generales_decreto_1875_1994_modificado_153_2019: paternityReal };
+  const direct = await runWithCurrentManifest("Que establece el articulo 57 del Decreto 1875/1994 de Catamarca modificado en 2019 sobre licencia por paternidad?", docs, "no debe llamarse");
+  assert.equal(direct.generated, false); assert.match(direct.result.respuesta, /Artículo 57 del Decreto Acuerdo N\.º 1875\/1994, modificado por el artículo 2 del Decreto Acuerdo 153\/2019/i);
+  assert.match(direct.result.respuesta, /10 días hábiles.*15 días hábiles/s); assert.match(direct.result.respuesta, /régimen general de la Administración Pública Provincial/i);
+  assert.match(direct.result.respuesta, /aplicación específica.*Decreto Acuerdo 1092\/2015.*no está confirmada/i); assert.doesNotMatch(direct.result.respuesta, /trámite|presentar solicitud/i);
+  const thematic = await runWithCurrentManifest("Soy docente de Catamarca, cuantos dias me corresponden por licencia de paternidad?", docs, "no debe llamarse");
+  assert.equal(thematic.generated, false); assert.match(thematic.result.respuesta, /10 días hábiles.*15 días hábiles/s);
+  assert.match(thematic.result.respuesta, /aplicación específica.*1092\/2015/i); assert.doesNotMatch(thematic.result.respuesta, /guarda adoptiva|artículo 36/);
+  const multipleChoice = await runWithCurrentManifest("¿Qué licencia corresponde por nacimiento? A) Artículo 36. B) Artículo 57, 10 días hábiles. C) Artículo 48.", docs, "no debe llamarse");
+  assert.equal(multipleChoice.generated, false); assert.match(multipleChoice.result.respuesta, /^Opción B\)/);
+});
+
+test("v3.3 error 4: la norma modificatoria se explica desde sus metadatos y limita el fallback", async () => {
+  const docs = { licencias_generales_decreto_1875_1994_modificado_153_2019: paternityReal };
+  const outcome = await runWithCurrentManifest("Que modifica el Decreto Acuerdo 153/2019 de Catamarca?", docs, "no debe llamarse");
+  assert.equal(outcome.generated, false); assert.match(outcome.result.respuesta, /153\/2019 modifica.*artículo 36.*artículo 57/s);
+  assert.match(outcome.result.respuesta, /guarda con fines adoptivos.*nacimiento de hijo/i);
+  assert.doesNotMatch(outcome.result.respuesta, /beneficios tienen los afiliados|turismo|casa del docente/i);
+});
+
+test("RAG v3.3 final: separa artículos originales y modificatorios sin fingir transcripción literal", async () => {
+  const docs = { licencias_generales_decreto_1875_1994_modificado_153_2019: paternityReal };
+  const article1 = await runWithCurrentManifest("¿Qué establece el artículo 1 del Decreto 153/2019?", docs, "no debe llamarse");
+  assert.equal(article1.generated, false); assert.match(article1.result.respuesta, /artículo 1 de Decreto Acuerdo 153\/2019 modifica el artículo 36 de Decreto Acuerdo N\.º 1875\/1994/i);
+  assert.match(article1.result.respuesta, /extracto documental.*no es una transcripción literal completa/i);
+  assert.doesNotMatch(article1.result.respuesta, /artículo 1 del Decreto 1875\/1994/);
+  const article2 = await runWithCurrentManifest("¿Qué establece el artículo 2 del Decreto 153/2019?", docs, "no debe llamarse");
+  assert.equal(article2.generated, false); assert.match(article2.result.respuesta, /artículo 2 de Decreto Acuerdo 153\/2019 modifica el artículo 57 de Decreto Acuerdo N\.º 1875\/1994/i);
+  assert.match(article2.result.respuesta, /extracto documental.*no es una transcripción literal completa/i);
+  const original57 = await runWithCurrentManifest("¿Qué establece el artículo 57 del Decreto 1875/1994?", docs,
+    "El artículo 57 del Decreto Acuerdo 1875/1994 establece la licencia por nacimiento para el agente varón.");
+  assert.equal(original57.generated, true); assert.match(original57.prompt, /Decreto Acuerdo N\.º 1875\/1994/);
+  assert.match(original57.prompt, /Artículo\/s: 57/); assert.doesNotMatch(original57.prompt, /Artículo\/s: 36/);
+  assert.match(original57.result.respuesta, /Decreto Acuerdo 1875\/1994/);
+  const modifies = await runWithCurrentManifest("¿Qué modifica el Decreto 153/2019?", docs, "no debe llamarse");
+  assert.equal(modifies.generated, false); assert.match(modifies.result.respuesta, /artículo 1 de Decreto Acuerdo 153\/2019 modifica el artículo 36/);
+  assert.match(modifies.result.respuesta, /artículo 2 de Decreto Acuerdo 153\/2019 modifica el artículo 57/);
+  const wrong57 = await runWithCurrentManifest("¿Qué establece el artículo 57 del Decreto 153/2019?", docs, "no debe llamarse");
+  assert.equal(wrong57.generated, false); assert.match(wrong57.result.respuesta, /Decreto 153\/2019.*no contiene el\/los artículo\/s solicitado\/s: 57/i);
+  assert.doesNotMatch(wrong57.result.respuesta, /Artículo 57 del Decreto 153\/2019 establece/i);
+});
+
+test("RAG v3.3 final: la respuesta local de paternidad cede ante consultas de varias disposiciones", async () => {
+  const docs = {
+    licencias_generales_decreto_1875_1994_modificado_153_2019: paternityReal,
+    licencias_docentes_provincial: licenseEvaluationReal,
+  };
+  const originalArticles = await runWithCurrentManifest("¿Qué establecen los artículos 36 y 57 del Decreto 1875/1994?", docs,
+    "Los artículos 36 y 57 del Decreto Acuerdo 1875/1994 regulan guarda con fines adoptivos y nacimiento de hijo/a.");
+  assert.equal(originalArticles.generated, true); assert.match(originalArticles.prompt, /Artículo\/s: 36/); assert.match(originalArticles.prompt, /Artículo\/s: 57/);
+  assert.match(originalArticles.prompt, /aplicación específica.*no está confirmada/i);
+  assert.match(originalArticles.result.respuesta, /artículos 36 y 57/);
+  const topics = await runWithCurrentManifest("¿Qué diferencias existen entre paternidad y guarda con fines adoptivos?", docs,
+    "La guarda con fines adoptivos está resumida en el artículo 36 del Decreto 1875/1994; la licencia por nacimiento está resumida en su artículo 57.");
+  assert.equal(topics.generated, true); assert.match(topics.prompt, /Artículo\/s: 36/); assert.match(topics.prompt, /Artículo\/s: 57/);
+  assert.match(topics.prompt, /aplicación específica.*no está confirmada/i);
+  assert.match(topics.result.respuesta, /artículo 36.*artículo 57/s);
+  const comparisonQuestion = "Compara la licencia por maternidad del artículo 27 del Decreto 1092/2015 con la licencia por paternidad del artículo 57 del Decreto 1875/1994, modificado por el Decreto 153/2019";
+  const beforeComparison = requests.length;
+  const crossRegime = await runWithCurrentManifest(comparisonQuestion, docs,
+    "El artículo 27 del Decreto Acuerdo 1092/2015 establece hasta 120 días corridos de licencia por maternidad en el régimen docente. El artículo 57 del Decreto Acuerdo 1875/1994, modificado por el Decreto Acuerdo 153/2019, contempla 10 días hábiles por nacimiento y 15 en los supuestos previstos; corresponde al régimen general de la Administración Pública Provincial. La aplicación específica de esta licencia de paternidad al personal docente no está confirmada.");
+  assert.equal(crossRegime.generated, true); assert.equal(requests.length, beforeComparison + 1);
+  assert.match(crossRegime.prompt, /Decreto Acuerdo Nº 1092\/2015[\s\S]*Artículo\/s: 27/);
+  assert.match(crossRegime.prompt, /Decreto Acuerdo Nº 1875\/1994[\s\S]*Artículo\/s: 57/);
+  assert.match(crossRegime.prompt, /Decreto Acuerdo 153\/2019/);
+  assert.match(crossRegime.prompt, /ciento veinte \(120\) días corridos/); assert.match(crossRegime.prompt, /10 días hábiles/); assert.match(crossRegime.prompt, /15 días hábiles/);
+  assert.match(crossRegime.prompt, /régimen general de la Administración Pública Provincial/i);
+  assert.match(crossRegime.prompt, /aplicación específica.*no está confirmada/i);
+  assert.match(crossRegime.result.respuesta, /120 días corridos/); assert.match(crossRegime.result.respuesta, /10 días hábiles.*15/i);
+  assert.match(crossRegime.result.respuesta, /régimen docente.*régimen general/s);
+  assert.match(crossRegime.result.respuesta, /aplicación específica.*no está confirmada/i);
+  const citedDecrees = Array.from(crossRegime.result.respuesta.matchAll(/Decreto Acuerdo (\d{2,5}\/\d{4})/gi), (match: any) => match[1]);
+  assert.deepEqual(Array.from(new Set(citedDecrees)).sort(), ["1092/2015", "153/2019", "1875/1994"]);
+  const missingMaternityArticle = await runWithCurrentManifest(comparisonQuestion,
+    { ...docs, licencias_docentes_provincial: licenseEvaluationReal.filter((record: any) => String(record.articulo) !== "27") },
+    "No debe responderse una comparación sin el artículo 27.");
+  assert.equal(missingMaternityArticle.generated, false);
+  assert.match(missingMaternityArticle.result.respuesta, /no contiene el\/los artículo\/s solicitado\/s: 27/i);
+  assert.doesNotMatch(missingMaternityArticle.result.respuesta, /120 días corridos|10 días hábiles/);
+});
+
+test("RAG v3.3 final: selección múltiple del artículo 45 reconcilia evidencia sin otra llamada", async () => {
+  const sources = [{ id: "licencias_docentes_provincial", dominio: "licencias", referencia: "Decreto Acuerdo Nº 1092/2015 – Régimen de Licencias Docentes", url: "mock://articulo45-multiple", activo: true }];
+  const question = examQuestions.find((item: any) => item.id === 6).question;
+  const answer = "A) La licencia común permite seis (6) meses sin haberes dentro del decenio. B) La opción contempla tres meses sin haberes por asuntos personales. C) La opción contempla dos meses sin haberes. Selecciono A, B y C.";
+  const before = requests.length;
+  const original = await runWithSources(question, sources, { "mock://articulo45-multiple": licenseParticularsReal }, answer);
+  assert.equal(original.generated, true); assert.equal(requests.length, before + 1);
+  assert.match(original.prompt, /Artículo\/s: 45/);
+  assert.match(original.result.respuesta, /C\) La licencia común permite seis/);
+  assert.match(original.result.respuesta, /A\) La opción contempla tres meses/);
+  assert.match(original.result.respuesta, /B\) La opción contempla dos meses/);
+  const optionMatches = Array.from(original.result.respuesta.matchAll(/(?:^|\s)([A-E])\)/g), (match: any) => match[1]);
+  assert.deepEqual(Array.from(new Set(optionMatches)).sort(), ["A", "B", "C"]);
+
+  const markers = Array.from(question.matchAll(/(?:^|\s)([A-E])\.\s/g)) as RegExpMatchArray[];
+  const optionRows = markers.map((marker, index) => ({
+    label: marker[1], text: question.slice((marker.index || 0) + marker[0].length, index + 1 < markers.length ? markers[index + 1].index || question.length : question.length).trim(),
+  }));
+  const firstOptionIndex = markers[0].index || 0;
+  const reorderedQuestion = `${question.slice(0, firstOptionIndex)} ${["C", "A", "B", "D", "E"].map((label) => {
+    const option = optionRows.find((row) => row.label === label)!;
+    return `${label}. ${option.text}`;
+  }).join(" ")}`;
+  const beforeReordered = requests.length;
+  const reordered = await runWithSources(reorderedQuestion, sources, { "mock://articulo45-multiple": licenseParticularsReal }, answer);
+  assert.equal(reordered.generated, true); assert.equal(requests.length, beforeReordered + 1);
+  assert.match(reordered.result.respuesta, /C\) La licencia común permite seis/);
+  assert.match(reordered.result.respuesta, /A\) La opción contempla tres meses/);
+  assert.match(reordered.result.respuesta, /B\) La opción contempla dos meses/);
+});
+
+test("v3.3 error 6: comparación multinormativa conserva cada asociación y el orden invertido", async () => {
+  const docs = { estatuto_docente_provincial: estatutoRegression, movilidad_docente_decreto_533: decreto533 };
+  const forward = await runWithCurrentManifest("Compara el articulo 6 de la Ley Provincial 3122 con el articulo 5 del Decreto 533/2021.", docs, "La Ley Provincial 3122, artículo 6 establece derechos; el Decreto Acuerdo 533/2021, artículo 5 dispone condiciones de traslado.");
+  assert.match(forward.prompt, /Artículo\/s: 6/); assert.match(forward.prompt, /Artículo\/s: Decreto Artículo 5/);
+  assert.match(forward.prompt, /Ley Nº 3122/); assert.match(forward.prompt, /Decreto Acuerdo N\.º 533\/2021/);
+  assert.doesNotMatch(forward.prompt, /Artículo\/s: 1(?:\D|$)/); assert.equal(forward.result.tipo, "respuesta_ia");
+  const reverse = await runWithCurrentManifest("Compara el artículo 5 del Decreto 533/2021 con el artículo 6 de la Ley Provincial 3122.", docs, "El artículo 5 del Decreto Acuerdo 533/2021 y el artículo 6 de la Ley Provincial 3122 regulan materias diferentes.");
+  assert.match(reverse.prompt, /Artículo\/s: 6/); assert.match(reverse.prompt, /Artículo\/s: Decreto Artículo 5/);
+  assert.match(reverse.result.respuesta, /artículo 5 del Decreto Acuerdo 533\/2021.*artículo 6 de la Ley Provincial 3122/i);
+  const sameArticleNumber = await runWithCurrentManifest("Compara el artículo 6 de la Ley Provincial 3122 con el artículo 6 del Decreto 533/2021.", docs,
+    "El artículo 6 de la Ley Provincial 3122 regula derechos docentes; el artículo 6 del Decreto Acuerdo 533/2021 regula el cambio de suplente a interino.");
+  assert.match(sameArticleNumber.prompt, /Ley Nº 3122[\s\S]*Artículo\/s: 6/);
+  assert.match(sameArticleNumber.prompt, /Decreto Acuerdo N\.º 533\/2021[\s\S]*Artículo\/s: Decreto Artículo 6/);
+  const sameNormSeveralArticles = await runWithCurrentManifest("Compara los artículos 5 y 6 del Decreto 533/2021.", docs,
+    "El artículo 5 establece las condiciones de traslado y el artículo 6 el cambio de suplente a interino.");
+  assert.match(sameNormSeveralArticles.prompt, /Artículo\/s: Decreto Artículo 5/);
+  assert.match(sameNormSeveralArticles.prompt, /Artículo\/s: Decreto Artículo 6/);
+  const inactive = await runWithCurrentManifest("Compara el artículo 6 de la Ley Provincial 3122 con el artículo 1 de la Ley Provincial 5381.", docs, "no debe llamarse");
+  assert.equal(inactive.generated, false); assert.match(inactive.result.respuesta, /Ley Provincial 5381.*inactiva/i);
+});
+
+test("v3.3: autoridades y texto del artículo 46 siguen la tabla documental vigente", async () => {
+  const sources = [{ id: "licencias_docentes_provincial", dominio: "licencias", referencia: "Decreto Acuerdo Nº 1092/2015 – Régimen de Licencias Docentes", url: "mock://licencias-autoridades-v110", activo: true }];
+  for (const article of ["49", "50"]) {
+    const answer = await runWithSources(`¿Quién otorga la licencia del artículo ${article} y quién interviene?`, sources,
+      { "mock://licencias-autoridades-v110": licenseAuthoritiesReal }, "no debe llamarse");
+    assert.equal(answer.generated, false); assert.match(answer.result.respuesta, /Director Unidad Escolar/);
+    assert.match(answer.result.respuesta, /Secretario de Unidad Escolar/);
+  }
+  const companion = await runWithSources("¿Cuál es el texto completo del artículo 46 sobre licencia para acompañar al cónyuge por misión oficial?", sources,
+    { "mock://licencias-autoridades-v110": licenseAuthoritiesReal }, "no debe llamarse");
+  assert.equal(companion.generated, false); assert.match(companion.result.respuesta, /misión oficial en el extranjero/);
+  assert.doesNotMatch(companion.result.respuesta, /fallecimiento|vínculo del pariente/);
+});
+
+test("v3.3: comparación con fuente normativa no disponible no se presenta como completa", async () => {
+  const docs = { estatuto_docente_provincial: estatutoRegression };
+  const outcome = await runWithCurrentManifest("Compara el artículo 6 de la Ley Provincial 3122 con el artículo 5 del Decreto 533/2021.", docs, "no debe llamarse", ["movilidad_docente_decreto_533"]);
+  assert.equal(outcome.generated, false); assert.match(outcome.result.respuesta, /Decreto 533\/2021.*fuente está activa, pero no pudo descargarse temporalmente/is);
+  assert.doesNotMatch(outcome.result.respuesta, /comparación completa/i);
 });
 
 test("Caso 30: regresión de consultas generales e información sin respaldo", async () => {

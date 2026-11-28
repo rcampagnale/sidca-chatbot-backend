@@ -1,0 +1,58 @@
+[
+  {
+    "articulo": 26,
+    "contenido": "[ARTÍCULO 26°]\nARTÍCULO 26°.- En los casos en los que el/la docente víctima de violencia de género deba ausentarse por tal motivo de su puesto de trabajo, esta inasistencia sea total o parcial, contará con la debida justificación emitida por los servicios de atención y asistencia a las víctimas de tal flagelo, los que evaluarán las condiciones y tiempo de la referida licencia.\nAsimismo, el personal víctima de violencia de género, para hacer efectiva su protección o su derecho a ser asistido integralmente, tendrá derecho a la reducción de la jornada o a la reordenación de tiempo de trabajo o del lugar de origen del mismo, mediante la certificación pertinente acreditativa del hecho.\nEl jerárquico inmediatamente superior del docente afectado será el responsable de otorgar la presente licencia.\n________________________________________\nMATERNIDAD"
+  },
+  {
+    "articulo": 46,
+    "contenido": "[ARTÍCULO 46°]\nARTICULO 46°.- Esta licencia se acordará al docente cuyo cónyuge/conviviente fuera designado para cumplir una misión oficial en el extranjero o en el país a más de CIEN (100) kilómetros del asiento habitual de sus tareas y por el plazo máximo de DOS (2) años, siempre que tal misión tenga una duración prevista o previsible de más de SESENTA (60) días corridos."
+  },
+  {
+    "articulo": 48,
+    "contenido": "[ARTÍCULO 48°]\nARTICULO 48°.- El docente tendrá derecho a licencia remunerada por los términos que a continuación se detallan, en los casos de fallecimiento de parientes consanguíneos o afines:\na) Diez (10) días por fallecimiento de cónyuge/conviviente, padres e hijos del docente.\nb) Cinco (5) días por fallecimiento de hermanos, abuelos, nietos, suegros, hermanos políticos, hijastros, hijos políticos o personas a cargo.\nc) Un (1) día (el día del sepelio) por fallecimiento de parientes de 3er. y 4to. grado: primos hermanos, tíos, sobrinos, bisabuelos, bisnietos, tíos abuelos.\nEl docente deberá acreditar el fallecimiento y vínculo del parentesco con la certificación pertinente.\nLa licencia podrá ser solicitada a partir del día del fallecimiento del pariente. No se requiere antigüedad para el uso de esta licencia."
+  },
+  {
+    "articulo": 49,
+    "contenido": "[ARTÍCULO 49°]\nARTICULO 49°.- La justificación de inasistencia motivadas por fenómenos meteorológicos y casos de fuerza mayor debidamente comprobados serán acordadas conforme el presente artículo."
+  },
+  {
+    "articulo": 50,
+    "contenido": "[ARTÍCULO 50°]\nARTICULO 50°.- Toda inasistencia motivada por donación de sangre será justificada por UN (01) día con goce de haberes, siempre que el docente presente el comprobante respectivo en el/los establecimiento/s que correspondiere. Esta inasistencia justificada no será tenida en cuenta para la calificación anual."
+  },
+  {
+    "titulo": "Resumen de Licencia",
+    "tipo": "tabla",
+    "contenido": [
+      {
+        "articulo": "26",
+        "descripcion": "Por Violencia de Género",
+        "otorgante": "Director de Nivel",
+        "interviniente": "Director Unidad Escolar"
+      },
+      {
+        "articulo": "46",
+        "descripcion": "Para Acompañar al Cónyuge",
+        "otorgante": "Dir. Prov. RR HH - Min. de Educ. C.yT.",
+        "interviniente": "Director Unidad Escolar"
+      },
+      {
+        "articulo": "48",
+        "descripcion": "Por Fallecimiento",
+        "otorgante": "Director Unidad Escolar",
+        "interviniente": "Secretario de Unidad Escolar"
+      },
+      {
+        "articulo": "49",
+        "descripcion": "Por Razones Extraordinarias",
+        "otorgante": "Director Unidad Escolar",
+        "interviniente": "Secretario de Unidad Escolar"
+      },
+      {
+        "articulo": "50",
+        "descripcion": "Por Donación de Sangre",
+        "otorgante": "Director Unidad Escolar",
+        "interviniente": "Secretario de Unidad Escolar"
+      }
+    ]
+  }
+]

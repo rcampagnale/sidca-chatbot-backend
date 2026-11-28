@@ -1,0 +1,72 @@
+{
+  "version": "1.0.1",
+  "actualizado": "2026-11-28",
+  "dominio": "servicios",
+  "servicios": [
+    {
+      "id": "sidca_certificados",
+      "dominio": "servicios",
+      "categoria": "Certificados",
+      "titulo_articulo": "Certificados de capacitación y entrega de certificados",
+      "contenido": "Actualmente, la descarga de certificados de capacitación no se encuentra habilitada en la App SiDCa. Los docentes pueden consultar sus cursos aprobados ingresando a Información > Capacitaciones > Cursos Aprobados. Para consultas relacionadas con la disponibilidad, emisión y entrega de certificados, pueden comunicarse con el área de Entrega de Certificados por WhatsApp al 5493834325816. Los certificados de capacitación son diferentes de las constancias de asistencia presencial.",
+      "respuesta_sugerida": "Actualmente, la descarga de certificados de capacitación no se encuentra habilitada en la App SiDCa. Podés consultar tus cursos aprobados en Información > Capacitaciones > Cursos Aprobados. Para consultas sobre la entrega de certificados, comunicate por WhatsApp al 5493834325816.",
+      "contacto": {
+        "area": "Entrega de Certificados",
+        "whatsapp": "5493834325816",
+        "url": "https://wa.me/5493834325816"
+      },
+      "ubicacion_app": "Home > Información > Capacitaciones > Cursos Aprobados",
+      "datos_dinamicos": {
+        "coleccion": "certificados",
+        "campos_posibles": [
+          "resolucion",
+          "modalidad",
+          "fecha",
+          "dias",
+          "cargaHoraria",
+          "imagen",
+          "titulo",
+          "cursoId"
+        ]
+      },
+      "preguntas_relacionadas": [
+        "¿Dónde consulto por certificados?",
+        "¿Cuál es el contacto de entrega de certificados?",
+        "¿Dónde veo mis cursos aprobados?",
+        "¿Puedo imprimir mi certificado?",
+        "¿Cómo consulto el certificado de un curso?",
+        "¿Cómo descargo mi certificado de capacitación?",
+        "¿Puedo descargar mi certificado desde la app?",
+        "¿Por qué no puedo descargar mi certificado?",
+        "¿Está habilitada la descarga de certificados?",
+        "¿Cómo obtengo mi certificado de capacitación?",
+        "¿Dónde retiro mi certificado?",
+        "¿Cómo consulto si mi certificado está disponible?"
+      ],
+      "palabras_clave": [
+        "certificados",
+        "entrega de certificados",
+        "curso aprobado",
+        "imprimir certificado",
+        "resolucion",
+        "carga horaria",
+        "certificado",
+        "certificado de capacitacion",
+        "descargar certificado",
+        "descarga de certificados",
+        "cursos aprobados",
+        "certificado pdf",
+        "certificado no disponible",
+        "certificado no habilitado",
+        "emision de certificados",
+        "retiro de certificados"
+      ],
+      "fuente": "App SiDCa",
+      "fuente_codigo": [
+        "app/courses/certificados.tsx",
+        "app/courses/courses-picked.tsx",
+        "app/contact/contact-information.tsx"
+      ]
+    }
+  ]
+}

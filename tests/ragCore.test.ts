@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { activeSources, attachDocumentControl, classifyNomenclator, normalizeNorm, parseNormativeReferences, rankNormative, recordsFromDocument, sourceFingerprint, type RagChunk } from "../src/ragCore.js";
+import { activeSources, attachDocumentControl, chunkMatchesNormativeReference, chunkNormativeReferenceRole, classifyNomenclator, normalizeNorm, parseNormativeReferences, rankNormative, recordsFromDocument, sourceFingerprint, type RagChunk } from "../src/ragCore.js";
 
 const manifest = JSON.parse(await readFile(new URL("./fixtures/manifest.json", import.meta.url), "utf8"));
 const nomen = JSON.parse(await readFile(new URL("./fixtures/nomencladores.json", import.meta.url), "utf8"));
@@ -54,3 +54,12 @@ test("parsea Ley Provincial, símbolo N.º, puntos y año abreviado",()=>assert.
 test("reconoce Decreto-Ley como tipo independiente",()=>assert.equal(parseNormativeReferences("Decreto-Ley Nº 3.387")[0].kind,"decreto-ley"));
 test("no exige que la jurisdicción de consulta se repita en la identidad cuando no fue pedida",()=>assert.equal(rankNormative([{...base[1],sourceId:"ley_5381",norm:"Ley 5381",source:"Ley 5381",jurisdiction:"Catamarca",article:"49"}],"Ley 5381 artículo 49").length,1));
 test("jurisdicción explícita impide confundir norma nacional con provincial",()=>assert.equal(rankNormative([{...base[1],sourceId:"ley_5381",norm:"Ley 5381",source:"Ley 5381",jurisdiction:"Catamarca",article:"49"}],"Ley Nacional 5381 artículo 49").length,0));
+test("identidad normativa distingue norma original y modificatoria en los mismos metadatos",()=>{
+ const modified: RagChunk = { sourceId:"licencias_generales_decreto_1875_1994_modificado_153_2019",source:"Decreto Acuerdo 1875/1994, modificado por Decreto Acuerdo 153/2019",norm:"Decreto Acuerdo 1875/1994",article:"57",domain:"licencias",jurisdiction:"Catamarca",text:"Artículo original 57",metadata:{documento:"Decreto Acuerdo 1875/1994",norma_modificatoria:"Decreto Acuerdo 153/2019",articulo_modificatorio:2} };
+ const original = parseNormativeReferences("Decreto 1875/1994")[0];
+ const modifier = parseNormativeReferences("Decreto 153/2019")[0];
+ assert.equal(chunkNormativeReferenceRole(modified, original),"original");
+ assert.equal(chunkNormativeReferenceRole(modified, modifier),"modifier");
+ assert.equal(chunkMatchesNormativeReference(modified, original),true);
+ assert.equal(chunkMatchesNormativeReference(modified, modifier),true);
+});
