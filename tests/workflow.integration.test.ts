@@ -9,6 +9,8 @@ const generalList = JSON.parse(await readFile(new URL("./fixtures/nomenclador-ge
 const diverseGeneralList = JSON.parse(await readFile(new URL("./fixtures/nomenclador-general-diversidad.json", import.meta.url), "utf8"));
 const centersList = JSON.parse(await readFile(new URL("./fixtures/nomenclador-centros.json", import.meta.url), "utf8"));
 const completeCentersList = JSON.parse(await readFile(new URL("./fixtures/nomenclador-centros-completo.json", import.meta.url), "utf8"));
+const generalRealList = JSON.parse(await readFile(new URL("./fixtures/nomenclador-general-real.json", import.meta.url), "utf8"));
+const centersRealList = JSON.parse(await readFile(new URL("./fixtures/nomenclador-centros-real.json", import.meta.url), "utf8"));
 const gardensList = JSON.parse(await readFile(new URL("./fixtures/nomenclador-jardines.json", import.meta.url), "utf8"));
 const nationalLaw = JSON.parse(await readFile(new URL("./fixtures/ley_26206_educacion_nacional.json", import.meta.url), "utf8"));
 const privateLaw = JSON.parse(await readFile(new URL("./fixtures/decreto_ley_3387_educacion_privada.json", import.meta.url), "utf8"));
@@ -21,6 +23,7 @@ const consultasGenerales = JSON.parse(await readFile(new URL("./fixtures/consult
 const serviciosSidca = JSON.parse(await readFile(new URL("./fixtures/servicios-sidca-regresion.json", import.meta.url), "utf8"));
 const decreto533 = JSON.parse(await readFile(new URL("./fixtures/decreto-533-regresion.json", import.meta.url), "utf8"));
 const licenseParticulars = JSON.parse(await readFile(new URL("./fixtures/licencias-particulares-regresion.json", import.meta.url), "utf8"));
+const licenseParticularsReal = JSON.parse(await readFile(new URL("./fixtures/licencias-particulares-real.json", import.meta.url), "utf8"));
 let now = 1000;
 let contents = source;
 let manifest: any = { version: "1", fuentes: [{ id: "movilidad_docente_decreto_533", dominio: "coberturas", referencia: "Decreto Acuerdo 533/2021 Catamarca", url: "mock://movilidad", activo: true }] };
@@ -152,7 +155,7 @@ test("Caso 9: pipeline recupera escuela común del Decreto 2431/2016", async () 
 test("v3: maestro de grado de jornada completa usa el registro general de escuela común", async () => {
   const before = requests.length;
   const result = await queryNomencladores("¿Cuántas horas reloj semanales y puntos de incompatibilidad tiene un maestro de grado de jornada completa de una escuela común?");
-  assert.equal(requests.length, before); assert.match(result.respuesta, /CAT2431-052/); assert.match(result.respuesta, /Jornada: Completa/);
+  assert.equal(requests.length, before); assert.ok(result.referencias.some((reference: string) => /CAT2431-052/.test(reference))); assert.match(result.respuesta, /Jornada: Completa/);
   assert.match(result.respuesta, /Horas reloj semanales: 40/); assert.match(result.respuesta, /Puntos de incompatibilidad: 36/);
   assert.match(result.respuesta, /Nivel Primario Común/); assert.doesNotMatch(result.respuesta, /CAT2453-CE|CAT-1480/);
 });
@@ -178,13 +181,13 @@ test("Caso 12: prompt identifica horas, incompatibilidad y puntos del director m
 test("Caso 13: preceptor usa registro general de Centros, sin mezclar POF", async () => {
   const before = requests.length;
   const result = await queryNomencladores("¿Cuántas horas reloj semanales y puntos de incompatibilidad tiene un preceptor de Centros Educativos?");
-  assert.equal(requests.length, before); assert.match(result.respuesta, /CAT2453-CE-015/); assert.match(result.respuesta, /Horas reloj semanales: 30/); assert.match(result.respuesta, /Puntos de incompatibilidad: 18/); assert.match(result.respuesta, /Artículo 2/); assert.doesNotMatch(result.respuesta, /POF específica/);
+  assert.equal(requests.length, before); assert.ok(result.referencias.some((reference: string) => /CAT2453-CE-015/.test(reference))); assert.match(result.respuesta, /Horas reloj semanales: 30/); assert.match(result.respuesta, /Puntos de incompatibilidad: 18/); assert.match(result.respuesta, /Norma: .*Artículo 2/); assert.doesNotMatch(result.respuesta, /POF específica/);
 });
 
 test("Caso 14: comparación recupera y mantiene identidad de ambas instituciones", async () => {
   const before = requests.length;
   const result = await queryNomencladores("¿Qué diferencias existen entre un director de Centro Educativo y un director de Jardín Maternal Pasitos Cuidados?");
-  assert.equal(requests.length, before); assert.match(result.respuesta, /CAT2453-CE-001/); assert.match(result.respuesta, /CAT-1480-2019-09/); assert.match(result.respuesta, /Decreto ECyT 2453\/2019/); assert.match(result.respuesta, /Decreto ECyT N.º 1480\/2019/);
+  assert.equal(requests.length, before); assert.ok(result.referencias.some((reference: string) => /CAT2453-CE-001/.test(reference))); assert.ok(result.referencias.some((reference: string) => /CAT-1480-2019-09/.test(reference))); assert.match(result.respuesta, /Decreto ECyT 2453\/2019/); assert.match(result.respuesta, /Decreto ECyT N.º 1480\/2019/);
 });
 
 async function queryIntegrity(pregunta: string, id: string, dominio: string, data: unknown) {
@@ -520,8 +523,71 @@ test("v3: razones particulares (52) y asuntos particulares (45) se resuelven des
 test("v3 auditoría: comparación de razones y asuntos particulares conserva ambos artículos", async () => {
   const fuentes = [{ id: "licencias_docentes_provincial", dominio: "licencias", referencia: "Decreto Acuerdo 1092/2015 – Régimen de Licencias Docentes", url: "mock://licencias-particulares-comparison", activo: true }];
   const outcome = await runWithSources("Compará las licencias por razones particulares y asuntos particulares", fuentes, { "mock://licencias-particulares-comparison": licenseParticulars }, "Las dos licencias tienen condiciones diferentes según los artículos citados.");
-  assert.equal(outcome.generated, true); assert.match(outcome.prompt, /ART[IÍ]CULO 45/); assert.match(outcome.prompt, /ART[IÍ]CULO 52/);
-  assert.match(outcome.result.respuesta, /condiciones diferentes/); assert.equal(outcome.result.dominio, "licencias");
+  assert.equal(outcome.generated, false); assert.match(outcome.result.respuesta, /ART[IÍ]CULO 45/); assert.match(outcome.result.respuesta, /ART[IÍ]CULO 52/);
+  assert.match(outcome.result.respuesta, /anticipación mínima de QUINCE \(15\) días/); assert.match(outcome.result.respuesta, /docentes por horas cátedra/);
+  assert.equal(outcome.result.dominio, "licencias");
+});
+
+test("operativo v3.1: la comparación local de artículos 45 y 52 conserva condiciones sin atribuciones", async () => {
+  const fuentes = [{ id: "licencias_docentes_provincial", dominio: "licencias", referencia: "Decreto Acuerdo 1092/2015 – Régimen de Licencias Docentes", url: "mock://licencias-particulares-real", activo: true }];
+  const outcome = await runWithSources("¿Qué diferencias existen entre licencia por razones particulares y licencia por asuntos particulares?", fuentes, { "mock://licencias-particulares-real": licenseParticularsReal }, "No debe consultarse Groq para esta comparación documental.");
+  assert.equal(outcome.generated, false);
+  assert.match(outcome.result.respuesta, /ART[IÍ]CULO 45/); assert.match(outcome.result.respuesta, /ART[IÍ]CULO 52/);
+  assert.match(outcome.result.respuesta, /a\) Común:[\s\S]*DOS \(2\) años de antigüedad ininterrumpida/);
+  assert.match(outcome.result.respuesta, /en este caso, en el período inmediato anterior/);
+  assert.match(outcome.result.respuesta, /anticipación mínima de QUINCE \(15\) días/);
+  assert.match(outcome.result.respuesta, /con veinticuatro \(24\) horas de anticipación,[\s\S]*con goce de haberes/);
+  assert.match(outcome.result.respuesta, /docentes por horas cátedra[\s\S]*equivalentes al número de horas cátedras semanal/);
+  assert.doesNotMatch(outcome.result.respuesta, /licencia común (?:se concede|es|tiene) con goce/i);
+});
+
+test("operativo v3.1: artículo 52 literal excluye el encabezado de la sección siguiente", async () => {
+  const fuentes = [{ id: "licencias_docentes_provincial", dominio: "licencias", referencia: "Régimen de Licencias Docentes", url: "mock://licencia-52-real", activo: true }];
+  const outcome = await runWithSources("Dame el texto literal del artículo 52 del régimen de licencias docentes", fuentes, { "mock://licencia-52-real": licenseParticularsReal }, "No debe consultarse Groq para texto literal.");
+  assert.equal(outcome.generated, false); assert.match(outcome.result.respuesta, /con goce de haberes/);
+  assert.match(outcome.result.respuesta, /horas anuales de inasistencias equivalentes al número de horas cátedras semanal/);
+  assert.doesNotMatch(outcome.result.respuesta, /SUPERPOSICIÓN DE HORARIOS/);
+});
+
+test("auditoría final RAG v3.1: artículo literal conserva una línea normativa final en mayúsculas", async () => {
+  const fuente = [{ id: "licencias_docentes_provincial", dominio: "licencias", referencia: "Decreto Acuerdo 1092/2015 – Régimen de Licencias Docentes", url: "mock://licencia-upper-final", activo: true }];
+  const document = structuredClone(licenseParticularsReal);
+  const article = document.find((item: any) => String(item.articulo).includes("52"));
+  assert.ok(article);
+  const normativeFinalLine = "Los docentes por horas cátedra podrán solicitar hasta un máximo de horas anuales de inasistencias equivalentes al número de horas cátedras semanal del cargo de que se trate.";
+  article.contenido = `${article.contenido.replace(/\n_{5,}\s*SUPERPOSICI[ÓO]N DE HORARIOS[\s\S]*$/i, "").trimEnd()}\n${normativeFinalLine.toUpperCase()}`;
+  const outcome = await runWithSources("Dame el texto literal del artículo 52 del régimen de licencias docentes", fuente, { "mock://licencia-upper-final": document }, "No debe consultarse Groq.");
+  assert.equal(outcome.generated, false); assert.match(outcome.result.respuesta, new RegExp(normativeFinalLine.toUpperCase().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+});
+
+test("operativo v3.1: Decreto 533/2021 conserva el primer suplente sin agregar trámites", async () => {
+  const fuentes = [{ id: "movilidad_docente_decreto_533", dominio: "coberturas", referencia: "Decreto Acuerdo 533/2021 Catamarca", url: "mock://movilidad-first-substitute", activo: true }];
+  const outcome = await runWithSources("¿A quién corresponde el cambio automático de situación de revista según el Decreto Acuerdo 533/2021?", fuentes, { "mock://movilidad-first-substitute": decreto533 }, "No debe consultarse Groq para esta regla documentada.");
+  assert.equal(outcome.generated, false); assert.match(outcome.result.respuesta, /primer docente suplente/);
+  assert.match(outcome.result.respuesta, /cuando se produzca la baja del interino o titular suplido/);
+  assert.doesNotMatch(outcome.result.respuesta, /presentar un trámite|iniciar una solicitud|requisito adicional/i);
+});
+
+test("auditoría final RAG v3.1: pregunta operativa exacta del artículo 6 del Decreto 533 se resuelve localmente", async () => {
+  const fuentes = [{ id: "movilidad_docente_decreto_533", dominio: "coberturas", referencia: "Decreto Acuerdo 533/2021 Catamarca", url: "mock://mobility-exact-art6", activo: true }];
+  const before = requests.length;
+  const outcome = await runWithSources("¿Qué establece el artículo 6 del Decreto 533/2021?", fuentes, { "mock://mobility-exact-art6": decreto533 }, "No debe consultarse Groq.");
+  assert.equal(outcome.generated, false); assert.equal(requests.length, before);
+  assert.match(outcome.result.respuesta, /primer docente suplente/);
+  assert.match(outcome.result.respuesta, /cuando se produzca la baja del interino o titular suplido/);
+  assert.doesNotMatch(outcome.result.respuesta, /presentar un trámite|iniciar una solicitud|requisito adicional/i);
+});
+
+test("auditoría final RAG v3.1: artículo 6 determinista no intercepta otro artículo de Decreto 533", async () => {
+  const fuentes = [{ id: "movilidad_docente_decreto_533", dominio: "coberturas", referencia: "Decreto Acuerdo 533/2021 Catamarca", url: "mock://mobility-non-art6", activo: true }];
+  const outcome = await runWithSources("¿Qué establece el artículo 5 del Decreto 533/2021?", fuentes, { "mock://mobility-non-art6": decreto533 }, "La respuesta del artículo 5 no debe sustituirse por el artículo 6.");
+  assert.equal(outcome.generated, true); assert.match(outcome.prompt, /ART[IÍ]CULO 5/); assert.doesNotMatch(outcome.result.respuesta, /primer docente suplente/);
+});
+
+test("auditoría final RAG v3.1: artículo 6 de otra norma no activa la regla del Decreto 533", async () => {
+  const fuentes = [{ id: "movilidad_docente_decreto_533", dominio: "coberturas", referencia: "Decreto Acuerdo 533/2021 Catamarca", url: "mock://mobility-other-norm", activo: true }];
+  const outcome = await runWithSources("¿Qué establece el artículo 6 de la Ley Provincial 5381?", fuentes, { "mock://mobility-other-norm": decreto533 }, "No hay respaldo para esa norma.");
+  assert.equal(outcome.generated, false); assert.doesNotMatch(outcome.result.respuesta, /primer docente suplente|baja del interino o titular suplido/);
 });
 
 test("v3 auditoría: artículos 16 y 17 se recuperan juntos sin agregar el artículo 20", async () => {
@@ -551,45 +617,155 @@ test("v3: nomenclador solicita precisión si hay más de una jornada compatible"
 
 test("v3 auditoría: comparación de jornadas resuelve los registros por separado", async () => {
   const result = await queryNomencladores("Compará Maestro de Grado Jornada Completa vs. Maestro de Grado Jornada Extendida de escuela común");
-  assert.equal(result.dominio, "nomenclador"); assert.match(result.respuesta, /CAT2431-052/); assert.match(result.respuesta, /CAT2431-046/);
+  assert.equal(result.dominio, "nomenclador"); assert.ok(result.referencias.some((reference: string) => /CAT2431-052/.test(reference))); assert.ok(result.referencias.some((reference: string) => /CAT2431-046/.test(reference)));
   assert.match(result.respuesta, /Jornada Completa/); assert.match(result.respuesta, /Jornada Extendida/); assert.match(result.respuesta, /2431\/2016/);
 });
 
 test("v3 auditoría: consultas acentuadas y sin acentos mantienen la resolución documental", async () => {
   const accented = await queryNomencladores("¿Cuántas horas reloj tiene un maestro de grado de jornada completa de escuela común?");
   const unaccented = await queryNomencladores("Cuantas horas reloj tiene un maestro de grado de jornada completa de escuela comun?");
-  assert.match(accented.respuesta, /CAT2431-052/); assert.match(unaccented.respuesta, /CAT2431-052/);
+  assert.ok(accented.referencias.some((reference: string) => /CAT2431-052/.test(reference))); assert.ok(unaccented.referencias.some((reference: string) => /CAT2431-052/.test(reference)));
   assert.match(accented.respuesta, /Horas reloj semanales: 40/); assert.match(unaccented.respuesta, /Horas reloj semanales: 40/);
 });
 
 test("v3 auditoría: más de cinco registros reales se examinan y diferencia Maestro Especial de Maestro de Grado", async () => {
   assert.ok(diverseGeneralList.registros.length > 5);
   const result = await queryNomencladores("¿Cuántas horas reloj tiene un Maestro Especial de Jornada Simple de Nivel Primario Común?", diverseGeneralList);
-  assert.match(result.respuesta, /CAT2431-065/); assert.match(result.respuesta, /Maestro Especial Escuela JS - Primario Común/);
+  assert.ok(result.referencias.some((reference: string) => /CAT2431-065/.test(reference))); assert.match(result.respuesta, /Maestro Especial Escuela JS - Primario Común/);
   assert.match(result.respuesta, /Horas reloj semanales: 12/); assert.doesNotMatch(result.respuesta, /CAT2431-052|Maestro de Grado Jornada Completa/);
 });
 
 test("v3 auditoría: cargos compuestos Secretario y Prosecretario no se confunden", async () => {
   const result = await queryNomencladores("Compará Secretario de 2da. de Nivel Secundario y Educación Artística con Prosecretario de 2da. de Nivel Secundario y Educación Artística", diverseGeneralList);
-  assert.match(result.respuesta, /CAT2431-115/); assert.match(result.respuesta, /CAT2431-116/);
+  assert.ok(result.referencias.some((reference: string) => /CAT2431-115/.test(reference))); assert.ok(result.referencias.some((reference: string) => /CAT2431-116/.test(reference)));
   assert.match(result.respuesta, /Secretario de 2da\./); assert.match(result.respuesta, /Prosecretario de 2da\./);
 });
 
 test("v3 auditoría: Director y Vicedirector se comparan como roles independientes", async () => {
   const result = await queryNomencladores("Compará Director común 1ra. cat. Anexo Albergue JC vs. Vicedirector Común 1ra. cat. JC", diverseGeneralList);
-  assert.match(result.respuesta, /CAT2431-028/); assert.match(result.respuesta, /CAT2431-059/);
+  assert.ok(result.referencias.some((reference: string) => /CAT2431-028/.test(reference))); assert.ok(result.referencias.some((reference: string) => /CAT2431-059/.test(reference)));
   assert.match(result.respuesta, /Director común/); assert.match(result.respuesta, /Vicedirector Común/);
 });
 
 test("v3 auditoría: comparación entre niveles identifica cada registro y su norma", async () => {
   const result = await queryNomencladores("Compará Director JIN 1ra. cat. vs Director común 1ra. cat. Anexo Albergue JC", diverseGeneralList);
-  assert.match(result.respuesta, /CAT2431-018/); assert.match(result.respuesta, /CAT2431-028/);
+  assert.ok(result.referencias.some((reference: string) => /CAT2431-018/.test(reference))); assert.ok(result.referencias.some((reference: string) => /CAT2431-028/.test(reference)));
   assert.match(result.respuesta, /Educación Inicial/); assert.match(result.respuesta, /Nivel Primario Común/); assert.match(result.respuesta, /Decreto Acuerdo 2431\/2016/);
+});
+
+test("operativo v3.1: abreviatura Director de Centro Educativo resuelve el cargo institucional", async () => {
+  assert.equal(generalRealList.registros.length, 186); assert.equal(centersRealList.registros.length, 20);
+  const before = requests.length;
+  const result = await queryNomencladores("Compara un Director de Centro Educativo con un Director de Jardín Maternal Pasitos Cuidados", generalRealList, centersRealList);
+  assert.equal(requests.length, before); assert.equal(result.tipo, "respuesta_local", result.respuesta);
+  assert.match(result.respuesta, /Director General/); assert.match(result.respuesta, /Director\/a de Jardín Maternal/);
+  assert.doesNotMatch(result.respuesta, /CAT2453-CE|CAT-1480/);
+  assert.ok(result.referencias.some((reference: string) => /2453\/2019/.test(reference)));
+  assert.ok(result.referencias.some((reference: string) => /1480\/2019/.test(reference)));
+  assert.ok(result.referencias.some((reference: string) => /CAT2453-CE-001/.test(reference)));
+  assert.ok(result.referencias.some((reference: string) => /CAT-1480-2019-09/.test(reference)));
+});
+
+test("auditoría final RAG v3.1: alias Director de Centro Educativo aclara si el catálogo ofrece dos categorías", async () => {
+  const centersWithAlternative = structuredClone(centersRealList);
+  const director = centersWithAlternative.registros.find((record: any) => record.id === "CAT2453-CE-001");
+  assert.ok(director);
+  centersWithAlternative.registros.push({ ...director, id: "TEST-CAT2453-CE-001-ALT", nivel_educativo: "Inicial" });
+  const result = await queryNomencladores("Compara un Director de Centro Educativo con un Director de Jardín Maternal Pasitos Cuidados", generalRealList, centersWithAlternative);
+  assert.equal(result.tipo, "aclaracion"); assert.match(result.respuesta, /Alternativas documentadas/);
+  assert.match(result.respuesta, /Director General/); assert.match(result.respuesta, /nivel educativo/);
+});
+
+test("auditoría final RAG v3.1: institución al final no resuelve un Director General ambiguo", async () => {
+  const centersWithAlternative = structuredClone(centersRealList);
+  const director = centersWithAlternative.registros.find((record: any) => record.id === "CAT2453-CE-001");
+  assert.ok(director);
+  centersWithAlternative.registros.push({ ...director, id: "TEST-CAT2453-CE-001-SCOPE", nivel_educativo: "Inicial" });
+  const result = await queryNomencladores("Compara Director General con Vicedirector de Centros Educativos", generalRealList, centersWithAlternative);
+  assert.equal(result.tipo, "aclaracion"); assert.match(result.respuesta, /Alternativas documentadas|Alternativas:/);
+  assert.match(result.respuesta, /Director General/); assert.match(result.respuesta, /Vicedirector/);
+});
+
+test("operativo v3.1: calificadores compartidos resuelven comparación de jornadas con corpus completo", async () => {
+  assert.equal(generalRealList.registros.length, 186);
+  const before = requests.length;
+  const result = await queryNomencladores("Compara un maestro de grado de jornada completa con un maestro de grado de jornada extendida de nivel primario común", generalRealList);
+  assert.equal(requests.length, before); assert.equal(result.tipo, "respuesta_local", result.respuesta);
+  assert.match(result.respuesta, /Horas reloj semanales: 40/); assert.match(result.respuesta, /Horas reloj semanales: 35/);
+  assert.match(result.respuesta, /Jornada: Completa/); assert.match(result.respuesta, /Jornada: Extendida/);
+  assert.match(result.respuesta, /Cargo: Maestro de Grado Jornada Completa\nNivel\/modalidad:/);
+  assert.doesNotMatch(result.respuesta, /CAT2431-/); assert.doesNotMatch(result.respuesta, /;.*Horas reloj/);
+  assert.ok(result.referencias.some((reference: string) => /2431\/2016/.test(reference)));
+  assert.ok(result.referencias.some((reference: string) => /CAT2431-052/.test(reference)));
+  assert.ok(result.referencias.some((reference: string) => /CAT2431-046/.test(reference)));
+});
+
+test("auditoría final RAG v3.1: el corpus real completo identifica la consulta operativa de Maestro de Grado JC", async () => {
+  assert.equal(generalRealList.registros.length, 186); assert.equal(centersRealList.registros.length, 20);
+  const before = requests.length;
+  const result = await queryNomencladores("¿Cuántas horas reloj semanales y puntos de incompatibilidad tiene un maestro de grado de jornada completa de una escuela común?", generalRealList, centersRealList);
+  assert.equal(requests.length, before); assert.equal(result.tipo, "respuesta_local");
+  assert.match(result.respuesta, /Horas reloj semanales: 40/); assert.match(result.respuesta, /Puntos de incompatibilidad: 36/);
+  assert.match(result.respuesta, /Decreto Acuerdo 2431\/2016/); assert.ok(result.referencias.some((reference: string) => /CAT2431-052/.test(reference)));
+  assert.doesNotMatch(result.respuesta, /CAT2453-CE|CAT-1480/);
+});
+
+test("auditoría final RAG v3.1: métricas iguales permiten respuesta; otras métricas divergentes piden desambiguar", async () => {
+  const variedCenters = structuredClone(centersRealList);
+  const firstVice = variedCenters.registros.find((record: any) => /vicedirector/i.test(record.categoria));
+  assert.ok(firstVice);
+  firstVice.puntos_salariales += 1;
+  firstVice.puntaje_incompatibilidad += 1;
+  const hoursOnly = await queryNomencladores("¿Cuántas horas reloj tiene un vicedirector de Centros Educativos?", generalRealList, variedCenters);
+  assert.equal(hoursOnly.tipo, "respuesta_local"); assert.match(hoursOnly.respuesta, /Horas reloj semanales: 35/);
+  assert.doesNotMatch(hoursOnly.respuesta, /Puntos salariales:|Puntos de incompatibilidad:/);
+  const salary = await queryNomencladores("¿Cuántos puntos salariales tiene un vicedirector de Centros Educativos?", generalRealList, variedCenters);
+  assert.equal(salary.tipo, "aclaracion"); assert.match(salary.respuesta, /Alternativas:/);
+  const incompatibility = await queryNomencladores("¿Cuántos puntos de incompatibilidad tiene un vicedirector de Centros Educativos?", generalRealList, variedCenters);
+  assert.equal(incompatibility.tipo, "aclaracion"); assert.match(incompatibility.respuesta, /Alternativas:/);
+});
+
+test("auditoría final RAG v3.1: comparación conserva instituciones y niveles distintos", async () => {
+  const institutions = await queryNomencladores("Compara Director de Centro Comunitario con Director de Centro Educativo", generalRealList, centersRealList);
+  assert.equal(institutions.tipo, "respuesta_local", institutions.respuesta);
+  assert.ok(institutions.referencias.some((reference: string) => /CAT2431-086/.test(reference)));
+  assert.ok(institutions.referencias.some((reference: string) => /CAT2453-CE-001/.test(reference)));
+  const levels = await queryNomencladores("Compara Director JIN 1ra. cat. con Director común 1ra. cat. Anexo Albergue JC", generalRealList, centersRealList);
+  assert.equal(levels.tipo, "respuesta_local", levels.respuesta);
+  assert.ok(levels.referencias.some((reference: string) => /CAT2431-018/.test(reference)));
+  assert.ok(levels.referencias.some((reference: string) => /CAT2431-028/.test(reference)));
+});
+
+test("operativo v3.1: el nomenclador solicita precisión y ofrece alternativas cuando la comparación sigue ambigua", async () => {
+  const result = await queryNomencladores("Compara un Director con un Vicedirector", generalRealList, centersRealList);
+  assert.equal(result.tipo, "aclaracion"); assert.match(result.respuesta, /Alternativas documentadas/);
+  assert.match(result.respuesta, /nivel educativo|institución|denominación exacta del cargo/);
+  assert.match(result.respuesta, /director|vicedirector/i);
+});
+
+test("operativo v3.1: una institución compartida se propaga sin colapsar cargos distintos", async () => {
+  const result = await queryNomencladores("Compara Director General con Vicedirector de nivel inicial de Centros Educativos", generalRealList, centersRealList);
+  assert.equal(result.tipo, "respuesta_local", result.respuesta); assert.match(result.respuesta, /Director General/);
+  assert.match(result.respuesta, /Vicedirector Educación Inicial/); assert.match(result.respuesta, /Centros Educativos/);
+});
+
+test("auditoría final RAG v3.1: un nivel al final no se impone a cargos con descriptores distintos", async () => {
+  const result = await queryNomencladores("Compara Director JIN 1ra. cat. con Director común 1ra. cat. de Nivel Primario Común", generalRealList, centersRealList);
+  assert.equal(result.tipo, "aclaracion"); assert.match(result.respuesta, /Alternativas documentadas/);
+  assert.match(result.respuesta, /Director JIN|Director común/);
+});
+
+test("operativo v3.1: vicedirectores de Centros con métricas coincidentes se responden sin aclaración", async () => {
+  const before = requests.length;
+  const result = await queryNomencladores("¿Cuántas horas reloj y puntos de incompatibilidad tiene un vicedirector de Centros Educativos?", generalRealList, centersRealList);
+  assert.equal(requests.length, before); assert.equal(result.tipo, "respuesta_local");
+  assert.match(result.respuesta, /Inicial/); assert.match(result.respuesta, /Primaria/); assert.match(result.respuesta, /Secundaria/);
+  assert.match(result.respuesta, /Horas reloj semanales: 35/); assert.match(result.respuesta, /Puntos de incompatibilidad: 30/);
 });
 
 test("v3 auditoría: comparación informa ausencia de horas reloj y compara solo magnitudes presentes", async () => {
   const result = await queryNomencladores("Compará Maestro de Grado Jornada Completa con Hora Cátedra Nivel Secundario", diverseGeneralList);
-  assert.match(result.respuesta, /CAT2431-052/); assert.match(result.respuesta, /CAT2431-106/);
+  assert.ok(result.referencias.some((reference: string) => /CAT2431-052/.test(reference)), `${JSON.stringify(result.referencias)} ${result.respuesta}`); assert.ok(result.referencias.some((reference: string) => /CAT2431-106/.test(reference)), JSON.stringify(result.referencias));
   assert.match(result.respuesta, /Horas reloj semanales: no hay datos compatibles en todos los registros/);
   assert.match(result.respuesta, /Puntos de incompatibilidad:.*registra 35 más que/s);
 });
@@ -597,7 +773,7 @@ test("v3 auditoría: comparación informa ausencia de horas reloj y compara solo
 test("v3 auditoría: una POF se incluye solo si se solicita y aporta el registro institucional", async () => {
   assert.equal(completeCentersList.registros.length, 20);
   const result = await queryNomencladores("¿Cuántas horas reloj tiene un Maestro de Grado Jornada Extendida de la POF de Centros Educativos?", generalList, completeCentersList);
-  assert.match(result.respuesta, /CAT2453-CE-017/); assert.match(result.respuesta, /POF Centro Educativo Nº 1 Riberas del Valle/);
+  assert.ok(result.referencias.some((reference: string) => /CAT2453-CE-017/.test(reference))); assert.match(result.respuesta, /POF Centro Educativo Nº 1 Riberas del Valle/);
   assert.match(result.respuesta, /Horas reloj semanales: 35/); assert.match(result.respuesta, /Jornada: Extendida/);
 });
 
